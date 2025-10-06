@@ -7,8 +7,19 @@
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMainWindow>
+#include <QPushButton>
+#include <QSignalBlocker>
 #include <QSlider>
+#include <QKeyEvent>
+#include <QPainter>
+#include <QMouseEvent>
+#include <QCursor>
+#include <QEvent>
+#include <QResizeEvent>
+#include <QRegion>
+#include <QWheelEvent>
 #include <QTimer>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QWidget>
 #include <QString>
@@ -26,6 +37,8 @@
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <shlwapi.h>
+
+#include <cwchar>
 
 #include <algorithm>
 #include <array>
@@ -45,6 +58,124 @@ namespace openzoom {
 namespace {
 
 constexpr int kZoomSliderScale = 100;
+constexpr int kZoomSliderMaxMultiplier = 12;
+constexpr int kZoomFocusSliderScale = 100;
+constexpr float kPanKeyboardStep = 0.01f;
+constexpr float kPanJoystickStep = 0.008f;
+constexpr int kBlurSigmaSliderMin = 1;
+constexpr int kBlurSigmaSliderMax = 50;
+constexpr float kBlurSigmaStep = 0.1f;
+constexpr int kBlurRadiusMin = 1;
+constexpr int kBlurRadiusMax = 15;
+
+float SliderValueToSigma(int sliderValue) {
+    int clamped = std::clamp(sliderValue, kBlurSigmaSliderMin, kBlurSigmaSliderMax);
+    return static_cast<float>(clamped) * kBlurSigmaStep;
+}
+
+int NormalizeRadiusValue(int sliderValue) {
+    int radius = std::clamp(sliderValue, kBlurRadiusMin, kBlurRadiusMax);
+    if ((radius & 1) == 0) {
+        if (radius >= kBlurRadiusMax) {
+            radius -= 1;
+        } else {
+            radius += 1;
+        }
+    }
+    return radius;
+}
+
+void ApplyGaussianBlur(const std::vector<uint8_t>& src,
+                       std::vector<uint8_t>& scratch,
+                       std::vector<uint8_t>& dst,
+                       UINT width,
+                       UINT height,
+                       int radius,
+                       float sigma) {
+    if (radius <= 0 || sigma <= 0.0f || src.empty() || width == 0 || height == 0) {
+        dst = src;
+        return;
+    }
+
+    const size_t pixelCount = static_cast<size_t>(width) * height;
+    scratch.resize(pixelCount * 4);
+    dst.resize(pixelCount * 4);
+
+    const int kernelSize = radius * 2 + 1;
+    std::vector<float> kernel(static_cast<size_t>(kernelSize));
+    const float sigma2 = sigma * sigma;
+    const float denom = 2.0f * sigma2;
+    float weightSum = 0.0f;
+    for (int i = -radius; i <= radius; ++i) {
+        const float x = static_cast<float>(i);
+        const float weight = std::exp(-(x * x) / denom);
+        kernel[static_cast<size_t>(i + radius)] = weight;
+        weightSum += weight;
+    }
+    if (weightSum <= 0.0f) {
+        dst = src;
+        return;
+    }
+    for (float& weight : kernel) {
+        weight /= weightSum;
+    }
+
+    auto samplePixel = [&](const std::vector<uint8_t>& buffer, UINT x, UINT y) -> const uint8_t* {
+        return buffer.data() + (static_cast<size_t>(y) * width + x) * 4;
+    };
+
+    auto writePixel = [](std::vector<uint8_t>& buffer, UINT width, UINT x, UINT y,
+                         float b, float g, float r, float a) {
+        uint8_t* dstPixel = buffer.data() + (static_cast<size_t>(y) * width + x) * 4;
+        dstPixel[0] = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(b)), 0, 255));
+        dstPixel[1] = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(g)), 0, 255));
+        dstPixel[2] = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(r)), 0, 255));
+        dstPixel[3] = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(a)), 0, 255));
+    };
+
+    // Horizontal pass
+    for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+            float accumB = 0.0f;
+            float accumG = 0.0f;
+            float accumR = 0.0f;
+            float accumA = 0.0f;
+            for (int k = -radius; k <= radius; ++k) {
+                int sampleX = static_cast<int>(x) + k;
+                sampleX = std::clamp(sampleX, 0, static_cast<int>(width) - 1);
+                const uint8_t* srcPixel = samplePixel(src, static_cast<UINT>(sampleX), y);
+                const float weight = kernel[static_cast<size_t>(k + radius)];
+                accumB += weight * srcPixel[0];
+                accumG += weight * srcPixel[1];
+                accumR += weight * srcPixel[2];
+                accumA += weight * srcPixel[3];
+            }
+            writePixel(scratch, width, x, y, accumB, accumG, accumR, accumA);
+        }
+    }
+
+    // Vertical pass
+    for (UINT y = 0; y < height; ++y) {
+        for (UINT x = 0; x < width; ++x) {
+            float accumB = 0.0f;
+            float accumG = 0.0f;
+            float accumR = 0.0f;
+            float accumA = 0.0f;
+            for (int k = -radius; k <= radius; ++k) {
+                int sampleY = static_cast<int>(y) + k;
+                sampleY = std::clamp(sampleY, 0, static_cast<int>(height) - 1);
+                const uint8_t* srcPixel = samplePixel(scratch, x, static_cast<UINT>(sampleY));
+                const float weight = kernel[static_cast<size_t>(k + radius)];
+                accumB += weight * srcPixel[0];
+                accumG += weight * srcPixel[1];
+                accumR += weight * srcPixel[2];
+                accumA += weight * srcPixel[3];
+            }
+            writePixel(dst, width, x, y, accumB, accumG, accumR, accumA);
+        }
+    }
+}
+
 
 void ThrowIfFailed(HRESULT hr, const char* message) {
     if (FAILED(hr)) {
@@ -248,7 +379,9 @@ void ApplyZoom(const std::vector<uint8_t>& src,
                std::vector<uint8_t>& dst,
                UINT width,
                UINT height,
-               float zoomAmount)
+               float zoomAmount,
+               float centerXNormalized,
+               float centerYNormalized)
 {
     const float zoom = std::max(1.0f, zoomAmount);
     const UINT stride = width * 4;
@@ -256,31 +389,50 @@ void ApplyZoom(const std::vector<uint8_t>& src,
         dst.resize(src.size());
     }
 
-    const float cx = static_cast<float>(width) * 0.5f;
-    const float cy = static_cast<float>(height) * 0.5f;
+    const float maxIndexX = static_cast<float>(width > 0 ? width - 1 : 0);
+    const float maxIndexY = static_cast<float>(height > 0 ? height - 1 : 0);
+    const float outputCenterX = maxIndexX * 0.5f;
+    const float outputCenterY = maxIndexY * 0.5f;
+
+    float centerX = std::clamp(centerXNormalized, 0.0f, 1.0f) * maxIndexX;
+    float centerY = std::clamp(centerYNormalized, 0.0f, 1.0f) * maxIndexY;
+
+    const float halfVisibleWidth = (static_cast<float>(width)) / (zoom * 2.0f);
+    const float halfVisibleHeight = (static_cast<float>(height)) / (zoom * 2.0f);
+
+    if (width > 1) {
+        const float minCenterX = std::max(0.0f, halfVisibleWidth - 0.5f);
+        const float maxCenterX = std::min(maxIndexX, static_cast<float>(width) - 1.0f - (halfVisibleWidth - 0.5f));
+        if (minCenterX <= maxCenterX) {
+            centerX = std::clamp(centerX, minCenterX, maxCenterX);
+        }
+    }
+
+    if (height > 1) {
+        const float minCenterY = std::max(0.0f, halfVisibleHeight - 0.5f);
+        const float maxCenterY = std::min(maxIndexY, static_cast<float>(height) - 1.0f - (halfVisibleHeight - 0.5f));
+        if (minCenterY <= maxCenterY) {
+            centerY = std::clamp(centerY, minCenterY, maxCenterY);
+        }
+    }
 
     for (UINT y = 0; y < height; ++y) {
         uint8_t* dstRow = dst.data() + static_cast<size_t>(y) * stride;
         for (UINT x = 0; x < width; ++x) {
-            const float sx = (static_cast<float>(x) - cx) / zoom + cx;
-            const float sy = (static_cast<float>(y) - cy) / zoom + cy;
+            const float sx = (static_cast<float>(x) - outputCenterX) / zoom + centerX;
+            const float sy = (static_cast<float>(y) - outputCenterY) / zoom + centerY;
 
-            int sampleX = static_cast<int>(std::roundf(sx));
-            int sampleY = static_cast<int>(std::roundf(sy));
-            if (sampleX < 0 || sampleX >= static_cast<int>(width) ||
-                sampleY < 0 || sampleY >= static_cast<int>(height)) {
-                dstRow[x * 4 + 0] = 0;
-                dstRow[x * 4 + 1] = 0;
-                dstRow[x * 4 + 2] = 0;
-                dstRow[x * 4 + 3] = 255;
-            } else {
-                const uint8_t* srcPixel = src.data() + static_cast<size_t>(sampleY) * stride + sampleX * 4;
-                uint8_t* dstPixel = dstRow + x * 4;
-                dstPixel[0] = srcPixel[0];
-                dstPixel[1] = srcPixel[1];
-                dstPixel[2] = srcPixel[2];
-                dstPixel[3] = srcPixel[3];
-            }
+            int sampleX = static_cast<int>(std::lroundf(sx));
+            int sampleY = static_cast<int>(std::lroundf(sy));
+            sampleX = std::clamp(sampleX, 0, static_cast<int>(width) - 1);
+            sampleY = std::clamp(sampleY, 0, static_cast<int>(height) - 1);
+
+            const uint8_t* srcPixel = src.data() + static_cast<size_t>(sampleY) * stride + sampleX * 4;
+            uint8_t* dstPixel = dstRow + x * 4;
+            dstPixel[0] = srcPixel[0];
+            dstPixel[1] = srcPixel[1];
+            dstPixel[2] = srcPixel[2];
+            dstPixel[3] = srcPixel[3];
         }
     }
 }
@@ -667,6 +819,132 @@ private:
     D3D12Presenter* presenter_{};
 };
 
+JoystickOverlay::JoystickOverlay(QWidget* parent)
+    : QWidget(parent) {
+    setAttribute(Qt::WA_TransparentForMouseEvents, false);
+    setAttribute(Qt::WA_NoSystemBackground, true);
+    setAttribute(Qt::WA_TranslucentBackground, true);
+    setVisible(false);
+    if (parent) {
+        parent->installEventFilter(this);
+    }
+    setFixedSize(160, 160);
+    UpdateMask();
+    ResetKnob();
+}
+
+void JoystickOverlay::ResetKnob() {
+    knobPos_ = QPointF(width() / 2.0, height() / 2.0);
+    update();
+}
+
+bool JoystickOverlay::eventFilter(QObject* watched, QEvent* event) {
+    if (watched == parentWidget()) {
+        if (event->type() == QEvent::Resize) {
+            UpdatePlacement();
+        }
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void JoystickOverlay::showEvent(QShowEvent* event) {
+    QWidget::showEvent(event);
+    UpdatePlacement();
+}
+
+void JoystickOverlay::paintEvent(QPaintEvent*) {
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    painter.setCompositionMode(QPainter::CompositionMode_Source);
+    painter.fillRect(rect(), Qt::transparent);
+    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
+
+    painter.setBrush(QColor(60, 60, 60, 180));
+    painter.setPen(Qt::NoPen);
+    painter.drawEllipse(rect());
+
+    painter.setBrush(QColor(230, 230, 230, 230));
+    painter.setPen(Qt::NoPen);
+    painter.drawEllipse(KnobRect());
+}
+
+void JoystickOverlay::mousePressEvent(QMouseEvent* event) {
+    if (event->button() == Qt::LeftButton) {
+        dragging_ = true;
+        UpdateFromPosition(event->position());
+    }
+}
+
+void JoystickOverlay::mouseMoveEvent(QMouseEvent* event) {
+    if (dragging_) {
+        UpdateFromPosition(event->position());
+    }
+}
+
+void JoystickOverlay::mouseReleaseEvent(QMouseEvent* event) {
+    if (dragging_ && event->button() == Qt::LeftButton) {
+        dragging_ = false;
+        ResetKnob();
+        emit JoystickChanged(0.0f, 0.0f);
+        update();
+    }
+}
+
+void JoystickOverlay::resizeEvent(QResizeEvent* event) {
+    QWidget::resizeEvent(event);
+    UpdateMask();
+}
+
+QRectF JoystickOverlay::KnobRect() const {
+    constexpr qreal knobRadius = 24.0;
+    return QRectF(knobPos_.x() - knobRadius,
+                  knobPos_.y() - knobRadius,
+                  knobRadius * 2.0,
+                  knobRadius * 2.0);
+}
+
+void JoystickOverlay::UpdatePlacement() {
+    if (!parentWidget()) {
+        return;
+    }
+    const int margin = 20;
+    const int x = parentWidget()->width() - width() - margin;
+    const int y = parentWidget()->height() - height() - margin;
+    move(std::max(0, x), std::max(0, y));
+}
+
+void JoystickOverlay::UpdateFromPosition(const QPointF& pos) {
+    const QPointF center(width() / 2.0, height() / 2.0);
+    QPointF delta = pos - center;
+    const qreal maxRadius = width() / 2.0;
+    if (delta.manhattanLength() < 0.0001) {
+        delta = QPointF(0, 0);
+    }
+    const qreal distance = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
+    if (distance > maxRadius) {
+        delta *= maxRadius / distance;
+    }
+    knobPos_ = center + delta;
+    update();
+
+    float normX = static_cast<float>(delta.x() / maxRadius);
+    float normY = static_cast<float>(delta.y() / maxRadius);
+    normX = std::clamp(normX, -1.0f, 1.0f);
+    normY = std::clamp(normY, -1.0f, 1.0f);
+
+    emit JoystickChanged(normX, -normY);
+}
+
+void JoystickOverlay::UpdateMask() {
+    if (width() <= 0 || height() <= 0) {
+        clearMask();
+        return;
+    }
+    QRegion region(rect(), QRegion::Ellipse);
+    setMask(region);
+}
+
 class MainWindow : public QMainWindow {
 public:
     MainWindow() {
@@ -678,6 +956,27 @@ public:
         rootLayout->setContentsMargins(12, 12, 12, 12);
         rootLayout->setSpacing(8);
 
+        controlsToggleButton_ = new QToolButton();
+        controlsToggleButton_->setText("Hide Controls");
+        controlsToggleButton_->setCheckable(true);
+        controlsToggleButton_->setChecked(true);
+        controlsToggleButton_->setArrowType(Qt::DownArrow);
+        controlsToggleButton_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+
+        joystickCheckbox_ = new QCheckBox("Virtual Joystick");
+
+        auto* headerLayout = new QHBoxLayout();
+        headerLayout->setSpacing(8);
+        headerLayout->addWidget(controlsToggleButton_);
+        headerLayout->addStretch(1);
+        headerLayout->addWidget(joystickCheckbox_);
+        rootLayout->addLayout(headerLayout);
+
+        controlsContainer_ = new QWidget();
+        auto* controlsLayout = new QVBoxLayout(controlsContainer_);
+        controlsLayout->setContentsMargins(0, 0, 0, 0);
+        controlsLayout->setSpacing(8);
+
         auto* cameraLayout = new QHBoxLayout();
         cameraLayout->setSpacing(8);
         auto* cameraLabel = new QLabel("Camera:");
@@ -685,7 +984,7 @@ public:
         cameraCombo_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
         cameraLayout->addWidget(cameraLabel);
         cameraLayout->addWidget(cameraCombo_, 1);
-        rootLayout->addLayout(cameraLayout);
+        controlsLayout->addLayout(cameraLayout);
 
         auto* bwLayout = new QHBoxLayout();
         bwLayout->setSpacing(8);
@@ -697,24 +996,90 @@ public:
         bwSlider_->setEnabled(false);
         bwLayout->addWidget(bwCheckbox_);
         bwLayout->addWidget(bwSlider_, 1);
-        rootLayout->addLayout(bwLayout);
+        controlsLayout->addLayout(bwLayout);
 
         auto* zoomLayout = new QHBoxLayout();
         zoomLayout->setSpacing(8);
         zoomCheckbox_ = new QCheckBox("Zoom");
         zoomSlider_ = new QSlider(Qt::Horizontal);
-        zoomSlider_->setRange(kZoomSliderScale, 4 * kZoomSliderScale);
+        zoomSlider_->setRange(kZoomSliderScale, kZoomSliderMaxMultiplier * kZoomSliderScale);
         zoomSlider_->setPageStep(10);
         zoomSlider_->setValue(kZoomSliderScale);
         zoomSlider_->setEnabled(false);
         zoomLayout->addWidget(zoomCheckbox_);
         zoomLayout->addWidget(zoomSlider_, 1);
-        rootLayout->addLayout(zoomLayout);
+        controlsLayout->addLayout(zoomLayout);
+
+        auto* blurLayout = new QHBoxLayout();
+        blurLayout->setSpacing(8);
+        blurCheckbox_ = new QCheckBox("Gaussian Blur");
+        blurSigmaSlider_ = new QSlider(Qt::Horizontal);
+        blurSigmaSlider_->setRange(1, 50); // 0.1 .. 5.0 sigma
+        blurSigmaSlider_->setPageStep(2);
+        blurSigmaSlider_->setSingleStep(1);
+        blurSigmaSlider_->setValue(10);
+        blurSigmaSlider_->setEnabled(false);
+        blurSigmaValueLabel_ = new QLabel("1.0");
+        blurSigmaValueLabel_->setMinimumWidth(40);
+
+        blurRadiusSlider_ = new QSlider(Qt::Horizontal);
+        blurRadiusSlider_->setRange(1, 15);
+        blurRadiusSlider_->setPageStep(2);
+        blurRadiusSlider_->setSingleStep(2);
+        blurRadiusSlider_->setValue(3);
+        blurRadiusSlider_->setEnabled(false);
+        blurRadiusValueLabel_ = new QLabel("3");
+        blurRadiusValueLabel_->setMinimumWidth(30);
+
+        blurLayout->addWidget(blurCheckbox_);
+        blurLayout->addWidget(new QLabel("Sigma:"));
+        blurLayout->addWidget(blurSigmaSlider_, 1);
+        blurLayout->addWidget(blurSigmaValueLabel_);
+        blurLayout->addSpacing(12);
+        blurLayout->addWidget(new QLabel("Radius:"));
+        blurLayout->addWidget(blurRadiusSlider_, 1);
+        blurLayout->addWidget(blurRadiusValueLabel_);
+        controlsLayout->addLayout(blurLayout);
+
+        auto* focusLayout = new QHBoxLayout();
+        focusLayout->setSpacing(8);
+        auto* focusXLabel = new QLabel("Focus X:");
+        zoomCenterXSlider_ = new QSlider(Qt::Horizontal);
+        zoomCenterXSlider_->setRange(0, kZoomFocusSliderScale);
+        zoomCenterXSlider_->setPageStep(5);
+        zoomCenterXSlider_->setValue(kZoomFocusSliderScale / 2);
+        focusLayout->addWidget(focusXLabel);
+        focusLayout->addWidget(zoomCenterXSlider_, 1);
+
+        auto* focusYLabel = new QLabel("Focus Y:");
+        zoomCenterYSlider_ = new QSlider(Qt::Horizontal);
+        zoomCenterYSlider_->setRange(0, kZoomFocusSliderScale);
+        zoomCenterYSlider_->setPageStep(5);
+        zoomCenterYSlider_->setValue(kZoomFocusSliderScale / 2);
+        focusLayout->addWidget(focusYLabel);
+        focusLayout->addWidget(zoomCenterYSlider_, 1);
+        controlsLayout->addLayout(focusLayout);
+
+        auto* debugLayout = new QHBoxLayout();
+        debugLayout->setSpacing(8);
+        debugButton_ = new QPushButton("Debug View");
+        debugButton_->setCheckable(true);
+        debugButton_->setChecked(false);
+        debugLayout->addWidget(debugButton_);
+        debugLayout->addStretch(1);
+        controlsLayout->addLayout(debugLayout);
+
+        rootLayout->addWidget(controlsContainer_, 0);
 
         renderWidget_ = new RenderWidget();
+        renderWidget_->installEventFilter(this);
         rootLayout->addWidget(renderWidget_, 1);
 
         setCentralWidget(central);
+    }
+
+    void setApp(OpenZoomApp* app) {
+        app_ = app;
     }
 
     RenderWidget* renderWidget() const { return renderWidget_; }
@@ -723,6 +1088,85 @@ public:
     QSlider* blackWhiteSlider() const { return bwSlider_; }
     QCheckBox* zoomCheckbox() const { return zoomCheckbox_; }
     QSlider* zoomSlider() const { return zoomSlider_; }
+    QPushButton* debugButton() const { return debugButton_; }
+    QSlider* zoomCenterXSlider() const { return zoomCenterXSlider_; }
+    QSlider* zoomCenterYSlider() const { return zoomCenterYSlider_; }
+    QCheckBox* joystickCheckbox() const { return joystickCheckbox_; }
+    QToolButton* controlsToggleButton() const { return controlsToggleButton_; }
+    QWidget* controlsContainer() const { return controlsContainer_; }
+    QCheckBox* blurCheckbox() const { return blurCheckbox_; }
+    QSlider* blurSigmaSlider() const { return blurSigmaSlider_; }
+    QSlider* blurRadiusSlider() const { return blurRadiusSlider_; }
+    QLabel* blurSigmaValueLabel() const { return blurSigmaValueLabel_; }
+    QLabel* blurRadiusValueLabel() const { return blurRadiusValueLabel_; }
+
+protected:
+    void keyPressEvent(QKeyEvent* event) override {
+        if (app_ && app_->HandlePanKey(event->key(), true)) {
+            event->accept();
+            return;
+        }
+        QMainWindow::keyPressEvent(event);
+    }
+
+    void keyReleaseEvent(QKeyEvent* event) override {
+        if (app_ && app_->HandlePanKey(event->key(), false)) {
+            event->accept();
+            return;
+        }
+        QMainWindow::keyReleaseEvent(event);
+    }
+
+    bool eventFilter(QObject* watched, QEvent* event) override {
+        if (watched == renderWidget_) {
+            switch (event->type()) {
+            case QEvent::Wheel: {
+                auto* wheel = static_cast<QWheelEvent*>(event);
+                if (wheel->modifiers() & Qt::ControlModifier) {
+                    if (app_) {
+                        app_->HandleZoomWheel(wheel->angleDelta().y(), wheel->position());
+                    }
+                    event->accept();
+                    return true;
+                }
+                break;
+            }
+            case QEvent::MouseButtonPress: {
+                auto* mouse = static_cast<QMouseEvent*>(event);
+                if (mouse->button() == Qt::MiddleButton) {
+                    if (app_) {
+                        app_->BeginMousePan(mouse->position(), renderWidget_->size());
+                    }
+                    event->accept();
+                    return true;
+                }
+                break;
+            }
+            case QEvent::MouseMove: {
+                auto* mouse = static_cast<QMouseEvent*>(event);
+                if (app_ && app_->UpdateMousePan(mouse->position())) {
+                    event->accept();
+                    return true;
+                }
+                break;
+            }
+            case QEvent::MouseButtonRelease: {
+                auto* mouse = static_cast<QMouseEvent*>(event);
+                if (mouse->button() == Qt::MiddleButton) {
+                    if (app_) {
+                        app_->EndMousePan();
+                    }
+                    event->accept();
+                    return true;
+                }
+                break;
+            }
+            default:
+                break;
+            }
+        }
+        return QMainWindow::eventFilter(watched, event);
+    }
 
 private:
     RenderWidget* renderWidget_{};
@@ -731,6 +1175,18 @@ private:
     QSlider* bwSlider_{};
     QCheckBox* zoomCheckbox_{};
     QSlider* zoomSlider_{};
+    QPushButton* debugButton_{};
+    QSlider* zoomCenterXSlider_{};
+    QSlider* zoomCenterYSlider_{};
+    QCheckBox* joystickCheckbox_{};
+    QToolButton* controlsToggleButton_{};
+    QWidget* controlsContainer_{};
+    QCheckBox* blurCheckbox_{};
+    QSlider* blurSigmaSlider_{};
+    QSlider* blurRadiusSlider_{};
+    QLabel* blurSigmaValueLabel_{};
+    QLabel* blurRadiusValueLabel_{};
+    OpenZoomApp* app_{};
 };
 
 
@@ -742,6 +1198,7 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     presenter_ = std::make_unique<D3D12Presenter>();
 
     mainWindow_ = std::make_unique<MainWindow>();
+    mainWindow_->setApp(this);
     renderWidget_ = mainWindow_->renderWidget();
     renderWidget_->setPresenter(presenter_.get());
     cameraCombo_ = mainWindow_->cameraCombo();
@@ -749,6 +1206,47 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     bwSlider_ = mainWindow_->blackWhiteSlider();
     zoomCheckbox_ = mainWindow_->zoomCheckbox();
     zoomSlider_ = mainWindow_->zoomSlider();
+    debugButton_ = mainWindow_->debugButton();
+    zoomCenterXSlider_ = mainWindow_->zoomCenterXSlider();
+    zoomCenterYSlider_ = mainWindow_->zoomCenterYSlider();
+    joystickCheckbox_ = mainWindow_->joystickCheckbox();
+    collapseButton_ = mainWindow_->controlsToggleButton();
+    controlsContainer_ = mainWindow_->controlsContainer();
+    blurCheckbox_ = mainWindow_->blurCheckbox();
+    blurSigmaSlider_ = mainWindow_->blurSigmaSlider();
+    blurRadiusSlider_ = mainWindow_->blurRadiusSlider();
+    blurSigmaValueLabel_ = mainWindow_->blurSigmaValueLabel();
+    blurRadiusValueLabel_ = mainWindow_->blurRadiusValueLabel();
+
+    joystickOverlay_ = new JoystickOverlay(renderWidget_);
+    connect(joystickOverlay_, &JoystickOverlay::JoystickChanged,
+            this, [this](float x, float y) {
+                joystickPanX_ = std::clamp(x, -1.0f, 1.0f);
+                joystickPanY_ = std::clamp(y, -1.0f, 1.0f);
+            });
+    UpdateJoystickVisibility();
+
+    if (zoomCenterXSlider_) {
+        zoomCenterX_ = std::clamp(static_cast<float>(zoomCenterXSlider_->value()) / static_cast<float>(kZoomFocusSliderScale), 0.0f, 1.0f);
+    }
+    if (zoomCenterYSlider_) {
+        zoomCenterY_ = std::clamp(static_cast<float>(zoomCenterYSlider_->value()) / static_cast<float>(kZoomFocusSliderScale), 0.0f, 1.0f);
+    }
+
+    SetZoomCenter(zoomCenterX_, zoomCenterY_, true);
+
+    if (blurSigmaSlider_) {
+        blurSigma_ = SliderValueToSigma(blurSigmaSlider_->value());
+    }
+    if (blurRadiusSlider_) {
+        int normalized = NormalizeRadiusValue(blurRadiusSlider_->value());
+        blurRadius_ = normalized;
+        if (blurRadiusSlider_->value() != normalized) {
+            blurRadiusSlider_->setValue(normalized);
+        }
+    }
+    blurEnabled_ = blurCheckbox_ ? blurCheckbox_->isChecked() : false;
+    UpdateBlurUiLabels();
 
     PopulateCameraCombo();
 
@@ -762,6 +1260,44 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
             this, &OpenZoomApp::OnZoomToggled);
     connect(zoomSlider_, &QSlider::valueChanged,
             this, &OpenZoomApp::OnZoomAmountChanged);
+    if (debugButton_) {
+        connect(debugButton_, &QPushButton::toggled,
+                this, &OpenZoomApp::OnDebugViewToggled);
+    }
+    if (zoomCenterXSlider_) {
+        connect(zoomCenterXSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnZoomCenterXChanged);
+    }
+    if (zoomCenterYSlider_) {
+        connect(zoomCenterYSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnZoomCenterYChanged);
+    }
+    if (collapseButton_) {
+        connect(collapseButton_, &QToolButton::toggled,
+                this, &OpenZoomApp::OnControlsCollapsedToggled);
+        OnControlsCollapsedToggled(collapseButton_->isChecked());
+    }
+    if (joystickCheckbox_) {
+        joystickCheckbox_->setChecked(false);
+        connect(joystickCheckbox_, &QCheckBox::toggled,
+                this, &OpenZoomApp::OnVirtualJoystickToggled);
+    }
+    if (blurCheckbox_) {
+        QSignalBlocker block(blurCheckbox_);
+        blurCheckbox_->setChecked(blurEnabled_);
+        connect(blurCheckbox_, &QCheckBox::toggled,
+                this, &OpenZoomApp::OnBlurToggled);
+    }
+    if (blurSigmaSlider_) {
+        connect(blurSigmaSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnBlurSigmaChanged);
+    }
+    if (blurRadiusSlider_) {
+        connect(blurRadiusSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnBlurRadiusChanged);
+    }
+
+    UpdateBlurUiLabels();
 
     frameTimer_ = new QTimer(this);
     connect(frameTimer_, &QTimer::timeout, this, &OpenZoomApp::OnFrameTick);
@@ -860,6 +1396,10 @@ void OpenZoomApp::EnumerateCameras() {
         CoTaskMemFree(devices);
     }
 
+    std::sort(cameras_.begin(), cameras_.end(), [](const CameraInfo& a, const CameraInfo& b) {
+        return _wcsicmp(a.name.c_str(), b.name.c_str()) < 0;
+    });
+
     selectedCameraIndex_ = cameras_.empty() ? -1 : 0;
 }
 
@@ -902,6 +1442,391 @@ void OpenZoomApp::OnZoomToggled(bool checked) {
 
 void OpenZoomApp::OnZoomAmountChanged(int value) {
     zoomAmount_ = std::max(1.0f, static_cast<float>(value) / static_cast<float>(kZoomSliderScale));
+}
+
+void OpenZoomApp::OnDebugViewToggled(bool checked) {
+    debugViewEnabled_ = checked;
+}
+
+void OpenZoomApp::OnZoomCenterXChanged(int value) {
+    if (suspendControlSync_) {
+        return;
+    }
+    const float norm = std::clamp(static_cast<float>(value) / static_cast<float>(kZoomFocusSliderScale), 0.0f, 1.0f);
+    SetZoomCenter(norm, zoomCenterY_, false);
+}
+
+void OpenZoomApp::OnZoomCenterYChanged(int value) {
+    if (suspendControlSync_) {
+        return;
+    }
+    const float norm = std::clamp(static_cast<float>(value) / static_cast<float>(kZoomFocusSliderScale), 0.0f, 1.0f);
+    SetZoomCenter(zoomCenterX_, norm, false);
+}
+
+void OpenZoomApp::OnControlsCollapsedToggled(bool checked) {
+    controlsCollapsed_ = !checked;
+    if (controlsContainer_) {
+        controlsContainer_->setVisible(checked);
+    }
+    if (collapseButton_) {
+        collapseButton_->setArrowType(checked ? Qt::DownArrow : Qt::RightArrow);
+        collapseButton_->setText(checked ? "Hide Controls" : "Show Controls");
+    }
+}
+
+void OpenZoomApp::OnVirtualJoystickToggled(bool checked) {
+    virtualJoystickEnabled_ = checked;
+    if (!virtualJoystickEnabled_) {
+        joystickPanX_ = 0.0f;
+        joystickPanY_ = 0.0f;
+        if (joystickOverlay_) {
+            joystickOverlay_->ResetKnob();
+        }
+    } else {
+        joystickPanX_ = 0.0f;
+        joystickPanY_ = 0.0f;
+    }
+    UpdateJoystickVisibility();
+}
+
+void OpenZoomApp::OnBlurToggled(bool checked) {
+    blurEnabled_ = checked;
+    UpdateBlurUiLabels();
+}
+
+void OpenZoomApp::OnBlurSigmaChanged(int value) {
+    blurSigma_ = SliderValueToSigma(value);
+    UpdateBlurUiLabels();
+}
+
+void OpenZoomApp::OnBlurRadiusChanged(int value) {
+    int normalized = NormalizeRadiusValue(value);
+    if (blurRadiusSlider_ && normalized != value) {
+        QSignalBlocker blocker(blurRadiusSlider_);
+        blurRadiusSlider_->setValue(normalized);
+    }
+    blurRadius_ = normalized;
+    UpdateBlurUiLabels();
+}
+
+void OpenZoomApp::SetZoomCenter(float normX, float normY, bool syncUi) {
+    const float clampedX = std::clamp(normX, 0.0f, 1.0f);
+    const float clampedY = std::clamp(normY, 0.0f, 1.0f);
+    zoomCenterX_ = clampedX;
+    zoomCenterY_ = clampedY;
+
+    if (syncUi) {
+        suspendControlSync_ = true;
+        if (zoomCenterXSlider_) {
+            QSignalBlocker blockX(zoomCenterXSlider_);
+            zoomCenterXSlider_->setValue(static_cast<int>(std::round(clampedX * kZoomFocusSliderScale)));
+        }
+        if (zoomCenterYSlider_) {
+            QSignalBlocker blockY(zoomCenterYSlider_);
+            zoomCenterYSlider_->setValue(static_cast<int>(std::round(clampedY * kZoomFocusSliderScale)));
+        }
+        suspendControlSync_ = false;
+    }
+}
+
+bool OpenZoomApp::HandlePanKey(int key, bool pressed) {
+    switch (key) {
+    case Qt::Key_Left:
+        panLeftPressed_ = pressed;
+        return true;
+    case Qt::Key_Right:
+        panRightPressed_ = pressed;
+        return true;
+    case Qt::Key_Up:
+        panUpPressed_ = pressed;
+        return true;
+    case Qt::Key_Down:
+        panDownPressed_ = pressed;
+        return true;
+    default:
+        break;
+    }
+    return false;
+}
+
+void OpenZoomApp::ApplyInputForces() {
+    float moveX = 0.0f;
+    if (panLeftPressed_) {
+        moveX -= 1.0f;
+    }
+    if (panRightPressed_) {
+        moveX += 1.0f;
+    }
+    moveX += joystickPanX_;
+
+    float moveY = 0.0f;
+    if (panUpPressed_) {
+        moveY -= 1.0f;
+    }
+    if (panDownPressed_) {
+        moveY += 1.0f;
+    }
+    moveY += -joystickPanY_;
+
+    if (std::abs(moveX) < 1e-5f && std::abs(moveY) < 1e-5f) {
+        return;
+    }
+
+    const float length = std::sqrt(moveX * moveX + moveY * moveY);
+    float normalizedX = moveX;
+    float normalizedY = moveY;
+    if (length > 1e-5f) {
+        normalizedX /= length;
+        normalizedY /= length;
+    }
+
+    const bool keyboardActive = panLeftPressed_ || panRightPressed_ || panUpPressed_ || panDownPressed_;
+    const float analogStrength = std::sqrt(joystickPanX_ * joystickPanX_ + joystickPanY_ * joystickPanY_);
+
+    float baseStep = 0.0f;
+    if (keyboardActive) {
+        baseStep = kPanKeyboardStep;
+    }
+    if (analogStrength > 0.001f) {
+        baseStep = std::max(baseStep, kPanJoystickStep * std::clamp(analogStrength, 0.1f, 1.0f));
+    }
+    if (baseStep <= 0.0f) {
+        baseStep = kPanJoystickStep;
+    }
+
+    const float zoomFactor = std::max(1.0f, zoomAmount_);
+    const float step = baseStep / zoomFactor;
+
+    SetZoomCenter(zoomCenterX_ + normalizedX * step,
+                  zoomCenterY_ + normalizedY * step,
+                  true);
+}
+
+void OpenZoomApp::UpdateJoystickVisibility() {
+    if (!joystickOverlay_) {
+        return;
+    }
+    if (virtualJoystickEnabled_) {
+        joystickOverlay_->ResetKnob();
+        joystickOverlay_->show();
+    } else {
+        joystickOverlay_->hide();
+    }
+}
+
+void OpenZoomApp::UpdateBlurUiLabels() {
+    const QString sigmaText = QString::number(blurSigma_, 'f', 1);
+    if (blurSigmaValueLabel_) {
+        blurSigmaValueLabel_->setText(sigmaText);
+        blurSigmaValueLabel_->setEnabled(blurEnabled_);
+    }
+    if (blurRadiusValueLabel_) {
+        blurRadiusValueLabel_->setText(QString::number(blurRadius_));
+        blurRadiusValueLabel_->setEnabled(blurEnabled_);
+    }
+    if (blurSigmaSlider_) {
+        blurSigmaSlider_->setEnabled(blurEnabled_);
+    }
+    if (blurRadiusSlider_) {
+        blurRadiusSlider_->setEnabled(blurEnabled_);
+    }
+    if (blurCheckbox_) {
+        QSignalBlocker block(blurCheckbox_);
+        blurCheckbox_->setChecked(blurEnabled_);
+    }
+}
+
+void OpenZoomApp::HandleZoomWheel(int delta, const QPointF& localPos) {
+    if (!zoomSlider_) {
+        return;
+    }
+
+    float focusU = 0.0f;
+    float focusV = 0.0f;
+    bool hasFocus = MapViewToSource(localPos, focusU, focusV);
+    if (debugViewEnabled_) {
+        hasFocus = false;
+    }
+
+    if (!zoomEnabled_) {
+        if (zoomCheckbox_) {
+            QSignalBlocker blocker(zoomCheckbox_);
+            zoomCheckbox_->setChecked(true);
+        }
+        zoomEnabled_ = true;
+        zoomSlider_->setEnabled(true);
+    }
+
+    const int stepUnits = (delta / 120); // standard wheel step
+    if (stepUnits == 0) {
+        return;
+    }
+    const float prevZoom = zoomAmount_;
+    const int stepSize = std::max(zoomSlider_->pageStep() / 2, 1);
+    const int deltaValue = stepUnits * stepSize;
+    const int newValue = std::clamp(zoomSlider_->value() + deltaValue,
+                                    zoomSlider_->minimum(),
+                                    zoomSlider_->maximum());
+
+    if (newValue == zoomSlider_->value()) {
+        return;
+    }
+
+    QSignalBlocker blockSlider(zoomSlider_);
+    zoomSlider_->setValue(newValue);
+    blockSlider.unblock();
+    OnZoomAmountChanged(newValue);
+    const float newZoom = zoomAmount_;
+
+    if (hasFocus) {
+        const float factor = (prevZoom <= 0.0f || newZoom <= 0.0f) ? 1.0f : (prevZoom / newZoom);
+        const float newCenterX = focusU - (focusU - zoomCenterX_) * factor;
+        const float newCenterY = focusV - (focusV - zoomCenterY_) * factor;
+        SetZoomCenter(newCenterX, newCenterY, true);
+    }
+}
+
+bool OpenZoomApp::MapViewToSource(const QPointF& pos, float& outX, float& outY) const {
+    if (!renderWidget_ || cameraFrameWidth_ == 0 || cameraFrameHeight_ == 0) {
+        return false;
+    }
+
+    const int targetWidth = std::max(1, renderWidget_->width());
+    const int targetHeight = std::max(1, renderWidget_->height());
+
+    const float srcWidth = static_cast<float>(cameraFrameWidth_);
+    const float srcHeight = static_cast<float>(cameraFrameHeight_);
+
+    bool cropToFill = !debugViewEnabled_;
+    float cropWidth = srcWidth;
+    float cropHeight = srcHeight;
+
+    if (cropToFill) {
+        const float targetAspect = static_cast<float>(targetWidth) / static_cast<float>(targetHeight);
+        const float srcAspect = srcWidth / srcHeight;
+        if (targetAspect > srcAspect) {
+            cropHeight = srcWidth / targetAspect;
+            cropHeight = std::min(cropHeight, srcHeight);
+        } else {
+            cropWidth = srcHeight * targetAspect;
+            cropWidth = std::min(cropWidth, srcWidth);
+        }
+    }
+
+    cropWidth = std::clamp(cropWidth, 1.0f, srcWidth);
+    cropHeight = std::clamp(cropHeight, 1.0f, srcHeight);
+
+    float centerX = zoomCenterX_ * (srcWidth - 1.0f);
+    float centerY = zoomCenterY_ * (srcHeight - 1.0f);
+
+    const float halfCropWidth = cropWidth * 0.5f;
+    const float halfCropHeight = cropHeight * 0.5f;
+
+    const float minCenterX = std::max(0.0f, halfCropWidth - 0.5f);
+    const float maxCenterX = std::max(minCenterX, (srcWidth - 1.0f) - (halfCropWidth - 0.5f));
+    const float minCenterY = std::max(0.0f, halfCropHeight - 0.5f);
+    const float maxCenterY = std::max(minCenterY, (srcHeight - 1.0f) - (halfCropHeight - 0.5f));
+
+    centerX = std::clamp(centerX, minCenterX, maxCenterX);
+    centerY = std::clamp(centerY, minCenterY, maxCenterY);
+
+    float startX = centerX - halfCropWidth + 0.5f;
+    float startY = centerY - halfCropHeight + 0.5f;
+    startX = std::clamp(startX, 0.0f, srcWidth - cropWidth);
+    startY = std::clamp(startY, 0.0f, srcHeight - cropHeight);
+
+    float scaleFactor;
+    if (cropToFill) {
+        scaleFactor = static_cast<float>(targetWidth) / cropWidth;
+    } else {
+        const float widthScale = static_cast<float>(targetWidth) / cropWidth;
+        const float heightScale = static_cast<float>(targetHeight) / cropHeight;
+        scaleFactor = std::min(widthScale, heightScale);
+    }
+    if (!(scaleFactor > 0.0f) || !std::isfinite(scaleFactor)) {
+        scaleFactor = 1.0f;
+    }
+
+    UINT activeWidth = static_cast<UINT>(std::round(cropWidth * scaleFactor));
+    UINT activeHeight = static_cast<UINT>(std::round(cropHeight * scaleFactor));
+    activeWidth = std::clamp(activeWidth, 1u, static_cast<UINT>(targetWidth));
+    activeHeight = std::clamp(activeHeight, 1u, static_cast<UINT>(targetHeight));
+
+    const UINT offsetX = (targetWidth > static_cast<int>(activeWidth)) ?
+                         static_cast<UINT>((targetWidth - static_cast<int>(activeWidth)) / 2) : 0;
+    const UINT offsetY = (targetHeight > static_cast<int>(activeHeight)) ?
+                         static_cast<UINT>((targetHeight - static_cast<int>(activeHeight)) / 2) : 0;
+
+    float localX = static_cast<float>(pos.x()) - static_cast<float>(offsetX);
+    float localY = static_cast<float>(pos.y()) - static_cast<float>(offsetY);
+
+    localX = std::clamp(localX, 0.0f, static_cast<float>(activeWidth - 1));
+    localY = std::clamp(localY, 0.0f, static_cast<float>(activeHeight - 1));
+
+    const float stepX = cropWidth / static_cast<float>(activeWidth);
+    const float stepY = cropHeight / static_cast<float>(activeHeight);
+
+    const float sampleX = startX + localX * stepX;
+    const float sampleY = startY + localY * stepY;
+
+    const float denomX = std::max(srcWidth - 1.0f, 1.0f);
+    const float denomY = std::max(srcHeight - 1.0f, 1.0f);
+    outX = std::clamp(sampleX / denomX, 0.0f, 1.0f);
+    outY = std::clamp(sampleY / denomY, 0.0f, 1.0f);
+    return true;
+}
+
+void OpenZoomApp::BeginMousePan(const QPointF& pos, const QSize& widgetSize) {
+    middlePanActive_ = true;
+    middlePanLastPos_ = pos;
+    middlePanWidgetSize_ = widgetSize;
+    if (renderWidget_) {
+        renderWidget_->setCursor(Qt::ClosedHandCursor);
+        renderWidget_->grabMouse(Qt::ClosedHandCursor);
+    }
+}
+
+bool OpenZoomApp::UpdateMousePan(const QPointF& pos) {
+    if (!middlePanActive_) {
+        return false;
+    }
+
+    float prevU = 0.0f;
+    float prevV = 0.0f;
+    float currU = 0.0f;
+    float currV = 0.0f;
+
+    bool prevValid = MapViewToSource(middlePanLastPos_, prevU, prevV);
+    bool currValid = MapViewToSource(pos, currU, currV);
+
+    middlePanLastPos_ = pos;
+
+    if (!prevValid || !currValid) {
+        return false;
+    }
+
+    const float deltaU = prevU - currU;
+    const float deltaV = prevV - currV;
+    if (std::abs(deltaU) < 1e-6f && std::abs(deltaV) < 1e-6f) {
+        return false;
+    }
+
+    SetZoomCenter(zoomCenterX_ + deltaU,
+                  zoomCenterY_ + deltaV,
+                  true);
+    return true;
+}
+
+void OpenZoomApp::EndMousePan() {
+    if (!middlePanActive_) {
+        return;
+    }
+    middlePanActive_ = false;
+    if (renderWidget_) {
+        renderWidget_->releaseMouse();
+        renderWidget_->unsetCursor();
+    }
 }
 
 void OpenZoomApp::StartCameraCapture(size_t index) {
@@ -1145,6 +2070,8 @@ void OpenZoomApp::OnFrameTick() {
         return;
     }
 
+    ApplyInputForces();
+
     std::vector<uint8_t> localFrame;
     GUID subtype = GUID_NULL;
     UINT width = 0;
@@ -1212,73 +2139,248 @@ void OpenZoomApp::BuildCompositeAndPresent(UINT width, UINT height) {
         ApplyBlackWhite(stageRaw_, stageBw_, blackWhiteThreshold_);
     }
 
+    const std::vector<uint8_t>* currentStage = blackWhiteEnabled_ ? &stageBw_ : &stageRaw_;
+
     const std::vector<uint8_t>& zoomSource = blackWhiteEnabled_ ? stageBw_ : stageRaw_;
     stageZoom_ = zoomSource;
     if (zoomEnabled_) {
-        ApplyZoom(zoomSource, stageZoom_, width, height, zoomAmount_);
+        ApplyZoom(zoomSource, stageZoom_, width, height, zoomAmount_, zoomCenterX_, zoomCenterY_);
+        currentStage = &stageZoom_;
     }
 
-    if (zoomEnabled_) {
-        stageFinal_ = stageZoom_;
-    } else if (blackWhiteEnabled_) {
-        stageFinal_ = stageBw_;
+    if (blurEnabled_) {
+        ApplyGaussianBlur(*currentStage, blurScratch_, stageBlur_, width, height, blurRadius_, blurSigma_);
+        currentStage = &stageBlur_;
     } else {
-        stageFinal_ = stageRaw_;
+        stageBlur_.clear();
     }
 
-    const UINT compositeWidth = width * 2;
-    const UINT compositeHeight = height * 2;
-    const UINT compositeStride = compositeWidth * 4;
-    compositeBuffer_.assign(static_cast<size_t>(compositeStride) * compositeHeight, 0);
+    stageFinal_ = *currentStage;
 
-    const int frameWidthInt = static_cast<int>(width);
-    const int frameHeightInt = static_cast<int>(height);
-    const float dominantExtent = static_cast<float>(std::max(width, height));
-    const int paddingCandidate = static_cast<int>(std::roundf(dominantExtent * 0.05f));
-    const int maxPaddingWidth = std::max(0, (frameWidthInt - 1) / 2);
-    const int maxPaddingHeight = std::max(0, (frameHeightInt - 1) / 2);
-    const int padding = std::clamp(paddingCandidate, 0, std::min(maxPaddingWidth, maxPaddingHeight));
-    const UINT paddingU = static_cast<UINT>(padding);
-    const UINT innerWidth = static_cast<UINT>(std::max(1, frameWidthInt - 2 * padding));
-    const UINT innerHeight = static_cast<UINT>(std::max(1, frameHeightInt - 2 * padding));
+    if (stageFinal_.empty()) {
+        return;
+    }
 
-    auto blitScaled = [&](const std::vector<uint8_t>& src, UINT destX, UINT destY) {
-        if (innerWidth == 0 || innerHeight == 0) {
-            return;
+    const uint8_t* displayData = nullptr;
+    UINT displayWidth = 0;
+    UINT displayHeight = 0;
+
+    if (debugViewEnabled_) {
+        std::vector<const std::vector<uint8_t>*> debugStages;
+        debugStages.reserve(5);
+        debugStages.push_back(&stageRaw_);
+        if (blackWhiteEnabled_) {
+            debugStages.push_back(&stageBw_);
         }
+        if (zoomEnabled_) {
+            debugStages.push_back(&stageZoom_);
+        }
+        if (blurEnabled_ && !stageBlur_.empty()) {
+            debugStages.push_back(&stageBlur_);
+        }
+        debugStages.push_back(&stageFinal_);
 
-        const UINT stride = width * 4;
-        const float scaleX = static_cast<float>(width) / static_cast<float>(innerWidth);
-        const float scaleY = static_cast<float>(height) / static_cast<float>(innerHeight);
+        if (!debugStages.empty()) {
+            const size_t stageCount = debugStages.size();
+            const size_t columns = static_cast<size_t>(std::ceil(std::sqrt(static_cast<float>(stageCount))));
+            const size_t rows = (stageCount + columns - 1) / columns;
 
-        for (UINT y = 0; y < innerHeight; ++y) {
-            const UINT srcY = std::min(height - 1, static_cast<UINT>(std::lroundf(static_cast<float>(y) * scaleY)));
-            uint8_t* dstRow = compositeBuffer_.data() +
-                              (static_cast<size_t>(destY + paddingU + y) * compositeStride) +
-                              (destX + paddingU) * 4;
-            const uint8_t* srcRow = src.data() + static_cast<size_t>(srcY) * stride;
-            for (UINT x = 0; x < innerWidth; ++x) {
-                const UINT srcX = std::min(width - 1, static_cast<UINT>(std::lroundf(static_cast<float>(x) * scaleX)));
-                const uint8_t* srcPixel = srcRow + srcX * 4;
-                uint8_t* dstPixel = dstRow + x * 4;
-                dstPixel[0] = srcPixel[0];
-                dstPixel[1] = srcPixel[1];
-                dstPixel[2] = srcPixel[2];
-                dstPixel[3] = srcPixel[3];
+            const UINT compositeWidth = width * static_cast<UINT>(columns);
+            const UINT compositeHeight = height * static_cast<UINT>(rows);
+            const UINT compositeStride = compositeWidth * 4;
+            compositeBuffer_.assign(static_cast<size_t>(compositeStride) * compositeHeight, 0);
+
+            const int frameWidthInt = static_cast<int>(width);
+            const int frameHeightInt = static_cast<int>(height);
+            const float dominantExtent = static_cast<float>(std::max(width, height));
+            const int paddingCandidate = static_cast<int>(std::roundf(dominantExtent * 0.05f));
+            const int maxPaddingWidth = std::max(0, (frameWidthInt - 1) / 2);
+            const int maxPaddingHeight = std::max(0, (frameHeightInt - 1) / 2);
+            const int padding = std::clamp(paddingCandidate, 0, std::min(maxPaddingWidth, maxPaddingHeight));
+            const UINT paddingU = static_cast<UINT>(padding);
+            const UINT innerWidth = static_cast<UINT>(std::max(1, frameWidthInt - 2 * padding));
+            const UINT innerHeight = static_cast<UINT>(std::max(1, frameHeightInt - 2 * padding));
+
+            auto blitScaled = [&](const std::vector<uint8_t>& src, UINT destX, UINT destY) {
+                if (innerWidth == 0 || innerHeight == 0) {
+                    return;
+                }
+
+                const UINT stride = width * 4;
+                const float scaleX = static_cast<float>(width) / static_cast<float>(innerWidth);
+                const float scaleY = static_cast<float>(height) / static_cast<float>(innerHeight);
+
+                for (UINT y = 0; y < innerHeight; ++y) {
+                    const UINT srcY = std::min(height - 1, static_cast<UINT>(std::lroundf(static_cast<float>(y) * scaleY)));
+                    uint8_t* dstRow = compositeBuffer_.data() +
+                                      (static_cast<size_t>(destY + paddingU + y) * compositeStride) +
+                                      (destX + paddingU) * 4;
+                    const uint8_t* srcRow = src.data() + static_cast<size_t>(srcY) * stride;
+                    for (UINT x = 0; x < innerWidth; ++x) {
+                        const UINT srcX = std::min(width - 1, static_cast<UINT>(std::lroundf(static_cast<float>(x) * scaleX)));
+                        const uint8_t* srcPixel = srcRow + srcX * 4;
+                        uint8_t* dstPixel = dstRow + x * 4;
+                        dstPixel[0] = srcPixel[0];
+                        dstPixel[1] = srcPixel[1];
+                        dstPixel[2] = srcPixel[2];
+                        dstPixel[3] = srcPixel[3];
+                    }
+                }
+            };
+
+            for (size_t index = 0; index < stageCount; ++index) {
+                const size_t row = index / columns;
+                const size_t column = index % columns;
+                const UINT destX = static_cast<UINT>(column) * width;
+                const UINT destY = static_cast<UINT>(row) * height;
+                const auto* stage = debugStages[index];
+                if (stage && !stage->empty()) {
+                    blitScaled(*stage, destX, destY);
+                }
             }
+
+            displayData = compositeBuffer_.data();
+            displayWidth = compositeWidth;
+            displayHeight = compositeHeight;
+        } else {
+            displayData = stageFinal_.data();
+            displayWidth = width;
+            displayHeight = height;
         }
-    };
-
-    blitScaled(stageRaw_, 0, 0);
-    blitScaled(stageBw_, width, 0);
-    blitScaled(stageZoom_, 0, height);
-    blitScaled(stageFinal_, width, height);
-
-    if (renderWidget_ && renderWidget_->isPresenterReady()) {
-        presenter_->Present(compositeBuffer_.data(), compositeWidth, compositeHeight);
+    } else {
+        displayData = stageFinal_.data();
+        displayWidth = width;
+        displayHeight = height;
     }
+
+    const bool cropToFill = !debugViewEnabled_;
+    const float centerX = cropToFill ? zoomCenterX_ : 0.5f;
+    const float centerY = cropToFill ? zoomCenterY_ : 0.5f;
+    PresentFitted(displayData, displayWidth, displayHeight, cropToFill, centerX, centerY);
+}
+
+void OpenZoomApp::PresentFitted(const uint8_t* data,
+                                UINT srcWidth,
+                                UINT srcHeight,
+                                bool cropToFill,
+                                float centerXNorm,
+                                float centerYNorm) {
+    if (!data || srcWidth == 0 || srcHeight == 0) {
+        return;
+    }
+
+    if (!renderWidget_ || !renderWidget_->isPresenterReady()) {
+        return;
+    }
+
+    const int targetWidthInt = std::max(1, renderWidget_->width());
+    const int targetHeightInt = std::max(1, renderWidget_->height());
+    const UINT targetWidth = static_cast<UINT>(targetWidthInt);
+    const UINT targetHeight = static_cast<UINT>(targetHeightInt);
+
+    presentationBuffer_.assign(static_cast<size_t>(targetWidth) * targetHeight * 4, 0);
+
+    const float srcWidthF = static_cast<float>(srcWidth);
+    const float srcHeightF = static_cast<float>(srcHeight);
+    const float targetAspect = static_cast<float>(targetWidth) / static_cast<float>(targetHeight);
+    const float srcAspect = srcWidthF / srcHeightF;
+
+    float cropWidth = srcWidthF;
+    float cropHeight = srcHeightF;
+
+    if (cropToFill) {
+        if (targetAspect > srcAspect) {
+            cropHeight = srcWidthF / targetAspect;
+            cropHeight = std::min(cropHeight, srcHeightF);
+        } else {
+            cropWidth = srcHeightF * targetAspect;
+            cropWidth = std::min(cropWidth, srcWidthF);
+        }
+    }
+
+    cropWidth = std::clamp(cropWidth, 1.0f, srcWidthF);
+    cropHeight = std::clamp(cropHeight, 1.0f, srcHeightF);
+
+    float centerX = std::clamp(centerXNorm, 0.0f, 1.0f) * (srcWidthF - 1.0f);
+    float centerY = std::clamp(centerYNorm, 0.0f, 1.0f) * (srcHeightF - 1.0f);
+
+    const float halfCropWidth = cropWidth * 0.5f;
+    const float halfCropHeight = cropHeight * 0.5f;
+
+    const float minCenterX = std::max(0.0f, halfCropWidth - 0.5f);
+    const float maxCenterX = std::max(minCenterX, (srcWidthF - 1.0f) - (halfCropWidth - 0.5f));
+    const float minCenterY = std::max(0.0f, halfCropHeight - 0.5f);
+    const float maxCenterY = std::max(minCenterY, (srcHeightF - 1.0f) - (halfCropHeight - 0.5f));
+
+    if (minCenterX <= maxCenterX) {
+        centerX = std::clamp(centerX, minCenterX, maxCenterX);
+    } else {
+        centerX = (srcWidthF - 1.0f) * 0.5f;
+    }
+
+    if (minCenterY <= maxCenterY) {
+        centerY = std::clamp(centerY, minCenterY, maxCenterY);
+    } else {
+        centerY = (srcHeightF - 1.0f) * 0.5f;
+    }
+
+    float startX = centerX - halfCropWidth + 0.5f;
+    float startY = centerY - halfCropHeight + 0.5f;
+    startX = std::clamp(startX, 0.0f, srcWidthF - cropWidth);
+    startY = std::clamp(startY, 0.0f, srcHeightF - cropHeight);
+
+    float scaleFactor;
+    if (cropToFill) {
+        scaleFactor = static_cast<float>(targetWidth) / cropWidth;
+    } else {
+        const float widthScale = static_cast<float>(targetWidth) / cropWidth;
+        const float heightScale = static_cast<float>(targetHeight) / cropHeight;
+        scaleFactor = std::min(widthScale, heightScale);
+    }
+
+    if (!(scaleFactor > 0.0f) || !std::isfinite(scaleFactor)) {
+        scaleFactor = 1.0f;
+    }
+
+    UINT activeWidth = static_cast<UINT>(std::roundf(cropWidth * scaleFactor));
+    UINT activeHeight = static_cast<UINT>(std::roundf(cropHeight * scaleFactor));
+    activeWidth = std::clamp(activeWidth, 1u, targetWidth);
+    activeHeight = std::clamp(activeHeight, 1u, targetHeight);
+
+    const UINT offsetX = (targetWidth > activeWidth) ? (targetWidth - activeWidth) / 2 : 0;
+    const UINT offsetY = (targetHeight > activeHeight) ? (targetHeight - activeHeight) / 2 : 0;
+
+    const float stepX = cropWidth / static_cast<float>(activeWidth);
+    const float stepY = cropHeight / static_cast<float>(activeHeight);
+    const UINT srcStride = srcWidth * 4;
+    const UINT dstStride = targetWidth * 4;
+
+    for (UINT y = 0; y < activeHeight; ++y) {
+        const float sampleY = startY + static_cast<float>(y) * stepY;
+        int srcYIndex = static_cast<int>(std::lroundf(sampleY));
+        srcYIndex = std::clamp(srcYIndex, 0, static_cast<int>(srcHeight) - 1);
+        uint8_t* dstRow = presentationBuffer_.data() +
+                          (static_cast<size_t>(offsetY + y) * dstStride) +
+                          offsetX * 4;
+        const uint8_t* srcRow = data + static_cast<size_t>(srcYIndex) * srcStride;
+        for (UINT x = 0; x < activeWidth; ++x) {
+            const float sampleX = startX + static_cast<float>(x) * stepX;
+            int srcXIndex = static_cast<int>(std::lroundf(sampleX));
+            srcXIndex = std::clamp(srcXIndex, 0, static_cast<int>(srcWidth) - 1);
+            const uint8_t* srcPixel = srcRow + srcXIndex * 4;
+            uint8_t* dstPixel = dstRow + x * 4;
+            dstPixel[0] = srcPixel[0];
+            dstPixel[1] = srcPixel[1];
+            dstPixel[2] = srcPixel[2];
+            dstPixel[3] = srcPixel[3];
+        }
+    }
+
+    presenter_->Present(presentationBuffer_.data(), targetWidth, targetHeight);
 }
 
 } // namespace openzoom
+
+#include "app.moc"
 
 #endif // _WIN32

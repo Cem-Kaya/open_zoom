@@ -30,15 +30,22 @@ if exist "%CACHE_FILE%" (
     )
 )
 
+set "QT_BIN_DIR="
+
 if defined QT_PREFIX (
     set "CMAKE_QT_ARGS=-DCMAKE_PREFIX_PATH=%QT_PREFIX%"
+    call :resolve_qt_bindir "%QT_PREFIX%"
 ) else if defined Qt6_DIR (
     set "CMAKE_QT_ARGS=-DQt6_DIR=%Qt6_DIR%"
+    call :resolve_qt_bindir "%Qt6_DIR%"
 ) else if exist "%QT_PREFIX_DEFAULT%" (
     set "CMAKE_QT_ARGS=-DCMAKE_PREFIX_PATH=%QT_PREFIX_DEFAULT%"
+    call :resolve_qt_bindir "%QT_PREFIX_DEFAULT%"
 ) else (
     set "CMAKE_QT_ARGS="
 )
+
+if not defined QT_BIN_DIR if exist "%QT_PREFIX_DEFAULT%" call :resolve_qt_bindir "%QT_PREFIX_DEFAULT%"
 
 cmake -S "%ROOT_DIR%" -B "%BUILD_DIR%" -G "Visual Studio 17 2022" -A x64 %CMAKE_QT_ARGS%
 if errorlevel 1 goto :fail
@@ -49,11 +56,13 @@ if errorlevel 1 goto :fail
 set EXE_PATH=%BUILD_DIR%\Release\open_zoom.exe
 if exist "%EXE_PATH%" (
     echo Launching %EXE_PATH%
+    call :prepare_qt_runtime "%EXE_PATH%"
     "%EXE_PATH%"
 ) else (
     set EXE_PATH=%BUILD_DIR%\open_zoom.exe
     if exist "%EXE_PATH%" (
         echo Launching %EXE_PATH%
+        call :prepare_qt_runtime "%EXE_PATH%"
         "%EXE_PATH%"
     ) else (
         echo Executable not found. Build may have failed.
@@ -65,6 +74,46 @@ popd
 popd
 endlocal
 exit /b 0
+
+:resolve_qt_bindir
+if defined QT_BIN_DIR goto :eof
+set "QT_ROOT=%~1"
+if not defined QT_ROOT goto :eof
+for %%I in ("%QT_ROOT%") do set "QT_ROOT=%%~fI"
+if exist "%QT_ROOT%\bin" (
+    set "QT_BIN_DIR=%QT_ROOT%\bin"
+    goto :eof
+)
+for %%I in ("%QT_ROOT%\..") do if not defined QT_BIN_DIR if exist "%%~fI\bin" set "QT_BIN_DIR=%%~fI\bin"
+for %%I in ("%QT_ROOT%\..\..") do if not defined QT_BIN_DIR if exist "%%~fI\bin" set "QT_BIN_DIR=%%~fI\bin"
+for %%I in ("%QT_ROOT%\..\..\..") do if not defined QT_BIN_DIR if exist "%%~fI\bin" set "QT_BIN_DIR=%%~fI\bin"
+goto :eof
+
+:prepare_qt_runtime
+if not defined QT_BIN_DIR goto :prepare_qt_runtime_noqt
+if not exist "%QT_BIN_DIR%" (
+    echo Warning: Qt runtime directory "%QT_BIN_DIR%" not found.
+    set "QT_BIN_DIR="
+    goto :prepare_qt_runtime_noqt
+)
+set "PATH=%QT_BIN_DIR%;%PATH%"
+set "WINDEPLOYQT=%QT_BIN_DIR%\windeployqt.exe"
+for %%I in ("%~1") do set "EXE_DIR=%%~dpI"
+if defined EXE_DIR (
+    set "EXE_DIR=%EXE_DIR:"=%"
+    if "%EXE_DIR:~-1%"=="\\" set "EXE_DIR=%EXE_DIR:~0,-1%"
+)
+if exist "%WINDEPLOYQT%" (
+    echo Running Qt deployment tool: %WINDEPLOYQT%
+    "%WINDEPLOYQT%" --release "%~1" --dir "%EXE_DIR%"
+) else (
+    echo windeployqt.exe not found at "%WINDEPLOYQT%"; skipping deployment copy.
+)
+goto :eof
+
+:prepare_qt_runtime_noqt
+echo Qt runtime directory not detected; skipping Qt PATH update and deployment.
+goto :eof
 
 :fail
 popd
