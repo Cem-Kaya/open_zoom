@@ -22,13 +22,14 @@ Chronology / key accomplishments
    - Graceful shutdown on WM_CLOSE (camera thread stops, COM uninitializes, PowerShell prompt returns).
 
 4. Debugging view (current state)
-   - CPU pipeline converts each frame to BGRA, produces per-stage buffers (raw, black/white, zoom, final).
-   - Composite debug texture (2×2 quadrants) with padding to visualize each stage side-by-side; uploaded to GPU each frame.
+   - CPU pipeline converts each frame to BGRA, produces per-stage buffers (raw, black/white, zoom, blur, final).
+   - Composite debug texture auto-lays the available stages into a grid, so new effects appear without manual wiring.
    - Gradient fallback removed from active path (only black clear if no frame yet) to eliminate the colored noise overlay.
 
 Current limitations / open items
 - CUDA kernels are disabled except for legacy gradient helper; interop still registered but unused. Need to restore GPU path once debug verifies inputs.
-- Quadrant scaling is nearest-neighbor; consider better resample for clarity.
+- Blur currently runs on the UI thread; acceptable for testing but ideally moves to a worker (or GPU) before shipping.
+- Debug grid still uses nearest-neighbour scaling; consider a higher-quality resample for clarity.
 - No overlays for format info / diagnostics; could add text or ImGui.
 - Still-frame capture pipeline absent in this branch.
 
@@ -73,3 +74,9 @@ Update (2025-02): Qt+D3D12 refactor landed, Media Foundation capture stable on C
 Update (2025-02): After refactor the Qt runtime DLLs are required at launch on Windows. Ensure Qtin is on PATH or copy Qt6*.dll beside open_zoom.exe before running the batch.
 
 Update (2025-02): Added .gitignore (filters build/, ref/, IDE, Qt artifacts) and docs/README.md basics. Remember to sync these whenever the directory layout changes, especially when new generated folders appear. Qt runtime DLL note remains: ensure PATH points to Qtin before running.
+
+Update (2025-10): UI/UX polish and CPU blur pass
+- Added Gaussian blur stage with adjustable sigma/radius and hooked it into the CPU pipeline; debug grid now visualises every active stage.
+- Zoom UX improved: Ctrl + mouse wheel zooms around the cursor, middle mouse drag pans, virtual joystick sits bottom-right with a circular mask.
+- Control tray collapses behind a toggle, camera list sorts alphabetically, blur controls report live values.
+- `scripts/build_and_run.bat` resolves Qt bin automatically and runs `windeployqt`, producing a self-contained Release folder.
