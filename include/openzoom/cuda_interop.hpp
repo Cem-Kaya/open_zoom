@@ -6,6 +6,9 @@
 #include <d3d12.h>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 #if defined(__has_include)
 #  if __has_include(<cuda_runtime.h>) && __has_include(<cuda_surface_types.h>) && __has_include(<surface_functions.h>)
@@ -20,6 +23,9 @@
 #  define OPENZOOM_HAS_CUDA_EXT_MEMORY 0
 #endif
 
+struct ID3D12Device;
+struct ID3D12Resource;
+
 namespace openzoom {
 
 struct ProcessingSettings {
@@ -27,6 +33,19 @@ struct ProcessingSettings {
     float blackWhiteThreshold{0.5f};
     bool enableZoom{false};
     float zoomAmount{1.0f};
+    float zoomCenterX{0.5f};
+    float zoomCenterY{0.5f};
+    bool enableBlur{false};
+    int blurRadius{3};
+    float blurSigma{1.0f};
+    bool drawFocusMarker{false};
+};
+
+struct ProcessingInput {
+    const uint8_t* hostBgra{nullptr};
+    unsigned int hostStride{0};
+    unsigned int width{0};
+    unsigned int height{0};
 };
 
 #if OPENZOOM_HAS_CUDA_EXT_MEMORY
@@ -39,7 +58,8 @@ public:
 
     void RunGradientDemoKernel(unsigned int width, unsigned int height, float timeSeconds);
 
-    void ProcessFrame(unsigned int /*width*/, unsigned int /*height*/, const ProcessingSettings& /*settings*/) {}
+    bool ProcessFrame(const ProcessingInput& input, const ProcessingSettings& settings);
+    const std::string& LastError() const { return lastError_; }
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;
@@ -49,6 +69,9 @@ private:
 
     bool SelectCudaDeviceMatching(LUID adapterLuid);
     bool CreateSurfaceFromResource(ID3D12Device* device, ID3D12Resource* texture);
+    bool EnsureDeviceBuffers(unsigned int width, unsigned int height);
+    void ReleaseDeviceBuffers();
+    bool EnsureGaussianKernel(int radius, float sigma);
 
     cudaExternalMemory_t externalMemory_{};
     cudaMipmappedArray_t mipArray_{};
@@ -61,6 +84,19 @@ private:
     DXGI_FORMAT format_{DXGI_FORMAT_UNKNOWN};
     int cudaDeviceId_{-1};
     bool valid_{false};
+
+    uchar4* deviceBufferA_{};
+    uchar4* deviceBufferB_{};
+    uchar4* deviceScratch_{};
+    size_t devicePitchA_{};
+    size_t devicePitchB_{};
+    size_t devicePitchScratch_{};
+    unsigned int deviceWidth_{};
+    unsigned int deviceHeight_{};
+    int cachedKernelRadius_{-1};
+    float cachedKernelSigma_{0.0f};
+    bool kernelUploaded_{};
+    std::string lastError_;
 };
 #else
 class CudaInteropSurface {
@@ -72,7 +108,9 @@ public:
 
     void RunGradientDemoKernel(unsigned int /*width*/, unsigned int /*height*/, float /*timeSeconds*/) {}
 
-    void ProcessFrame(unsigned int /*width*/, unsigned int /*height*/, const ProcessingSettings& /*settings*/) {}
+    bool ProcessFrame(const ProcessingInput& /*input*/, const ProcessingSettings& /*settings*/) { return false; }
+
+    const std::string& LastError() const { static std::string dummy; return dummy; }
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;

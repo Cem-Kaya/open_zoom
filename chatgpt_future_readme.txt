@@ -80,3 +80,12 @@ Update (2025-10): UI/UX polish and CPU blur pass
 - Zoom UX improved: Ctrl + mouse wheel zooms around the cursor, middle mouse drag pans, virtual joystick sits bottom-right with a circular mask.
 - Control tray collapses behind a toggle, camera list sorts alphabetically, blur controls report live values.
 - `scripts/build_and_run.bat` resolves Qt bin automatically and runs `windeployqt`, producing a self-contained Release folder.
+
+Update (2025-11): Input polish and deployment fix
+- Two-finger touchpad scroll without Ctrl now pans the zoomed view; the handler consumes high-precision wheel gestures only when zoom is active.
+- A `Show Focus Point` checkbox in the debug panel overlays a red marker at the live zoom center so cursor-driven focus updates are obvious.
+- `scripts/build_and_run.bat` now trims the trailing `\` from the deployment directory before calling `windeployqt`, fixing the `Could not create directory ...Release"` error.
+- Qt's optional `WrapVulkanHeaders` probe still prints a warning during CMake configure; that's benign for the CUDA + D3D12 pipeline and can be ignored.
+- GPU processing path is live: frames upload into a shared D3D12 texture, CUDA kernels run black/white, zoom (with focus), separable blur, and focus-marker passes, and the presenter copies the texture directly to the swap chain. CPU compositing remains as a fallback (auto-enabled whenever the debug grid is requested).
+- Added verbose CUDA interop diagnostics (LUID matching, external memory import, per-call cudaError strings) so future failures surface actionable detail.
+- The control tray now exposes a "Processing: ..." badge so you can confirm when the CUDA path is active versus when the pipeline has fallen back to the CPU.

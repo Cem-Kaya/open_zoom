@@ -3,14 +3,20 @@
 #include "openzoom/cuda_interop.hpp"
 #include "openzoom/cuda_kernels.hpp"
 
+#include <d3d12.h>
+
 #if OPENZOOM_HAS_CUDA_EXT_MEMORY
 
 #include <windows.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstring>
 #include <stdexcept>
 #include <string>
 #include <utility>
-#include <cstring>
+
+#include <QDebug>
 
 namespace openzoom {
 
@@ -18,13 +24,16 @@ namespace {
 
 void ThrowIfFailed(HRESULT hr, const char* message) {
     if (FAILED(hr)) {
+        qWarning() << message << "hr=0x" << Qt::hex << static_cast<unsigned long>(hr);
         throw std::runtime_error(std::string(message) + " (hr=0x" + std::to_string(static_cast<unsigned long>(hr)) + ")");
     }
 }
 
 void ThrowIfCudaFailed(cudaError_t status, const char* message) {
     if (status != cudaSuccess) {
-        throw std::runtime_error(std::string(message) + ": " + cudaGetErrorString(status));
+        const char* err = cudaGetErrorString(status);
+        qWarning() << message << "cudaError=" << status << err;
+        throw std::runtime_error(std::string(message) + ": " + err);
     }
 }
 
@@ -57,14 +66,19 @@ cudaChannelFormatDesc MakeChannelDescForFormat(DXGI_FORMAT format) {
     }
 }
 
+constexpr int kMaxCudaBlurRadius = 15;
+
 } // namespace
 
 CudaInteropSurface::CudaInteropSurface(ID3D12Resource* texture) {
     try {
         Initialize(texture);
         valid_ = true;
-    } catch (const std::exception&) {
+        lastError_.clear();
+    } catch (const std::exception& e) {
+        qWarning() << "CudaInteropSurface init failed:" << e.what();
         valid_ = false;
+        lastError_ = e.what();
         if (surfaceObject_ != 0) {
             cudaDestroySurfaceObject(surfaceObject_);
             surfaceObject_ = 0;
@@ -97,6 +111,8 @@ CudaInteropSurface::~CudaInteropSurface() {
         cudaStreamDestroy(stream_);
         stream_ = nullptr;
     }
+
+    ReleaseDeviceBuffers();
 }
 
 bool CudaInteropSurface::SelectCudaDeviceMatching(LUID adapterLuid) {
@@ -107,13 +123,17 @@ bool CudaInteropSurface::SelectCudaDeviceMatching(LUID adapterLuid) {
         cudaDeviceProp properties{};
         ThrowIfCudaFailed(cudaGetDeviceProperties(&properties, deviceId), "cudaGetDeviceProperties failed");
 
-        if (std::memcmp(&adapterLuid, properties.luid, sizeof(LUID)) == 0) {
+        if (properties.luidSupported &&
+            std::memcmp(&adapterLuid, properties.luid, sizeof(LUID)) == 0) {
+            qInfo() << "CUDA device" << deviceId << properties.name << "matches DXGI adapter";
             ThrowIfCudaFailed(cudaSetDevice(deviceId), "cudaSetDevice failed");
             cudaDeviceId_ = deviceId;
             return true;
         }
     }
 
+    lastError_ = "No CUDA device matched DXGI adapter LUID";
+    qWarning() << "No CUDA device matched DXGI adapter LUID; CUDA interop disabled";
     return false;
 }
 
@@ -127,6 +147,7 @@ bool CudaInteropSurface::CreateSurfaceFromResource(ID3D12Device* device, ID3D12R
                                              nullptr,
                                              &sharedHandle),
                   "Failed to create shared handle for D3D12 resource");
+    qInfo() << "Created shared D3D12 resource handle for CUDA interop";
 
     D3D12_RESOURCE_DESC desc = texture->GetDesc();
     width_ = static_cast<UINT>(desc.Width);
@@ -156,7 +177,7 @@ bool CudaInteropSurface::CreateSurfaceFromResource(ID3D12Device* device, ID3D12R
         cudaExternalMemoryMipmappedArrayDesc arrayDesc{};
         arrayDesc.offset = 0;
         arrayDesc.numLevels = 1;
-        arrayDesc.extent = make_cudaExtent(width_, height_, 1);
+        arrayDesc.extent = make_cudaExtent(width_, height_, 0);
         arrayDesc.formatDesc = MakeChannelDescForFormat(format_);
         arrayDesc.flags = cudaArraySurfaceLoadStore | cudaArrayColorAttachment;
 
@@ -172,11 +193,17 @@ bool CudaInteropSurface::CreateSurfaceFromResource(ID3D12Device* device, ID3D12R
                           "cudaCreateSurfaceObject failed");
 
         ThrowIfCudaFailed(cudaStreamCreate(&stream_), "cudaStreamCreate failed");
-    } catch (...) {
+    } catch (const std::exception& e) {
+        lastError_ = e.what();
+        qWarning() << "CreateSurfaceFromResource exception:" << e.what();
         cleanupHandle();
         throw;
     }
 
+    cachedKernelRadius_ = -1;
+    cachedKernelSigma_ = 0.0f;
+    kernelUploaded_ = false;
+    qInfo() << "CUDA external memory imported successfully (" << width_ << "x" << height_ << ")";
     return true;
 }
 
@@ -196,6 +223,78 @@ void CudaInteropSurface::Initialize(ID3D12Resource* texture) {
     CreateSurfaceFromResource(device.Get(), texture);
 }
 
+bool CudaInteropSurface::EnsureDeviceBuffers(unsigned int width, unsigned int height) {
+    if (deviceBufferA_ && deviceBufferB_ && deviceWidth_ == width && deviceHeight_ == height) {
+        return true;
+    }
+
+    ReleaseDeviceBuffers();
+
+    size_t pitch = 0;
+    if (cudaDeviceId_ >= 0) {
+        ThrowIfCudaFailed(cudaSetDevice(cudaDeviceId_), "cudaSetDevice failed");
+    }
+
+    ThrowIfCudaFailed(cudaMallocPitch(reinterpret_cast<void**>(&deviceBufferA_), &devicePitchA_,
+                                      static_cast<size_t>(width) * sizeof(uchar4), height),
+                      "cudaMallocPitch buffer A failed");
+    ThrowIfCudaFailed(cudaMallocPitch(reinterpret_cast<void**>(&deviceBufferB_), &devicePitchB_,
+                                      static_cast<size_t>(width) * sizeof(uchar4), height),
+                      "cudaMallocPitch buffer B failed");
+    ThrowIfCudaFailed(cudaMallocPitch(reinterpret_cast<void**>(&deviceScratch_), &devicePitchScratch_,
+                                      static_cast<size_t>(width) * sizeof(uchar4), height),
+                      "cudaMallocPitch scratch buffer failed");
+
+    deviceWidth_ = width;
+    deviceHeight_ = height;
+    return true;
+}
+
+void CudaInteropSurface::ReleaseDeviceBuffers() {
+    if (deviceBufferA_) {
+        cudaFree(deviceBufferA_);
+        deviceBufferA_ = nullptr;
+    }
+    if (deviceBufferB_) {
+        cudaFree(deviceBufferB_);
+        deviceBufferB_ = nullptr;
+    }
+    if (deviceScratch_) {
+        cudaFree(deviceScratch_);
+        deviceScratch_ = nullptr;
+    }
+    devicePitchA_ = 0;
+    devicePitchB_ = 0;
+    devicePitchScratch_ = 0;
+    deviceWidth_ = 0;
+    deviceHeight_ = 0;
+    kernelUploaded_ = false;
+}
+
+bool CudaInteropSurface::EnsureGaussianKernel(int radius, float sigma) {
+    const int clampedRadius = std::min(std::max(radius, 1), kMaxCudaBlurRadius);
+    const float clampedSigma = std::max(sigma, 0.001f);
+
+    if (kernelUploaded_ && cachedKernelRadius_ == clampedRadius &&
+        std::abs(cachedKernelSigma_ - clampedSigma) < 1e-4f) {
+        return true;
+    }
+
+    if (cudaDeviceId_ >= 0) {
+        ThrowIfCudaFailed(cudaSetDevice(cudaDeviceId_), "cudaSetDevice failed");
+    }
+
+    if (!UploadGaussianKernel(clampedRadius, clampedSigma, stream_)) {
+        kernelUploaded_ = false;
+        return false;
+    }
+
+    cachedKernelRadius_ = clampedRadius;
+    cachedKernelSigma_ = clampedSigma;
+    kernelUploaded_ = true;
+    return true;
+}
+
 void CudaInteropSurface::RunGradientDemoKernel(unsigned int width, unsigned int height, float timeSeconds) {
     if (!valid_) {
         return;
@@ -211,6 +310,83 @@ void CudaInteropSurface::RunGradientDemoKernel(unsigned int width, unsigned int 
     LaunchGradientKernel(surfaceObject_, static_cast<int>(targetWidth), static_cast<int>(targetHeight), timeSeconds);
     ThrowIfCudaFailed(cudaGetLastError(), "Gradient kernel launch failed");
     ThrowIfCudaFailed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed");
+}
+
+bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input, const ProcessingSettings& settings) {
+    if (!valid_ || !input.hostBgra || input.width == 0 || input.height == 0) {
+        return false;
+    }
+
+    if (input.width != width_ || input.height != height_) {
+        return false;
+    }
+
+    try {
+        if (!EnsureDeviceBuffers(input.width, input.height)) {
+            return false;
+        }
+
+        ThrowIfCudaFailed(cudaMemcpy2DAsync(deviceBufferA_, devicePitchA_,
+                                            input.hostBgra, input.hostStride,
+                                            static_cast<size_t>(input.width) * sizeof(uchar4), input.height,
+                                            cudaMemcpyHostToDevice, stream_),
+                          "cudaMemcpy2DAsync host->device failed");
+
+        uchar4* current = deviceBufferA_;
+        uchar4* alternate = deviceBufferB_;
+        size_t currentPitch = devicePitchA_;
+        size_t alternatePitch = devicePitchB_;
+
+        auto swapBuffers = [&]() {
+            std::swap(current, alternate);
+            std::swap(currentPitch, alternatePitch);
+        };
+
+        if (settings.enableBlackWhite) {
+            LaunchBlackWhiteLinear(alternate, alternatePitch, current, currentPitch,
+                                   static_cast<int>(input.width), static_cast<int>(input.height),
+                                   settings.blackWhiteThreshold, stream_);
+            swapBuffers();
+        }
+
+        if (settings.enableZoom) {
+            LaunchZoomLinear(alternate, alternatePitch, current, currentPitch,
+                             static_cast<int>(input.width), static_cast<int>(input.height),
+                             settings.zoomAmount, settings.zoomCenterX, settings.zoomCenterY, stream_);
+            swapBuffers();
+        }
+
+        if (settings.enableBlur && settings.blurRadius > 0 && settings.blurSigma > 0.0f) {
+            if (!EnsureGaussianKernel(settings.blurRadius, settings.blurSigma)) {
+                kernelUploaded_ = false;
+                return false;
+            }
+
+            LaunchGaussianBlurLinear(alternate, alternatePitch,
+                                     deviceScratch_, devicePitchScratch_,
+                                     current, currentPitch,
+                                     static_cast<int>(input.width), static_cast<int>(input.height),
+                                     stream_);
+            swapBuffers();
+        }
+
+        if (settings.drawFocusMarker) {
+            LaunchFocusMarkerLinear(current, currentPitch,
+                                    static_cast<int>(input.width), static_cast<int>(input.height),
+                                    settings.zoomCenterX, settings.zoomCenterY, stream_);
+        }
+
+        ThrowIfCudaFailed(cudaMemcpy2DToArrayAsync(level0Array_, 0, 0,
+                                                   current, currentPitch,
+                                                   static_cast<size_t>(input.width) * sizeof(uchar4), input.height,
+                                                   cudaMemcpyDeviceToDevice, stream_),
+                          "cudaMemcpy2DToArrayAsync failed");
+
+        ThrowIfCudaFailed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed");
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace openzoom

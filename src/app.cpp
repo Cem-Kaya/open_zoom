@@ -1,6 +1,7 @@
 #ifdef _WIN32
 
 #include "openzoom/app.hpp"
+#include "openzoom/cuda_interop.hpp"
 #include <QApplication>
 #include <QCheckBox>
 #include <QComboBox>
@@ -27,6 +28,7 @@
 #include <QPaintEngine>
 #include <QResizeEvent>
 #include <QShowEvent>
+#include <QDebug>
 
 #include <windows.h>
 #include <combaseapi.h>
@@ -554,6 +556,57 @@ public:
         WaitForGpu();
     }
 
+    void PresentFromTexture(ID3D12Resource* texture, UINT width, UINT height) {
+        if (!initialized_ || !texture || width == 0 || height == 0) {
+            return;
+        }
+
+        if (width != width_ || height != height_) {
+            Resize(width, height);
+        }
+
+        ThrowIfFailed(commandAllocator_->Reset(), "Failed to reset command allocator");
+        ThrowIfFailed(commandList_->Reset(commandAllocator_.Get(), nullptr), "Failed to reset command list");
+
+        const UINT backIndex = swapChain_->GetCurrentBackBufferIndex();
+        Microsoft::WRL::ComPtr<ID3D12Resource> backBuffer = backBuffers_[backIndex];
+
+        auto transitionSourceToCopy = TransitionBarrier(texture,
+                                                        D3D12_RESOURCE_STATE_COMMON,
+                                                        D3D12_RESOURCE_STATE_COPY_SOURCE);
+        commandList_->ResourceBarrier(1, &transitionSourceToCopy);
+
+        auto transitionDestToCopy = TransitionBarrier(backBuffer.Get(),
+                                                      D3D12_RESOURCE_STATE_PRESENT,
+                                                      D3D12_RESOURCE_STATE_COPY_DEST);
+        commandList_->ResourceBarrier(1, &transitionDestToCopy);
+
+        commandList_->CopyResource(backBuffer.Get(), texture);
+
+        auto transitionDestToPresent = TransitionBarrier(backBuffer.Get(),
+                                                         D3D12_RESOURCE_STATE_COPY_DEST,
+                                                         D3D12_RESOURCE_STATE_PRESENT);
+        commandList_->ResourceBarrier(1, &transitionDestToPresent);
+
+        auto transitionSourceToCommon = TransitionBarrier(texture,
+                                                           D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                           D3D12_RESOURCE_STATE_COMMON);
+        commandList_->ResourceBarrier(1, &transitionSourceToCommon);
+
+        ThrowIfFailed(commandList_->Close(), "Failed to close command list");
+
+        ID3D12CommandList* lists[] = { commandList_.Get() };
+        commandQueue_->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
+
+        ThrowIfFailed(swapChain_->Present(1, 0), "Failed to present swap chain");
+
+        WaitForGpu();
+    }
+
+    ID3D12Device* GetDevice() const {
+        return device_.Get();
+    }
+
 private:
     void CreateDevice() {
         UINT dxgiFactoryFlags = 0;
@@ -569,17 +622,37 @@ private:
         factory_ = factory;
 
         Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
-        for (UINT adapterIndex = 0;
-             factory->EnumAdapters1(adapterIndex, &adapter) != DXGI_ERROR_NOT_FOUND;
-             ++adapterIndex) {
+
+        HRESULT hr = factory->EnumAdapterByGpuPreference(0,
+                                                         DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
+                                                         IID_PPV_ARGS(&adapter));
+        if (FAILED(hr) || !adapter) {
+            for (UINT adapterIndex = 0;
+                 factory->EnumAdapters1(adapterIndex, &adapter) != DXGI_ERROR_NOT_FOUND;
+                 ++adapterIndex) {
+                DXGI_ADAPTER_DESC1 desc{};
+                adapter->GetDesc1(&desc);
+                if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
+                    continue;
+                }
+                if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0,
+                                                _uuidof(ID3D12Device), nullptr))) {
+                    qInfo() << "Selected DXGI adapter" << QString::fromWCharArray(desc.Description);
+                    break;
+                }
+            }
+        } else {
             DXGI_ADAPTER_DESC1 desc{};
             adapter->GetDesc1(&desc);
             if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) {
-                continue;
+                adapter.Reset();
+            } else {
+                qInfo() << "Selected high-performance DXGI adapter" << QString::fromWCharArray(desc.Description);
             }
-            if (SUCCEEDED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, _uuidof(ID3D12Device), nullptr))) {
-                break;
-            }
+        }
+
+        if (!adapter) {
+            ThrowIfFailed(E_FAIL, "Failed to locate hardware adapter for D3D12");
         }
 
         ThrowIfFailed(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device_)),
@@ -1066,6 +1139,14 @@ public:
         debugButton_->setCheckable(true);
         debugButton_->setChecked(false);
         debugLayout->addWidget(debugButton_);
+        focusMarkerCheckbox_ = new QCheckBox("Show Focus Point");
+        focusMarkerCheckbox_->setChecked(false);
+        focusMarkerCheckbox_->setToolTip("Overlay a red marker at the current zoom focus");
+        debugLayout->addWidget(focusMarkerCheckbox_);
+        processingStatusLabel_ = new QLabel("Processing: CPU");
+        processingStatusLabel_->setObjectName("processingStatusLabel");
+        processingStatusLabel_->setMinimumWidth(120);
+        debugLayout->addWidget(processingStatusLabel_);
         debugLayout->addStretch(1);
         controlsLayout->addLayout(debugLayout);
 
@@ -1089,6 +1170,7 @@ public:
     QCheckBox* zoomCheckbox() const { return zoomCheckbox_; }
     QSlider* zoomSlider() const { return zoomSlider_; }
     QPushButton* debugButton() const { return debugButton_; }
+    QCheckBox* focusMarkerCheckbox() const { return focusMarkerCheckbox_; }
     QSlider* zoomCenterXSlider() const { return zoomCenterXSlider_; }
     QSlider* zoomCenterYSlider() const { return zoomCenterYSlider_; }
     QCheckBox* joystickCheckbox() const { return joystickCheckbox_; }
@@ -1099,6 +1181,7 @@ public:
     QSlider* blurRadiusSlider() const { return blurRadiusSlider_; }
     QLabel* blurSigmaValueLabel() const { return blurSigmaValueLabel_; }
     QLabel* blurRadiusValueLabel() const { return blurRadiusValueLabel_; }
+    QLabel* processingStatusLabel() const { return processingStatusLabel_; }
 
 protected:
     void keyPressEvent(QKeyEvent* event) override {
@@ -1126,6 +1209,9 @@ protected:
                     if (app_) {
                         app_->HandleZoomWheel(wheel->angleDelta().y(), wheel->position());
                     }
+                    event->accept();
+                    return true;
+                } else if (app_ && app_->HandlePanScroll(wheel)) {
                     event->accept();
                     return true;
                 }
@@ -1176,6 +1262,7 @@ private:
     QCheckBox* zoomCheckbox_{};
     QSlider* zoomSlider_{};
     QPushButton* debugButton_{};
+    QCheckBox* focusMarkerCheckbox_{};
     QSlider* zoomCenterXSlider_{};
     QSlider* zoomCenterYSlider_{};
     QCheckBox* joystickCheckbox_{};
@@ -1186,6 +1273,7 @@ private:
     QSlider* blurRadiusSlider_{};
     QLabel* blurSigmaValueLabel_{};
     QLabel* blurRadiusValueLabel_{};
+    QLabel* processingStatusLabel_{};
     OpenZoomApp* app_{};
 };
 
@@ -1207,6 +1295,7 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     zoomCheckbox_ = mainWindow_->zoomCheckbox();
     zoomSlider_ = mainWindow_->zoomSlider();
     debugButton_ = mainWindow_->debugButton();
+    focusMarkerCheckbox_ = mainWindow_->focusMarkerCheckbox();
     zoomCenterXSlider_ = mainWindow_->zoomCenterXSlider();
     zoomCenterYSlider_ = mainWindow_->zoomCenterYSlider();
     joystickCheckbox_ = mainWindow_->joystickCheckbox();
@@ -1217,6 +1306,7 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     blurRadiusSlider_ = mainWindow_->blurRadiusSlider();
     blurSigmaValueLabel_ = mainWindow_->blurSigmaValueLabel();
     blurRadiusValueLabel_ = mainWindow_->blurRadiusValueLabel();
+    processingStatusLabel_ = mainWindow_->processingStatusLabel();
 
     joystickOverlay_ = new JoystickOverlay(renderWidget_);
     connect(joystickOverlay_, &JoystickOverlay::JoystickChanged,
@@ -1247,6 +1337,10 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     }
     blurEnabled_ = blurCheckbox_ ? blurCheckbox_->isChecked() : false;
     UpdateBlurUiLabels();
+    UpdateProcessingStatusLabel();
+    if (focusMarkerCheckbox_) {
+        focusMarkerEnabled_ = focusMarkerCheckbox_->isChecked();
+    }
 
     PopulateCameraCombo();
 
@@ -1295,6 +1389,10 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     if (blurRadiusSlider_) {
         connect(blurRadiusSlider_, &QSlider::valueChanged,
                 this, &OpenZoomApp::OnBlurRadiusChanged);
+    }
+    if (focusMarkerCheckbox_) {
+        connect(focusMarkerCheckbox_, &QCheckBox::toggled,
+                this, &OpenZoomApp::OnFocusMarkerToggled);
     }
 
     UpdateBlurUiLabels();
@@ -1446,6 +1544,10 @@ void OpenZoomApp::OnZoomAmountChanged(int value) {
 
 void OpenZoomApp::OnDebugViewToggled(bool checked) {
     debugViewEnabled_ = checked;
+    if (focusMarkerCheckbox_) {
+        focusMarkerCheckbox_->setEnabled(!checked);
+    }
+    UpdateProcessingStatusLabel();
 }
 
 void OpenZoomApp::OnZoomCenterXChanged(int value) {
@@ -1493,11 +1595,13 @@ void OpenZoomApp::OnVirtualJoystickToggled(bool checked) {
 void OpenZoomApp::OnBlurToggled(bool checked) {
     blurEnabled_ = checked;
     UpdateBlurUiLabels();
+    UpdateProcessingStatusLabel();
 }
 
 void OpenZoomApp::OnBlurSigmaChanged(int value) {
     blurSigma_ = SliderValueToSigma(value);
     UpdateBlurUiLabels();
+    UpdateProcessingStatusLabel();
 }
 
 void OpenZoomApp::OnBlurRadiusChanged(int value) {
@@ -1508,6 +1612,11 @@ void OpenZoomApp::OnBlurRadiusChanged(int value) {
     }
     blurRadius_ = normalized;
     UpdateBlurUiLabels();
+    UpdateProcessingStatusLabel();
+}
+
+void OpenZoomApp::OnFocusMarkerToggled(bool checked) {
+    focusMarkerEnabled_ = checked;
 }
 
 void OpenZoomApp::SetZoomCenter(float normX, float normY, bool syncUi) {
@@ -1548,6 +1657,62 @@ bool OpenZoomApp::HandlePanKey(int key, bool pressed) {
         break;
     }
     return false;
+}
+
+bool OpenZoomApp::HandlePanScroll(const QWheelEvent* wheelEvent) {
+    if (!wheelEvent || !renderWidget_) {
+        return false;
+    }
+
+    if (debugViewEnabled_) {
+        return false;
+    }
+
+    if (!zoomEnabled_ || zoomAmount_ <= 1.0f) {
+        return false;
+    }
+
+    QPointF pixelDelta = wheelEvent->pixelDelta();
+    float deltaX = 0.0f;
+    float deltaY = 0.0f;
+    bool hasPixelPrecision = false;
+
+    if (!pixelDelta.isNull()) {
+        deltaX = pixelDelta.x();
+        deltaY = pixelDelta.y();
+        hasPixelPrecision = true;
+    } else {
+        QPoint angleDelta = wheelEvent->angleDelta();
+        if (angleDelta.isNull()) {
+            return false;
+        }
+        deltaX = static_cast<float>(angleDelta.x()) / 120.0f;
+        deltaY = static_cast<float>(angleDelta.y()) / 120.0f;
+    }
+
+    const float zoomFactor = std::max(zoomAmount_, 1.0f);
+    float moveX = 0.0f;
+    float moveY = 0.0f;
+
+    if (hasPixelPrecision) {
+        const float widgetWidth = static_cast<float>(std::max(1, renderWidget_->width()));
+        const float widgetHeight = static_cast<float>(std::max(1, renderWidget_->height()));
+        moveX = -deltaX / widgetWidth / zoomFactor;
+        moveY = -deltaY / widgetHeight / zoomFactor;
+    } else {
+        constexpr float wheelStepScale = 1.2f;
+        moveX = -deltaX * kPanKeyboardStep * wheelStepScale / zoomFactor;
+        moveY = -deltaY * kPanKeyboardStep * wheelStepScale / zoomFactor;
+    }
+
+    if (std::abs(moveX) < 1e-6f && std::abs(moveY) < 1e-6f) {
+        return false;
+    }
+
+    SetZoomCenter(zoomCenterX_ + moveX,
+                  zoomCenterY_ + moveY,
+                  true);
+    return true;
 }
 
 void OpenZoomApp::ApplyInputForces() {
@@ -1635,6 +1800,32 @@ void OpenZoomApp::UpdateBlurUiLabels() {
         QSignalBlocker block(blurCheckbox_);
         blurCheckbox_->setChecked(blurEnabled_);
     }
+}
+
+void OpenZoomApp::UpdateProcessingStatusLabel() {
+    if (!processingStatusLabel_) {
+        return;
+    }
+
+    QString text;
+    QString color;
+
+    if (debugViewEnabled_) {
+        text = QStringLiteral("Processing: CPU (debug view)");
+        color = QStringLiteral("#d17c00");
+    } else if (usingCudaLastFrame_ && cudaPipelineAvailable_) {
+        text = QStringLiteral("Processing: GPU");
+        color = QStringLiteral("#1c9c3e");
+    } else if (cudaPipelineAvailable_) {
+        text = QStringLiteral("Processing: CPU (fallback)");
+        color = QStringLiteral("#c0392b");
+    } else {
+        text = QStringLiteral("Processing: CPU");
+        color = QStringLiteral("#c0392b");
+    }
+
+    processingStatusLabel_->setText(text);
+    processingStatusLabel_->setStyleSheet(QStringLiteral("color: %1;").arg(color));
 }
 
 void OpenZoomApp::HandleZoomWheel(int delta, const QPointF& localPos) {
@@ -1774,6 +1965,142 @@ bool OpenZoomApp::MapViewToSource(const QPointF& pos, float& outX, float& outY) 
     const float denomY = std::max(srcHeight - 1.0f, 1.0f);
     outX = std::clamp(sampleX / denomX, 0.0f, 1.0f);
     outY = std::clamp(sampleY / denomY, 0.0f, 1.0f);
+    return true;
+}
+
+bool OpenZoomApp::EnsureCudaSurface(UINT width, UINT height) {
+    if (!presenter_ || !renderWidget_ || !renderWidget_->isPresenterReady()) {
+        qWarning() << "CUDA surface unavailable: presenter or render widget not ready";
+        return false;
+    }
+
+    if (cudaSurface_ && cudaSurface_->IsValid() &&
+        cudaSurfaceWidth_ == width && cudaSurfaceHeight_ == height) {
+        return true;
+    }
+
+    cudaSurface_.reset();
+    cudaSharedTexture_.Reset();
+    cudaSurfaceWidth_ = 0;
+    cudaSurfaceHeight_ = 0;
+
+    ID3D12Device* device = presenter_->GetDevice();
+    if (!device) {
+        qWarning() << "CUDA surface unavailable: presenter returned null device";
+        return false;
+    }
+
+    try {
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Alignment = 0;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.SampleDesc.Quality = 0;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
+
+        D3D12_HEAP_PROPERTIES heapProps{};
+        heapProps.Type = D3D12_HEAP_TYPE_DEFAULT;
+        heapProps.CPUPageProperty = D3D12_CPU_PAGE_PROPERTY_UNKNOWN;
+        heapProps.MemoryPoolPreference = D3D12_MEMORY_POOL_UNKNOWN;
+        heapProps.CreationNodeMask = 1;
+        heapProps.VisibleNodeMask = 1;
+
+        ThrowIfFailed(device->CreateCommittedResource(&heapProps,
+                                                      D3D12_HEAP_FLAG_SHARED,
+                                                      &desc,
+                                                      D3D12_RESOURCE_STATE_COMMON,
+                                                      nullptr,
+                                                      IID_PPV_ARGS(&cudaSharedTexture_)),
+                      "Failed to create CUDA shared texture");
+
+        auto surface = std::make_unique<CudaInteropSurface>(cudaSharedTexture_.Get());
+        if (!surface || !surface->IsValid()) {
+            if (surface) {
+                const std::string& err = surface->LastError();
+                if (!err.empty()) {
+                    qWarning() << "CUDA surface detail:" << err.c_str();
+                }
+            }
+            cudaSharedTexture_.Reset();
+            qWarning() << "CUDA surface initialization failed: surface invalid"
+                       << "(requested" << width << "x" << height << ")";
+            return false;
+        }
+
+        cudaSurface_ = std::move(surface);
+        cudaSurfaceWidth_ = width;
+        cudaSurfaceHeight_ = height;
+        cudaPipelineAvailable_ = true;
+        qInfo() << "CUDA surface ready for" << width << "x" << height;
+        return true;
+    } catch (...) {
+        cudaSurface_.reset();
+        cudaSharedTexture_.Reset();
+        cudaSurfaceWidth_ = 0;
+        cudaSurfaceHeight_ = 0;
+        cudaPipelineAvailable_ = false;
+        qWarning() << "CUDA surface creation exception triggered fallback";
+        return false;
+    }
+}
+
+bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
+    if (stageRaw_.empty()) {
+        qWarning() << "CUDA pipeline skipped: stageRaw_ empty";
+        return false;
+    }
+
+    if (!EnsureCudaSurface(width, height)) {
+        qWarning() << "CUDA pipeline disabled: failed to ensure CUDA surface";
+        if (cudaSurface_) {
+            const std::string& err = cudaSurface_->LastError();
+            if (!err.empty()) {
+                qWarning() << "CUDA surface detail:" << err.c_str();
+            }
+        }
+        usingCudaLastFrame_ = false;
+        return false;
+    }
+
+    if (!cudaSurface_) {
+        qWarning() << "CUDA pipeline disabled: surface not available";
+        usingCudaLastFrame_ = false;
+        return false;
+    }
+
+    ProcessingInput input{};
+    input.hostBgra = stageRaw_.data();
+    input.hostStride = width * 4;
+    input.width = width;
+    input.height = height;
+
+    ProcessingSettings settings{};
+    settings.enableBlackWhite = blackWhiteEnabled_;
+    settings.blackWhiteThreshold = blackWhiteThreshold_;
+    settings.enableZoom = zoomEnabled_;
+    settings.zoomAmount = zoomAmount_;
+    settings.zoomCenterX = zoomCenterX_;
+    settings.zoomCenterY = zoomCenterY_;
+    settings.enableBlur = blurEnabled_;
+    settings.blurRadius = std::clamp(blurRadius_, 1, 15);
+    settings.blurSigma = blurSigma_;
+    settings.drawFocusMarker = focusMarkerEnabled_ && !debugViewEnabled_;
+
+    if (!cudaSurface_->ProcessFrame(input, settings)) {
+        cudaPipelineAvailable_ = false;
+        qWarning() << "CUDA pipeline processing failed, falling back to CPU";
+        usingCudaLastFrame_ = false;
+        return false;
+    }
+
+    cudaPipelineAvailable_ = true;
+    presenter_->PresentFromTexture(cudaSharedTexture_.Get(), width, height);
     return true;
 }
 
@@ -2134,6 +2461,13 @@ bool OpenZoomApp::ConvertFrameToBgra(const std::vector<uint8_t>& frame,
 }
 
 void OpenZoomApp::BuildCompositeAndPresent(UINT width, UINT height) {
+    usingCudaLastFrame_ = false;
+    if (!debugViewEnabled_ && ProcessFrameWithCuda(width, height)) {
+        usingCudaLastFrame_ = true;
+        UpdateProcessingStatusLabel();
+        return;
+    }
+
     stageBw_ = stageRaw_;
     if (blackWhiteEnabled_) {
         ApplyBlackWhite(stageRaw_, stageBw_, blackWhiteThreshold_);
@@ -2158,6 +2492,7 @@ void OpenZoomApp::BuildCompositeAndPresent(UINT width, UINT height) {
     stageFinal_ = *currentStage;
 
     if (stageFinal_.empty()) {
+        UpdateProcessingStatusLabel();
         return;
     }
 
@@ -2376,7 +2711,45 @@ void OpenZoomApp::PresentFitted(const uint8_t* data,
         }
     }
 
+    if (focusMarkerEnabled_ && cropToFill) {
+        const float localX = (centerX - startX) / stepX;
+        const float localY = (centerY - startY) / stepY;
+        const float markerX = static_cast<float>(offsetX) + localX;
+        const float markerY = static_cast<float>(offsetY) + localY;
+
+        auto drawFilledCircle = [&](float cx, float cy, float radius,
+                                    uint8_t b, uint8_t g, uint8_t r, uint8_t a) {
+            const int minX = std::max(0, static_cast<int>(std::floor(cx - radius)));
+            const int maxX = std::min(static_cast<int>(targetWidth) - 1,
+                                      static_cast<int>(std::ceil(cx + radius)));
+            const int minY = std::max(0, static_cast<int>(std::floor(cy - radius)));
+            const int maxY = std::min(static_cast<int>(targetHeight) - 1,
+                                      static_cast<int>(std::ceil(cy + radius)));
+            const float radiusSq = radius * radius;
+            for (int py = minY; py <= maxY; ++py) {
+                const float dy = (static_cast<float>(py) + 0.5f) - cy;
+                for (int px = minX; px <= maxX; ++px) {
+                    const float dx = (static_cast<float>(px) + 0.5f) - cx;
+                    if (dx * dx + dy * dy <= radiusSq) {
+                        uint8_t* pixel = presentationBuffer_.data() +
+                                         (static_cast<size_t>(py) * targetWidth + px) * 4;
+                        pixel[0] = b;
+                        pixel[1] = g;
+                        pixel[2] = r;
+                        pixel[3] = a;
+                    }
+                }
+            }
+        };
+
+        constexpr float kMarkerRadius = 18.0f;
+        drawFilledCircle(markerX, markerY, kMarkerRadius, 0, 0, 255, 255);
+        constexpr float kInnerRadius = 6.0f;
+        drawFilledCircle(markerX, markerY, kInnerRadius, 255, 255, 255, 255);
+    }
+
     presenter_->Present(presentationBuffer_.data(), targetWidth, targetHeight);
+    UpdateProcessingStatusLabel();
 }
 
 } // namespace openzoom

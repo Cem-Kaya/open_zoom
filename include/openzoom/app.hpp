@@ -33,7 +33,10 @@ class QShowEvent;
 class QPaintEvent;
 class QMouseEvent;
 class QResizeEvent;
+class QWheelEvent;
 QT_END_NAMESPACE
+
+struct ID3D12Resource;
 
 namespace openzoom {
 
@@ -41,6 +44,7 @@ class D3D12Presenter;
 class RenderWidget;
 class MainWindow;
 class JoystickOverlay;
+class CudaInteropSurface;
 
 class JoystickOverlay : public QWidget {
     Q_OBJECT
@@ -95,6 +99,7 @@ private slots:
     void OnBlurToggled(bool checked);
     void OnBlurSigmaChanged(int value);
     void OnBlurRadiusChanged(int value);
+    void OnFocusMarkerToggled(bool checked);
 
 private:
     void InitializePlatform();
@@ -120,13 +125,17 @@ private:
     void ApplyInputForces();
     void UpdateJoystickVisibility();
     bool HandlePanKey(int key, bool pressed);
+    bool HandlePanScroll(const QWheelEvent* wheelEvent);
     void HandleZoomWheel(int delta, const QPointF& localPos);
     void UpdateBlurUiLabels();
+    void UpdateProcessingStatusLabel();
     void BeginMousePan(const QPointF& pos, const QSize& widgetSize);
     bool UpdateMousePan(const QPointF& pos);
     void EndMousePan();
     bool IsMousePanActive() const { return middlePanActive_; }
     bool MapViewToSource(const QPointF& pos, float& outX, float& outY) const;
+    bool EnsureCudaSurface(UINT width, UINT height);
+    bool ProcessFrameWithCuda(UINT width, UINT height);
 
     QApplication* qtApp_{};
     std::unique_ptr<MainWindow> mainWindow_;
@@ -138,6 +147,7 @@ private:
     QCheckBox* zoomCheckbox_{};
     QSlider* zoomSlider_{};
     QPushButton* debugButton_{};
+    QCheckBox* focusMarkerCheckbox_{};
     QSlider* zoomCenterXSlider_{};
     QSlider* zoomCenterYSlider_{};
     QCheckBox* joystickCheckbox_{};
@@ -148,6 +158,7 @@ private:
     QSlider* blurRadiusSlider_{};
     QLabel* blurSigmaValueLabel_{};
     QLabel* blurRadiusValueLabel_{};
+    QLabel* processingStatusLabel_{};
 
     std::unique_ptr<D3D12Presenter> presenter_;
 
@@ -182,6 +193,7 @@ private:
     bool zoomEnabled_{};
     float zoomAmount_{1.0f};
     bool debugViewEnabled_{};
+    bool focusMarkerEnabled_{};
     float zoomCenterX_{0.5f};
     float zoomCenterY_{0.5f};
     bool controlsCollapsed_{};
@@ -210,6 +222,13 @@ private:
     std::vector<uint8_t> blurScratch_;
 
     JoystickOverlay* joystickOverlay_{};
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> cudaSharedTexture_;
+    std::unique_ptr<CudaInteropSurface> cudaSurface_;
+    UINT cudaSurfaceWidth_{};
+    UINT cudaSurfaceHeight_{};
+    bool cudaPipelineAvailable_{};
+    bool usingCudaLastFrame_{};
 };
 
 } // namespace openzoom

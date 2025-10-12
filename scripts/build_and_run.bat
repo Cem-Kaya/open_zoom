@@ -98,10 +98,9 @@ if not exist "%QT_BIN_DIR%" (
 )
 set "PATH=%QT_BIN_DIR%;%PATH%"
 set "WINDEPLOYQT=%QT_BIN_DIR%\windeployqt.exe"
-for %%I in ("%~1") do set "EXE_DIR=%%~dpI"
-if defined EXE_DIR (
-    set "EXE_DIR=%EXE_DIR:"=%"
-    if "%EXE_DIR:~-1%"=="\\" set "EXE_DIR=%EXE_DIR:~0,-1%"
+set "EXE_DIR="
+for %%I in ("%~1") do (
+    for %%J in ("%%~dpI.") do set "EXE_DIR=%%~fJ"
 )
 if exist "%WINDEPLOYQT%" (
     echo Running Qt deployment tool: %WINDEPLOYQT%
