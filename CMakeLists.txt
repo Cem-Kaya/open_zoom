@@ -58,6 +58,8 @@ if (WIN32)
     )
 
     target_compile_definitions(open_zoom PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE)
+
+    add_subdirectory(sandbox/dx12_cuda_minimal)
 else()
     message(WARNING "OpenZoom is intended to be built on Windows with CUDA, Qt6, and Direct3D12 support.")
 endif()

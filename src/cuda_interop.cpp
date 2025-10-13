@@ -15,6 +15,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <mutex>
 
 #include <QDebug>
 
@@ -68,11 +69,47 @@ cudaChannelFormatDesc MakeChannelDescForFormat(DXGI_FORMAT format) {
 
 constexpr int kMaxCudaBlurRadius = 15;
 
+bool EnsureCudaDriverInitialized()
+{
+    static std::once_flag initFlag;
+    static CUresult initResult = CUDA_SUCCESS;
+    std::call_once(initFlag, []() {
+        initResult = cuInit(0);
+    });
+    if (initResult != CUDA_SUCCESS) {
+        qWarning() << "cuInit failed" << static_cast<int>(initResult);
+        return false;
+    }
+    return true;
+}
+
+bool QueryDeviceLuid(int deviceId, LUID& luidOut)
+{
+#if defined(CUDA_VERSION) && CUDA_VERSION >= 11030
+    if (!EnsureCudaDriverInitialized()) {
+        return false;
+    }
+
+    CUdevice cuDevice{};
+    if (cuDeviceGet(&cuDevice, deviceId) != CUDA_SUCCESS) {
+        return false;
+    }
+
+    char luidBuffer[sizeof(LUID)] = {};
+    unsigned int nodeMask = 0;
+    if (cuDeviceGetLuid(luidBuffer, &nodeMask, cuDevice) == CUDA_SUCCESS) {
+        std::memcpy(&luidOut, luidBuffer, sizeof(LUID));
+        return true;
+    }
+#endif
+    return false;
+}
+
 } // namespace
 
-CudaInteropSurface::CudaInteropSurface(ID3D12Resource* texture) {
+CudaInteropSurface::CudaInteropSurface(ID3D12Resource* texture, ID3D12Fence* sharedFence) {
     try {
-        Initialize(texture);
+        Initialize(texture, sharedFence);
         valid_ = true;
         lastError_.clear();
     } catch (const std::exception& e) {
@@ -86,6 +123,10 @@ CudaInteropSurface::CudaInteropSurface(ID3D12Resource* texture) {
         if (externalMemory_ != nullptr) {
             cudaDestroyExternalMemory(externalMemory_);
             externalMemory_ = nullptr;
+        }
+        if (externalSemaphore_ != nullptr) {
+            cudaDestroyExternalSemaphore(externalSemaphore_);
+            externalSemaphore_ = nullptr;
         }
         mipArray_ = nullptr;
         level0Array_ = nullptr;
@@ -107,6 +148,11 @@ CudaInteropSurface::~CudaInteropSurface() {
         externalMemory_ = nullptr;
     }
 
+    if (externalSemaphore_ != nullptr) {
+        cudaDestroyExternalSemaphore(externalSemaphore_);
+        externalSemaphore_ = nullptr;
+    }
+
     if (stream_ != nullptr) {
         cudaStreamDestroy(stream_);
         stream_ = nullptr;
@@ -119,22 +165,42 @@ bool CudaInteropSurface::SelectCudaDeviceMatching(LUID adapterLuid) {
     int deviceCount = 0;
     ThrowIfCudaFailed(cudaGetDeviceCount(&deviceCount), "cudaGetDeviceCount failed");
 
+    bool matched = false;
+    cudaDeviceProp matchedProps{};
+
     for (int deviceId = 0; deviceId < deviceCount; ++deviceId) {
         cudaDeviceProp properties{};
         ThrowIfCudaFailed(cudaGetDeviceProperties(&properties, deviceId), "cudaGetDeviceProperties failed");
 
-        if (properties.luidSupported &&
-            std::memcmp(&adapterLuid, properties.luid, sizeof(LUID)) == 0) {
-            qInfo() << "CUDA device" << deviceId << properties.name << "matches DXGI adapter";
+        LUID deviceLuid{};
+        if (QueryDeviceLuid(deviceId, deviceLuid) &&
+            std::memcmp(&adapterLuid, &deviceLuid, sizeof(LUID)) == 0) {
+            matched = true;
+            matchedProps = properties;
             ThrowIfCudaFailed(cudaSetDevice(deviceId), "cudaSetDevice failed");
             cudaDeviceId_ = deviceId;
-            return true;
+            qInfo() << "CUDA device" << deviceId << properties.name << "matches DXGI adapter";
+            break;
         }
     }
 
-    lastError_ = "No CUDA device matched DXGI adapter LUID";
-    qWarning() << "No CUDA device matched DXGI adapter LUID; CUDA interop disabled";
-    return false;
+    if (!matched) {
+        if (deviceCount > 0) {
+            qWarning() << "No CUDA device LUID matched; using device 0 as fallback";
+            cudaDeviceProp properties{};
+            ThrowIfCudaFailed(cudaGetDeviceProperties(&properties, 0), "cudaGetDeviceProperties failed");
+            ThrowIfCudaFailed(cudaSetDevice(0), "cudaSetDevice failed");
+            cudaDeviceId_ = 0;
+            matchedProps = properties;
+        } else {
+            lastError_ = "No CUDA devices available";
+            qWarning() << "No CUDA devices reported by runtime";
+            return false;
+        }
+    }
+
+    qInfo() << "Using CUDA device" << cudaDeviceId_ << matchedProps.name;
+    return true;
 }
 
 bool CudaInteropSurface::CreateSurfaceFromResource(ID3D12Device* device, ID3D12Resource* texture) {
@@ -170,14 +236,17 @@ bool CudaInteropSurface::CreateSurfaceFromResource(ID3D12Device* device, ID3D12R
     };
 
     try {
+        qInfo() << "Importing external memory (size" << static_cast<unsigned long long>(allocationInfo.SizeInBytes)
+                << ", flags=cudaExternalMemoryDedicated)";
         ThrowIfCudaFailed(cudaImportExternalMemory(&externalMemory_, &memoryDesc),
                           "cudaImportExternalMemory failed");
+        qInfo() << "Imported external memory for CUDA (size" << static_cast<unsigned long long>(allocationInfo.SizeInBytes) << ")";
         cleanupHandle();
 
         cudaExternalMemoryMipmappedArrayDesc arrayDesc{};
         arrayDesc.offset = 0;
         arrayDesc.numLevels = 1;
-        arrayDesc.extent = make_cudaExtent(width_, height_, 0);
+        arrayDesc.extent = make_cudaExtent(width_, height_, 1);
         arrayDesc.formatDesc = MakeChannelDescForFormat(format_);
         arrayDesc.flags = cudaArraySurfaceLoadStore | cudaArrayColorAttachment;
 
@@ -207,7 +276,7 @@ bool CudaInteropSurface::CreateSurfaceFromResource(ID3D12Device* device, ID3D12R
     return true;
 }
 
-void CudaInteropSurface::Initialize(ID3D12Resource* texture) {
+void CudaInteropSurface::Initialize(ID3D12Resource* texture, ID3D12Fence* sharedFence) {
     if (!texture) {
         throw std::invalid_argument("Cannot initialize CUDA interop with null resource");
     }
@@ -221,6 +290,10 @@ void CudaInteropSurface::Initialize(ID3D12Resource* texture) {
     }
 
     CreateSurfaceFromResource(device.Get(), texture);
+
+    if (sharedFence != nullptr) {
+        ImportFenceSemaphore(device.Get(), sharedFence);
+    }
 }
 
 bool CudaInteropSurface::EnsureDeviceBuffers(unsigned int width, unsigned int height) {
@@ -248,6 +321,44 @@ bool CudaInteropSurface::EnsureDeviceBuffers(unsigned int width, unsigned int he
     deviceWidth_ = width;
     deviceHeight_ = height;
     return true;
+}
+
+void CudaInteropSurface::ImportFenceSemaphore(ID3D12Device* device, ID3D12Fence* fence) {
+    if (!device || !fence) {
+        return;
+    }
+
+    WindowsSecurityAttributes securityAttributes;
+    HANDLE fenceHandle = nullptr;
+    ThrowIfFailed(device->CreateSharedHandle(fence,
+                                            securityAttributes.get(),
+                                            GENERIC_ALL,
+                                            nullptr,
+                                            &fenceHandle),
+                  "Failed to create shared handle for D3D12 fence");
+
+    auto cleanupHandle = [&]() {
+        if (fenceHandle) {
+            CloseHandle(fenceHandle);
+            fenceHandle = nullptr;
+        }
+    };
+
+    cudaExternalSemaphoreHandleDesc semaphoreDesc{};
+    semaphoreDesc.type = cudaExternalSemaphoreHandleTypeD3D12Fence;
+    semaphoreDesc.handle.win32.handle = fenceHandle;
+    semaphoreDesc.flags = 0;
+
+    try {
+        ThrowIfCudaFailed(cudaImportExternalSemaphore(&externalSemaphore_, &semaphoreDesc),
+                          "cudaImportExternalSemaphore failed");
+        qInfo() << "Imported shared D3D12 fence into CUDA";
+    } catch (...) {
+        cleanupHandle();
+        throw;
+    }
+
+    cleanupHandle();
 }
 
 void CudaInteropSurface::ReleaseDeviceBuffers() {
@@ -312,7 +423,9 @@ void CudaInteropSurface::RunGradientDemoKernel(unsigned int width, unsigned int 
     ThrowIfCudaFailed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed");
 }
 
-bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input, const ProcessingSettings& settings) {
+bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
+                                      const ProcessingSettings& settings,
+                                      const FenceSyncParams& fenceSync) {
     if (!valid_ || !input.hostBgra || input.width == 0 || input.height == 0) {
         return false;
     }
@@ -322,6 +435,14 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input, const Proces
     }
 
     try {
+        if (fenceSync.enable && externalSemaphore_ != nullptr) {
+            cudaExternalSemaphoreWaitParams waitParams{};
+            waitParams.params.fence.value = fenceSync.waitValue;
+            waitParams.flags = 0;
+            ThrowIfCudaFailed(cudaWaitExternalSemaphoresAsync(&externalSemaphore_, &waitParams, 1, stream_),
+                              "cudaWaitExternalSemaphoresAsync failed");
+        }
+
         if (!EnsureDeviceBuffers(input.width, input.height)) {
             return false;
         }
@@ -382,9 +503,24 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input, const Proces
                                                    cudaMemcpyDeviceToDevice, stream_),
                           "cudaMemcpy2DToArrayAsync failed");
 
-        ThrowIfCudaFailed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed");
+        if (fenceSync.enable && externalSemaphore_ != nullptr) {
+            cudaExternalSemaphoreSignalParams signalParams{};
+            signalParams.params.fence.value = fenceSync.signalValue;
+            signalParams.flags = 0;
+            ThrowIfCudaFailed(cudaSignalExternalSemaphoresAsync(&externalSemaphore_, &signalParams, 1, stream_),
+                              "cudaSignalExternalSemaphoresAsync failed");
+        } else {
+            ThrowIfCudaFailed(cudaStreamSynchronize(stream_), "cudaStreamSynchronize failed");
+        }
+        lastError_.clear();
         return true;
+    } catch (const std::exception& e) {
+        lastError_ = e.what();
+        qWarning() << "ProcessFrame exception:" << e.what();
+        return false;
     } catch (...) {
+        lastError_ = "Unknown CUDA exception during ProcessFrame";
+        qWarning() << "ProcessFrame encountered unknown exception";
         return false;
     }
 }

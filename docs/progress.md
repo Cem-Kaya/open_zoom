@@ -5,6 +5,7 @@
 - [x] Draft high-level build configuration strategy
 - [x] Implement CUDA/D3D11 interop demo pipeline skeleton (gradient fill)
 - [x] Refactor UI shell to Qt Widgets with Direct3D12 CPU presentation path
+- [x] Add DX12-CUDA minimal sandbox verifying external memory import flags
 
 ## In Progress
 - [ ] Adapt CUDA interop path to D3D12 resources and restore GPU processing

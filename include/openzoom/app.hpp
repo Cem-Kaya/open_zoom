@@ -13,6 +13,7 @@
 #include <mfreadwrite.h>
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -136,6 +137,7 @@ private:
     bool MapViewToSource(const QPointF& pos, float& outX, float& outY) const;
     bool EnsureCudaSurface(UINT width, UINT height);
     bool ProcessFrameWithCuda(UINT width, UINT height);
+    void ResetCudaFenceState();
 
     QApplication* qtApp_{};
     std::unique_ptr<MainWindow> mainWindow_;
@@ -229,6 +231,10 @@ private:
     UINT cudaSurfaceHeight_{};
     bool cudaPipelineAvailable_{};
     bool usingCudaLastFrame_{};
+    uint64_t sharedFenceCounter_{1};
+    uint64_t lastCudaSignalValue_{};
+    uint64_t lastGraphicsSignalValue_{};
+    bool cudaFenceInteropEnabled_{};
 };
 
 } // namespace openzoom

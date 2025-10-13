@@ -54,6 +54,8 @@ cmake --build "%BUILD_DIR%" --config Release
 if errorlevel 1 goto :fail
 
 set EXE_PATH=%BUILD_DIR%\Release\open_zoom.exe
+if /I "%OPENZOOM_SKIP_RUN%"=="1" goto after_run
+
 if exist "%EXE_PATH%" (
     echo Launching %EXE_PATH%
     call :prepare_qt_runtime "%EXE_PATH%"
@@ -69,6 +71,8 @@ if exist "%EXE_PATH%" (
         goto :fail
     )
 )
+
+:after_run
 
 popd
 popd

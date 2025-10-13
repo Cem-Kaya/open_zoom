@@ -11,22 +11,27 @@
 #include <vector>
 
 #if defined(__has_include)
-#  if __has_include(<cuda_runtime.h>) && __has_include(<cuda_surface_types.h>) && __has_include(<surface_functions.h>)
+#  if __has_include(<cuda_runtime.h>)
 #    include <cuda_runtime.h>
-#    include <cuda_surface_types.h>
-#    include <surface_functions.h>
 #    define OPENZOOM_HAS_CUDA_EXT_MEMORY 1
 #  else
-#    define OPENZOOM_HAS_CUDA_EXT_MEMORY 0
+#    define OPENZOOM_HAS_CUDA_EXT_MEMORY 1
 #  endif
 #else
-#  define OPENZOOM_HAS_CUDA_EXT_MEMORY 0
+#  define OPENZOOM_HAS_CUDA_EXT_MEMORY 1
 #endif
 
 struct ID3D12Device;
 struct ID3D12Resource;
+struct ID3D12Fence;
 
 namespace openzoom {
+
+struct FenceSyncParams {
+    bool enable{false};
+    uint64_t waitValue{0};
+    uint64_t signalValue{0};
+};
 
 struct ProcessingSettings {
     bool enableBlackWhite{false};
@@ -51,24 +56,28 @@ struct ProcessingInput {
 #if OPENZOOM_HAS_CUDA_EXT_MEMORY
 class CudaInteropSurface {
 public:
-    explicit CudaInteropSurface(ID3D12Resource* texture);
+    explicit CudaInteropSurface(ID3D12Resource* texture, ID3D12Fence* sharedFence = nullptr);
     ~CudaInteropSurface();
 
     bool IsValid() const { return valid_; }
+    bool HasExternalSemaphore() const { return externalSemaphore_ != nullptr; }
 
     void RunGradientDemoKernel(unsigned int width, unsigned int height, float timeSeconds);
 
-    bool ProcessFrame(const ProcessingInput& input, const ProcessingSettings& settings);
+    bool ProcessFrame(const ProcessingInput& input,
+                      const ProcessingSettings& settings,
+                      const FenceSyncParams& fenceSync);
     const std::string& LastError() const { return lastError_; }
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;
 
 private:
-    void Initialize(ID3D12Resource* texture);
+    void Initialize(ID3D12Resource* texture, ID3D12Fence* sharedFence);
 
     bool SelectCudaDeviceMatching(LUID adapterLuid);
     bool CreateSurfaceFromResource(ID3D12Device* device, ID3D12Resource* texture);
+    void ImportFenceSemaphore(ID3D12Device* device, ID3D12Fence* fence);
     bool EnsureDeviceBuffers(unsigned int width, unsigned int height);
     void ReleaseDeviceBuffers();
     bool EnsureGaussianKernel(int radius, float sigma);
@@ -78,6 +87,7 @@ private:
     cudaArray_t level0Array_{};
     cudaSurfaceObject_t surfaceObject_{0};
     cudaStream_t stream_{};
+    cudaExternalSemaphore_t externalSemaphore_{};
 
     UINT width_{};
     UINT height_{};
@@ -101,14 +111,17 @@ private:
 #else
 class CudaInteropSurface {
 public:
-    explicit CudaInteropSurface(ID3D12Resource* /*texture*/) {}
+    explicit CudaInteropSurface(ID3D12Resource* /*texture*/, ID3D12Fence* /*sharedFence*/ = nullptr) {}
     ~CudaInteropSurface() = default;
 
     bool IsValid() const { return false; }
+    bool HasExternalSemaphore() const { return false; }
 
     void RunGradientDemoKernel(unsigned int /*width*/, unsigned int /*height*/, float /*timeSeconds*/) {}
 
-    bool ProcessFrame(const ProcessingInput& /*input*/, const ProcessingSettings& /*settings*/) { return false; }
+    bool ProcessFrame(const ProcessingInput& /*input*/,
+                      const ProcessingSettings& /*settings*/,
+                      const FenceSyncParams& /*fenceSync*/) { return false; }
 
     const std::string& LastError() const { static std::string dummy; return dummy; }
 

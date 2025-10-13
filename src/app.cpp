@@ -556,7 +556,10 @@ public:
         WaitForGpu();
     }
 
-    void PresentFromTexture(ID3D12Resource* texture, UINT width, UINT height) {
+    void PresentFromTexture(ID3D12Resource* texture,
+                            UINT width,
+                            UINT height,
+                            const FenceSyncParams* fenceSync = nullptr) {
         if (!initialized_ || !texture || width == 0 || height == 0) {
             return;
         }
@@ -565,11 +568,18 @@ public:
             Resize(width, height);
         }
 
+        const bool useFenceSync = fenceSync && fenceSync->enable && fence_.Get() != nullptr;
+
         ThrowIfFailed(commandAllocator_->Reset(), "Failed to reset command allocator");
         ThrowIfFailed(commandList_->Reset(commandAllocator_.Get(), nullptr), "Failed to reset command list");
 
         const UINT backIndex = swapChain_->GetCurrentBackBufferIndex();
         Microsoft::WRL::ComPtr<ID3D12Resource> backBuffer = backBuffers_[backIndex];
+
+        if (useFenceSync && fenceSync->waitValue > 0) {
+            ThrowIfFailed(commandQueue_->Wait(fence_.Get(), fenceSync->waitValue),
+                          "Failed to queue wait on shared fence");
+        }
 
         auto transitionSourceToCopy = TransitionBarrier(texture,
                                                         D3D12_RESOURCE_STATE_COMMON,
@@ -600,11 +610,26 @@ public:
 
         ThrowIfFailed(swapChain_->Present(1, 0), "Failed to present swap chain");
 
-        WaitForGpu();
+        if (useFenceSync) {
+            ThrowIfFailed(commandQueue_->Signal(fence_.Get(), fenceSync->signalValue),
+                          "Failed to signal shared fence");
+            fenceValue_ = fenceSync->signalValue;
+            WaitForFenceValue(fenceSync->signalValue);
+        } else {
+            WaitForGpu();
+        }
     }
 
     ID3D12Device* GetDevice() const {
         return device_.Get();
+    }
+
+    ID3D12Fence* GetFence() const {
+        return fence_.Get();
+    }
+
+    UINT64 GetLastSignaledFenceValue() const {
+        return fenceValue_;
     }
 
 private:
@@ -680,7 +705,7 @@ private:
     }
 
     void CreateFenceObjects() {
-        ThrowIfFailed(device_->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence_)),
+        ThrowIfFailed(device_->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence_)),
                       "Failed to create fence");
         fenceEvent_ = CreateEvent(nullptr, FALSE, FALSE, nullptr);
         if (!fenceEvent_) {
@@ -811,6 +836,17 @@ private:
         ThrowIfFailed(commandQueue_->Signal(fence_.Get(), fenceValue), "Failed to signal fence");
         if (fence_->GetCompletedValue() < fenceValue) {
             ThrowIfFailed(fence_->SetEventOnCompletion(fenceValue, fenceEvent_),
+                          "Failed to set fence completion event");
+            WaitForSingleObject(fenceEvent_, INFINITE);
+        }
+    }
+
+    void WaitForFenceValue(UINT64 value) {
+        if (!fence_) {
+            return;
+        }
+        if (fence_->GetCompletedValue() < value) {
+            ThrowIfFailed(fence_->SetEventOnCompletion(value, fenceEvent_),
                           "Failed to set fence completion event");
             WaitForSingleObject(fenceEvent_, INFINITE);
         }
@@ -1284,6 +1320,7 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     InitializePlatform();
 
     presenter_ = std::make_unique<D3D12Presenter>();
+    ResetCudaFenceState();
 
     mainWindow_ = std::make_unique<MainWindow>();
     mainWindow_->setApp(this);
@@ -1814,7 +1851,11 @@ void OpenZoomApp::UpdateProcessingStatusLabel() {
         text = QStringLiteral("Processing: CPU (debug view)");
         color = QStringLiteral("#d17c00");
     } else if (usingCudaLastFrame_ && cudaPipelineAvailable_) {
-        text = QStringLiteral("Processing: GPU");
+        if (cudaFenceInteropEnabled_) {
+            text = QStringLiteral("Processing: GPU (fence interop)");
+        } else {
+            text = QStringLiteral("Processing: GPU");
+        }
         color = QStringLiteral("#1c9c3e");
     } else if (cudaPipelineAvailable_) {
         text = QStringLiteral("Processing: CPU (fallback)");
@@ -1968,6 +2009,14 @@ bool OpenZoomApp::MapViewToSource(const QPointF& pos, float& outX, float& outY) 
     return true;
 }
 
+void OpenZoomApp::ResetCudaFenceState() {
+    const UINT64 baseValue = presenter_ ? presenter_->GetLastSignaledFenceValue() : 0;
+    sharedFenceCounter_ = baseValue + 1;
+    lastCudaSignalValue_ = 0;
+    lastGraphicsSignalValue_ = baseValue;
+    cudaFenceInteropEnabled_ = false;
+}
+
 bool OpenZoomApp::EnsureCudaSurface(UINT width, UINT height) {
     if (!presenter_ || !renderWidget_ || !renderWidget_->isPresenterReady()) {
         qWarning() << "CUDA surface unavailable: presenter or render widget not ready";
@@ -1983,6 +2032,7 @@ bool OpenZoomApp::EnsureCudaSurface(UINT width, UINT height) {
     cudaSharedTexture_.Reset();
     cudaSurfaceWidth_ = 0;
     cudaSurfaceHeight_ = 0;
+    ResetCudaFenceState();
 
     ID3D12Device* device = presenter_->GetDevice();
     if (!device) {
@@ -2019,7 +2069,7 @@ bool OpenZoomApp::EnsureCudaSurface(UINT width, UINT height) {
                                                       IID_PPV_ARGS(&cudaSharedTexture_)),
                       "Failed to create CUDA shared texture");
 
-        auto surface = std::make_unique<CudaInteropSurface>(cudaSharedTexture_.Get());
+        auto surface = std::make_unique<CudaInteropSurface>(cudaSharedTexture_.Get(), presenter_->GetFence());
         if (!surface || !surface->IsValid()) {
             if (surface) {
                 const std::string& err = surface->LastError();
@@ -2037,6 +2087,16 @@ bool OpenZoomApp::EnsureCudaSurface(UINT width, UINT height) {
         cudaSurfaceWidth_ = width;
         cudaSurfaceHeight_ = height;
         cudaPipelineAvailable_ = true;
+        cudaFenceInteropEnabled_ = cudaSurface_->HasExternalSemaphore();
+        if (cudaFenceInteropEnabled_) {
+            lastGraphicsSignalValue_ = presenter_->GetLastSignaledFenceValue();
+            sharedFenceCounter_ = lastGraphicsSignalValue_ + 1;
+            lastCudaSignalValue_ = 0;
+            qInfo() << "CUDA fence interop enabled; base fence value"
+                    << static_cast<unsigned long long>(lastGraphicsSignalValue_);
+        } else {
+            qInfo() << "CUDA surface ready without fence interop";
+        }
         qInfo() << "CUDA surface ready for" << width << "x" << height;
         return true;
     } catch (...) {
@@ -2045,6 +2105,7 @@ bool OpenZoomApp::EnsureCudaSurface(UINT width, UINT height) {
         cudaSurfaceWidth_ = 0;
         cudaSurfaceHeight_ = 0;
         cudaPipelineAvailable_ = false;
+        ResetCudaFenceState();
         qWarning() << "CUDA surface creation exception triggered fallback";
         return false;
     }
@@ -2092,15 +2153,49 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
     settings.blurSigma = blurSigma_;
     settings.drawFocusMarker = focusMarkerEnabled_ && !debugViewEnabled_;
 
-    if (!cudaSurface_->ProcessFrame(input, settings)) {
+    FenceSyncParams cudaSyncParams{};
+    uint64_t cudaSignalCandidate = 0;
+    if (cudaFenceInteropEnabled_) {
+        cudaSyncParams.enable = true;
+        cudaSyncParams.waitValue = lastGraphicsSignalValue_;
+        cudaSignalCandidate = sharedFenceCounter_;
+        cudaSyncParams.signalValue = cudaSignalCandidate;
+    }
+
+    if (!cudaSurface_->ProcessFrame(input, settings, cudaSyncParams)) {
         cudaPipelineAvailable_ = false;
         qWarning() << "CUDA pipeline processing failed, falling back to CPU";
+        ResetCudaFenceState();
         usingCudaLastFrame_ = false;
         return false;
     }
 
+    if (cudaSyncParams.enable) {
+        lastCudaSignalValue_ = cudaSignalCandidate;
+        sharedFenceCounter_ = cudaSignalCandidate + 1;
+    }
+
     cudaPipelineAvailable_ = true;
-    presenter_->PresentFromTexture(cudaSharedTexture_.Get(), width, height);
+    FenceSyncParams presentSync{};
+    uint64_t graphicsSignalCandidate = 0;
+    if (cudaFenceInteropEnabled_) {
+        presentSync.enable = true;
+        presentSync.waitValue = lastCudaSignalValue_;
+        graphicsSignalCandidate = sharedFenceCounter_;
+        presentSync.signalValue = graphicsSignalCandidate;
+    }
+
+    presenter_->PresentFromTexture(cudaSharedTexture_.Get(),
+                                   width,
+                                   height,
+                                   presentSync.enable ? &presentSync : nullptr);
+
+    if (presentSync.enable) {
+        lastGraphicsSignalValue_ = graphicsSignalCandidate;
+        sharedFenceCounter_ = graphicsSignalCandidate + 1;
+    }
+
+    usingCudaLastFrame_ = true;
     return true;
 }
 
