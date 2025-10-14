@@ -1150,6 +1150,32 @@ public:
         blurLayout->addWidget(blurRadiusValueLabel_);
         controlsLayout->addLayout(blurLayout);
 
+        auto* spatialRow = new QHBoxLayout();
+        spatialRow->setSpacing(8);
+        spatialSharpenCheckbox_ = new QCheckBox("Spatial Sharpen");
+        spatialSharpenCheckbox_->setChecked(false);
+        spatialBackendCombo_ = new QComboBox();
+        spatialBackendCombo_->addItem("FSR 1.0 (EASU + RCAS)");
+        spatialBackendCombo_->addItem("NVIDIA Image Scaling");
+        spatialBackendCombo_->setEnabled(false);
+        spatialSharpnessSlider_ = new QSlider(Qt::Horizontal);
+        spatialSharpnessSlider_->setRange(0, 100);
+        spatialSharpnessSlider_->setPageStep(5);
+        spatialSharpnessSlider_->setValue(25);
+        spatialSharpnessSlider_->setEnabled(false);
+        spatialSharpnessValueLabel_ = new QLabel("0.25");
+        spatialSharpnessValueLabel_->setMinimumWidth(40);
+
+        spatialRow->addWidget(spatialSharpenCheckbox_);
+        spatialRow->addSpacing(12);
+        spatialRow->addWidget(new QLabel("Backend:"));
+        spatialRow->addWidget(spatialBackendCombo_, 1);
+        spatialRow->addSpacing(12);
+        spatialRow->addWidget(new QLabel("Sharpness:"));
+        spatialRow->addWidget(spatialSharpnessSlider_, 1);
+        spatialRow->addWidget(spatialSharpnessValueLabel_);
+        controlsLayout->addLayout(spatialRow);
+
         auto* focusLayout = new QHBoxLayout();
         focusLayout->setSpacing(8);
         auto* focusXLabel = new QLabel("Focus X:");
@@ -1217,6 +1243,10 @@ public:
     QSlider* blurRadiusSlider() const { return blurRadiusSlider_; }
     QLabel* blurSigmaValueLabel() const { return blurSigmaValueLabel_; }
     QLabel* blurRadiusValueLabel() const { return blurRadiusValueLabel_; }
+    QCheckBox* spatialSharpenCheckbox() const { return spatialSharpenCheckbox_; }
+    QComboBox* spatialBackendCombo() const { return spatialBackendCombo_; }
+    QSlider* spatialSharpnessSlider() const { return spatialSharpnessSlider_; }
+    QLabel* spatialSharpnessValueLabel() const { return spatialSharpnessValueLabel_; }
     QLabel* processingStatusLabel() const { return processingStatusLabel_; }
 
 protected:
@@ -1309,6 +1339,10 @@ private:
     QSlider* blurRadiusSlider_{};
     QLabel* blurSigmaValueLabel_{};
     QLabel* blurRadiusValueLabel_{};
+    QCheckBox* spatialSharpenCheckbox_{};
+    QComboBox* spatialBackendCombo_{};
+    QSlider* spatialSharpnessSlider_{};
+    QLabel* spatialSharpnessValueLabel_{};
     QLabel* processingStatusLabel_{};
     OpenZoomApp* app_{};
 };
@@ -1343,6 +1377,10 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     blurRadiusSlider_ = mainWindow_->blurRadiusSlider();
     blurSigmaValueLabel_ = mainWindow_->blurSigmaValueLabel();
     blurRadiusValueLabel_ = mainWindow_->blurRadiusValueLabel();
+    spatialSharpenCheckbox_ = mainWindow_->spatialSharpenCheckbox();
+    spatialBackendCombo_ = mainWindow_->spatialBackendCombo();
+    spatialSharpnessSlider_ = mainWindow_->spatialSharpnessSlider();
+    spatialSharpnessValueLabel_ = mainWindow_->spatialSharpnessValueLabel();
     processingStatusLabel_ = mainWindow_->processingStatusLabel();
 
     joystickOverlay_ = new JoystickOverlay(renderWidget_);
@@ -1373,7 +1411,17 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
         }
     }
     blurEnabled_ = blurCheckbox_ ? blurCheckbox_->isChecked() : false;
+    spatialSharpenEnabled_ = spatialSharpenCheckbox_ ? spatialSharpenCheckbox_->isChecked() : false;
+    if (spatialBackendCombo_) {
+        spatialUpscaler_ = static_cast<SpatialUpscaler>(std::clamp(spatialBackendCombo_->currentIndex(), 0, 1));
+    } else {
+        spatialUpscaler_ = SpatialUpscaler::kFsrEasuRcas;
+    }
+    if (spatialSharpnessSlider_) {
+        spatialSharpness_ = std::clamp(static_cast<float>(spatialSharpnessSlider_->value()) / 100.0f, 0.0f, 1.0f);
+    }
     UpdateBlurUiLabels();
+    UpdateSpatialSharpenUi();
     UpdateProcessingStatusLabel();
     if (focusMarkerCheckbox_) {
         focusMarkerEnabled_ = focusMarkerCheckbox_->isChecked();
@@ -1427,12 +1475,22 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
         connect(blurRadiusSlider_, &QSlider::valueChanged,
                 this, &OpenZoomApp::OnBlurRadiusChanged);
     }
+    if (spatialSharpenCheckbox_) {
+        connect(spatialSharpenCheckbox_, &QCheckBox::toggled,
+                this, &OpenZoomApp::OnSpatialSharpenToggled);
+    }
+    if (spatialBackendCombo_) {
+        connect(spatialBackendCombo_, &QComboBox::currentIndexChanged,
+                this, &OpenZoomApp::OnSpatialUpscalerChanged);
+    }
+    if (spatialSharpnessSlider_) {
+        connect(spatialSharpnessSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnSpatialSharpnessChanged);
+    }
     if (focusMarkerCheckbox_) {
         connect(focusMarkerCheckbox_, &QCheckBox::toggled,
                 this, &OpenZoomApp::OnFocusMarkerToggled);
     }
-
-    UpdateBlurUiLabels();
 
     frameTimer_ = new QTimer(this);
     connect(frameTimer_, &QTimer::timeout, this, &OpenZoomApp::OnFrameTick);
@@ -1656,6 +1714,28 @@ void OpenZoomApp::OnFocusMarkerToggled(bool checked) {
     focusMarkerEnabled_ = checked;
 }
 
+void OpenZoomApp::OnSpatialSharpenToggled(bool checked) {
+    spatialSharpenEnabled_ = checked;
+    UpdateSpatialSharpenUi();
+    UpdateProcessingStatusLabel();
+}
+
+void OpenZoomApp::OnSpatialUpscalerChanged(int index) {
+    const int clamped = std::clamp(index, 0, 1);
+    spatialUpscaler_ = static_cast<SpatialUpscaler>(clamped);
+    UpdateSpatialSharpenUi();
+    UpdateProcessingStatusLabel();
+}
+
+void OpenZoomApp::OnSpatialSharpnessChanged(int value) {
+    spatialSharpness_ = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
+    if (spatialSharpnessValueLabel_) {
+        spatialSharpnessValueLabel_->setText(QString::number(spatialSharpness_, 'f', 2));
+    }
+    UpdateSpatialSharpenUi();
+    UpdateProcessingStatusLabel();
+}
+
 void OpenZoomApp::SetZoomCenter(float normX, float normY, bool syncUi) {
     const float clampedX = std::clamp(normX, 0.0f, 1.0f);
     const float clampedY = std::clamp(normY, 0.0f, 1.0f);
@@ -1819,23 +1899,52 @@ void OpenZoomApp::UpdateJoystickVisibility() {
 
 void OpenZoomApp::UpdateBlurUiLabels() {
     const QString sigmaText = QString::number(blurSigma_, 'f', 1);
+    const bool blurActive = blurEnabled_;
     if (blurSigmaValueLabel_) {
         blurSigmaValueLabel_->setText(sigmaText);
-        blurSigmaValueLabel_->setEnabled(blurEnabled_);
+        blurSigmaValueLabel_->setEnabled(blurActive);
     }
     if (blurRadiusValueLabel_) {
         blurRadiusValueLabel_->setText(QString::number(blurRadius_));
-        blurRadiusValueLabel_->setEnabled(blurEnabled_);
+        blurRadiusValueLabel_->setEnabled(blurActive);
     }
     if (blurSigmaSlider_) {
-        blurSigmaSlider_->setEnabled(blurEnabled_);
+        blurSigmaSlider_->setEnabled(blurActive);
     }
     if (blurRadiusSlider_) {
-        blurRadiusSlider_->setEnabled(blurEnabled_);
+        blurRadiusSlider_->setEnabled(blurActive);
     }
     if (blurCheckbox_) {
         QSignalBlocker block(blurCheckbox_);
         blurCheckbox_->setChecked(blurEnabled_);
+        blurCheckbox_->setEnabled(true);
+    }
+}
+
+void OpenZoomApp::UpdateSpatialSharpenUi() {
+    const bool enabled = spatialSharpenEnabled_;
+
+    if (spatialSharpenCheckbox_) {
+        QSignalBlocker block(spatialSharpenCheckbox_);
+        spatialSharpenCheckbox_->setChecked(enabled);
+    }
+    if (spatialBackendCombo_) {
+        spatialBackendCombo_->setEnabled(enabled);
+        if (enabled) {
+            QSignalBlocker block(spatialBackendCombo_);
+            spatialBackendCombo_->setCurrentIndex(static_cast<int>(spatialUpscaler_));
+        }
+    }
+    if (spatialSharpnessSlider_) {
+        spatialSharpnessSlider_->setEnabled(enabled);
+        if (enabled) {
+            QSignalBlocker block(spatialSharpnessSlider_);
+            spatialSharpnessSlider_->setValue(static_cast<int>(std::round(spatialSharpness_ * 100.0f)));
+        }
+    }
+    if (spatialSharpnessValueLabel_) {
+        spatialSharpnessValueLabel_->setEnabled(enabled);
+        spatialSharpnessValueLabel_->setText(QString::number(spatialSharpness_, 'f', 2));
     }
 }
 
@@ -1847,21 +1956,34 @@ void OpenZoomApp::UpdateProcessingStatusLabel() {
     QString text;
     QString color;
 
+    auto backendLabel = [this]() -> QString {
+        if (spatialSharpenEnabled_) {
+            return (spatialUpscaler_ == SpatialUpscaler::kNis)
+                       ? QStringLiteral("Spatial Sharpen (NIS)")
+                       : QStringLiteral("Spatial Sharpen (FSR)");
+        }
+        if (blurEnabled_) {
+            return QStringLiteral("Gaussian Blur");
+        }
+        return QStringLiteral("None");
+    };
+
     if (debugViewEnabled_) {
         text = QStringLiteral("Processing: CPU (debug view)");
         color = QStringLiteral("#d17c00");
     } else if (usingCudaLastFrame_ && cudaPipelineAvailable_) {
+        const QString backend = backendLabel();
         if (cudaFenceInteropEnabled_) {
-            text = QStringLiteral("Processing: GPU (fence interop)");
+            text = QStringLiteral("Processing: GPU (fence interop, %1)").arg(backend);
         } else {
-            text = QStringLiteral("Processing: GPU");
+            text = QStringLiteral("Processing: GPU (%1)").arg(backend);
         }
         color = QStringLiteral("#1c9c3e");
     } else if (cudaPipelineAvailable_) {
-        text = QStringLiteral("Processing: CPU (fallback)");
+        text = QStringLiteral("Processing: CPU (fallback, %1)").arg(backendLabel());
         color = QStringLiteral("#c0392b");
     } else {
-        text = QStringLiteral("Processing: CPU");
+        text = QStringLiteral("Processing: CPU (%1)").arg(backendLabel());
         color = QStringLiteral("#c0392b");
     }
 
@@ -2152,6 +2274,9 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
     settings.blurRadius = std::clamp(blurRadius_, 1, 15);
     settings.blurSigma = blurSigma_;
     settings.drawFocusMarker = focusMarkerEnabled_ && !debugViewEnabled_;
+    settings.enableSpatialSharpen = spatialSharpenEnabled_;
+    settings.spatialUpscaler = spatialUpscaler_;
+    settings.spatialSharpness = spatialSharpness_;
 
     FenceSyncParams cudaSyncParams{};
     uint64_t cudaSignalCandidate = 0;

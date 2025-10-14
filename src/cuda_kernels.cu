@@ -4,6 +4,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+#include <math_constants.h>
 #if __has_include(<cuda_surface_types.h>)
 #include <cuda_surface_types.h>
 #elif __has_include(<surface_types.h>)
@@ -19,6 +20,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <cmath>
 
 namespace openzoom {
 
@@ -27,6 +29,99 @@ namespace {
 __device__ unsigned char FloatToByte(float value) {
     const float clamped = fminf(fmaxf(value, 0.0f), 1.0f);
     return static_cast<unsigned char>(clamped * 255.0f);
+}
+
+__device__ float3 ReadPixelLinear(const uchar4* src, size_t pitchBytes, int x, int y, int width, int height) {
+    const int clampedX = max(0, min(width - 1, x));
+    const int clampedY = max(0, min(height - 1, y));
+    const auto* row = reinterpret_cast<const uchar4*>(reinterpret_cast<const uint8_t*>(src) + pitchBytes * clampedY);
+    const uchar4 value = row[clampedX];
+    return make_float3(value.x, value.y, value.z);
+}
+
+__device__ float Lanczos2(float x) {
+    x = fabsf(x);
+    if (x < 1e-6f) {
+        return 1.0f;
+    }
+    if (x >= 2.0f) {
+        return 0.0f;
+    }
+    const float pix = CUDART_PI_F * x;
+    const float pixHalf = pix * 0.5f;
+    return (sinf(pix) * sinf(pixHalf)) / (pix * pixHalf);
+}
+
+__device__ float3 LanczosSample(const uchar4* src, size_t pitchBytes,
+                                float sampleX, float sampleY,
+                                int width, int height) {
+    const int baseX = static_cast<int>(floorf(sampleX));
+    const int baseY = static_cast<int>(floorf(sampleY));
+    float3 accum = make_float3(0.0f, 0.0f, 0.0f);
+    float weightSum = 0.0f;
+    for (int j = -1; j <= 2; ++j) {
+        for (int i = -1; i <= 2; ++i) {
+            const float w = Lanczos2(sampleX - (baseX + i)) * Lanczos2(sampleY - (baseY + j));
+            const float3 c = ReadPixelLinear(src, pitchBytes, baseX + i, baseY + j, width, height);
+            accum.x += c.x * w;
+            accum.y += c.y * w;
+            accum.z += c.z * w;
+            weightSum += w;
+        }
+    }
+    if (weightSum > 0.0f) {
+        const float inv = 1.0f / weightSum;
+        accum.x *= inv;
+        accum.y *= inv;
+        accum.z *= inv;
+    }
+    return accum;
+}
+
+__device__ float3 BilinearSample(const uchar4* src, size_t pitchBytes,
+                                 float sampleX, float sampleY,
+                                 int width, int height) {
+    const float fx = floorf(sampleX);
+    const float fy = floorf(sampleY);
+    const int x0 = static_cast<int>(fx);
+    const int y0 = static_cast<int>(fy);
+    const int x1 = x0 + 1;
+    const int y1 = y0 + 1;
+    const float tx = sampleX - fx;
+    const float ty = sampleY - fy;
+    const float3 c00 = ReadPixelLinear(src, pitchBytes, x0, y0, width, height);
+    const float3 c10 = ReadPixelLinear(src, pitchBytes, x1, y0, width, height);
+    const float3 c01 = ReadPixelLinear(src, pitchBytes, x0, y1, width, height);
+    const float3 c11 = ReadPixelLinear(src, pitchBytes, x1, y1, width, height);
+
+    const float3 c0 = make_float3(c00.x + tx * (c10.x - c00.x),
+                                  c00.y + tx * (c10.y - c00.y),
+                                  c00.z + tx * (c10.z - c00.z));
+    const float3 c1 = make_float3(c01.x + tx * (c11.x - c01.x),
+                                  c01.y + tx * (c11.y - c01.y),
+                                  c01.z + tx * (c11.z - c01.z));
+
+    return make_float3(c0.x + ty * (c1.x - c0.x),
+                       c0.y + ty * (c1.y - c0.y),
+                       c0.z + ty * (c1.z - c0.z));
+}
+
+__device__ float3 BoxBlur3x3(const uchar4* src, size_t pitchBytes,
+                             int x, int y, int width, int height) {
+    float3 accum = make_float3(0.0f, 0.0f, 0.0f);
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            const float3 c = ReadPixelLinear(src, pitchBytes, x + i, y + j, width, height);
+            accum.x += c.x;
+            accum.y += c.y;
+            accum.z += c.z;
+        }
+    }
+    const float inv = 1.0f / 9.0f;
+    accum.x *= inv;
+    accum.y *= inv;
+    accum.z *= inv;
+    return accum;
 }
 
 __global__ void GradientFillKernel(cudaSurfaceObject_t surface, int width, int height, float timeSeconds) {
@@ -327,6 +422,82 @@ __global__ void FocusMarkerKernel(uchar4* buffer, size_t pitchBytes,
     }
 }
 
+__global__ void FsrEasuRcasKernel(uchar4* dst, size_t dstPitchBytes,
+                                  const uchar4* src, size_t srcPitchBytes,
+                                  int srcWidth, int srcHeight,
+                                  int dstWidth, int dstHeight,
+                                  float sharpness) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dstWidth || y >= dstHeight) {
+        return;
+    }
+
+    const float scaleX = static_cast<float>(srcWidth) / static_cast<float>(dstWidth);
+    const float scaleY = static_cast<float>(srcHeight) / static_cast<float>(dstHeight);
+    const float sampleX = (static_cast<float>(x) + 0.5f) * scaleX - 0.5f;
+    const float sampleY = (static_cast<float>(y) + 0.5f) * scaleY - 0.5f;
+
+    float3 color = LanczosSample(src, srcPitchBytes, sampleX, sampleY, srcWidth, srcHeight);
+
+    const int nearX = static_cast<int>(roundf(sampleX));
+    const int nearY = static_cast<int>(roundf(sampleY));
+    const float3 blur = BoxBlur3x3(src, srcPitchBytes, nearX, nearY, srcWidth, srcHeight);
+
+    const float sharpen = fmaxf(0.0f, fminf(sharpness, 1.0f));
+    color.x = fmaf(sharpen, color.x - blur.x, color.x);
+    color.y = fmaf(sharpen, color.y - blur.y, color.y);
+    color.z = fmaf(sharpen, color.z - blur.z, color.z);
+
+    color.x = fminf(fmaxf(color.x, 0.0f), 255.0f);
+    color.y = fminf(fmaxf(color.y, 0.0f), 255.0f);
+    color.z = fminf(fmaxf(color.z, 0.0f), 255.0f);
+
+    auto* row = RowAt(dst, dstPitchBytes, y);
+    row[x] = make_uchar4(static_cast<unsigned char>(color.x + 0.5f),
+                         static_cast<unsigned char>(color.y + 0.5f),
+                         static_cast<unsigned char>(color.z + 0.5f),
+                         255u);
+}
+
+__global__ void NisKernel(uchar4* dst, size_t dstPitchBytes,
+                          const uchar4* src, size_t srcPitchBytes,
+                          int srcWidth, int srcHeight,
+                          int dstWidth, int dstHeight,
+                          float sharpness) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= dstWidth || y >= dstHeight) {
+        return;
+    }
+
+    const float scaleX = static_cast<float>(srcWidth) / static_cast<float>(dstWidth);
+    const float scaleY = static_cast<float>(srcHeight) / static_cast<float>(dstHeight);
+    const float sampleX = (static_cast<float>(x) + 0.5f) * scaleX - 0.5f;
+    const float sampleY = (static_cast<float>(y) + 0.5f) * scaleY - 0.5f;
+
+    float3 base = BilinearSample(src, srcPitchBytes, sampleX, sampleY, srcWidth, srcHeight);
+
+    const int nearX = static_cast<int>(roundf(sampleX));
+    const int nearY = static_cast<int>(roundf(sampleY));
+    const float3 blur = BoxBlur3x3(src, srcPitchBytes, nearX, nearY, srcWidth, srcHeight);
+
+    const float sharpen = fmaxf(0.0f, fminf(sharpness, 1.0f));
+    base.x = fmaf(sharpen, base.x - blur.x, base.x);
+    base.y = fmaf(sharpen, base.y - blur.y, base.y);
+    base.z = fmaf(sharpen, base.z - blur.z, base.z);
+
+    base.x = fminf(fmaxf(base.x, 0.0f), 255.0f);
+    base.y = fminf(fmaxf(base.y, 0.0f), 255.0f);
+    base.z = fminf(fmaxf(base.z, 0.0f), 255.0f);
+
+    auto* row = RowAt(dst, dstPitchBytes, y);
+    row[x] = make_uchar4(static_cast<unsigned char>(base.x + 0.5f),
+                         static_cast<unsigned char>(base.y + 0.5f),
+                         static_cast<unsigned char>(base.z + 0.5f),
+                         255u);
+}
+
 inline void CheckCuda(const char* message) {
     cudaError_t status = cudaGetLastError();
     if (status != cudaSuccess) {
@@ -392,9 +563,49 @@ void LaunchFocusMarkerLinear(uchar4* buffer, size_t pitchBytes,
                         (height + blockSize.y - 1) / blockSize.y);
 
     FocusMarkerKernel<<<gridSize, blockSize, 0, stream>>>(buffer, pitchBytes, width, height,
-                                                         centerXNorm, centerYNorm,
-                                                         radiusOuter, radiusInner);
+                                                          centerXNorm, centerYNorm,
+                                                          radiusOuter, radiusInner);
     CheckCuda("FocusMarkerKernel launch failed");
+}
+
+void LaunchFsrEasuRcasLinear(uchar4* dst, size_t dstPitchBytes,
+                             const uchar4* src, size_t srcPitchBytes,
+                             int srcWidth, int srcHeight,
+                             int dstWidth, int dstHeight,
+                             float sharpness,
+                             cudaStream_t stream) {
+    if (dstWidth <= 0 || dstHeight <= 0 || srcWidth <= 0 || srcHeight <= 0) {
+        return;
+    }
+    const dim3 blockSize(16, 16);
+    const dim3 gridSize((dstWidth + blockSize.x - 1) / blockSize.x,
+                        (dstHeight + blockSize.y - 1) / blockSize.y);
+    FsrEasuRcasKernel<<<gridSize, blockSize, 0, stream>>>(dst, dstPitchBytes,
+                                                         src, srcPitchBytes,
+                                                         srcWidth, srcHeight,
+                                                         dstWidth, dstHeight,
+                                                         sharpness);
+    CheckCuda("FsrEasuRcasKernel launch failed");
+}
+
+void LaunchNisLinear(uchar4* dst, size_t dstPitchBytes,
+                     const uchar4* src, size_t srcPitchBytes,
+                     int srcWidth, int srcHeight,
+                     int dstWidth, int dstHeight,
+                     float sharpness,
+                     cudaStream_t stream) {
+    if (dstWidth <= 0 || dstHeight <= 0 || srcWidth <= 0 || srcHeight <= 0) {
+        return;
+    }
+    const dim3 blockSize(16, 16);
+    const dim3 gridSize((dstWidth + blockSize.x - 1) / blockSize.x,
+                        (dstHeight + blockSize.y - 1) / blockSize.y);
+    NisKernel<<<gridSize, blockSize, 0, stream>>>(dst, dstPitchBytes,
+                                                 src, srcPitchBytes,
+                                                 srcWidth, srcHeight,
+                                                 dstWidth, dstHeight,
+                                                 sharpness);
+    CheckCuda("NisKernel launch failed");
 }
 
 bool UploadGaussianKernel(int radius, float sigma, cudaStream_t stream) {

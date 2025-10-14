@@ -6,7 +6,7 @@ OpenZoom is a Windows-only camera magnification playground that experiments with
 - Media Foundation capture thread that speaks BGRA32, RGB32, NV12, and YUY2 and normalises everything into BGRA for rendering.
 - Qt 6 widget shell hosting a Direct3D 12 swap chain, including resize-aware layout and clean shutdown handling.
 - Debug-friendly 2×2 compositor that shows raw input, grayscale, zoom, and combined output so filter stages are easy to inspect.
-- CUDA external-memory interop scaffolding in place; toggled off until the GPU kernels are reinstated.
+- CUDA external-memory interop path now active with optional spatial sharpening (FSR 1.0-style or NVIDIA NIS) plus the legacy Gaussian blur toggle for clearer zoomed text.
 - Batch script that bootstraps a Visual Studio 2022 build, scrubs stale CMake caches, and launches the app when compilation succeeds.
 
 ## Project Status

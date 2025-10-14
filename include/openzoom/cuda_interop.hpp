@@ -33,6 +33,11 @@ struct FenceSyncParams {
     uint64_t signalValue{0};
 };
 
+enum class SpatialUpscaler : int {
+    kFsrEasuRcas = 0,
+    kNis = 1,
+};
+
 struct ProcessingSettings {
     bool enableBlackWhite{false};
     float blackWhiteThreshold{0.5f};
@@ -44,6 +49,9 @@ struct ProcessingSettings {
     int blurRadius{3};
     float blurSigma{1.0f};
     bool drawFocusMarker{false};
+    bool enableSpatialSharpen{false};
+    SpatialUpscaler spatialUpscaler{SpatialUpscaler::kFsrEasuRcas};
+    float spatialSharpness{0.2f};
 };
 
 struct ProcessingInput {

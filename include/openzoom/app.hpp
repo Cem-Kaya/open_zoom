@@ -8,6 +8,8 @@
 #include <QRectF>
 #include <QSize>
 
+#include "openzoom/cuda_interop.hpp"
+
 #include <wrl/client.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
@@ -46,7 +48,6 @@ class RenderWidget;
 class MainWindow;
 class JoystickOverlay;
 class CudaInteropSurface;
-
 class JoystickOverlay : public QWidget {
     Q_OBJECT
 public:
@@ -101,6 +102,9 @@ private slots:
     void OnBlurSigmaChanged(int value);
     void OnBlurRadiusChanged(int value);
     void OnFocusMarkerToggled(bool checked);
+    void OnSpatialSharpenToggled(bool checked);
+    void OnSpatialUpscalerChanged(int index);
+    void OnSpatialSharpnessChanged(int value);
 
 private:
     void InitializePlatform();
@@ -130,6 +134,7 @@ private:
     void HandleZoomWheel(int delta, const QPointF& localPos);
     void UpdateBlurUiLabels();
     void UpdateProcessingStatusLabel();
+    void UpdateSpatialSharpenUi();
     void BeginMousePan(const QPointF& pos, const QSize& widgetSize);
     bool UpdateMousePan(const QPointF& pos);
     void EndMousePan();
@@ -160,6 +165,10 @@ private:
     QSlider* blurRadiusSlider_{};
     QLabel* blurSigmaValueLabel_{};
     QLabel* blurRadiusValueLabel_{};
+    QCheckBox* spatialSharpenCheckbox_{};
+    QComboBox* spatialBackendCombo_{};
+    QSlider* spatialSharpnessSlider_{};
+    QLabel* spatialSharpnessValueLabel_{};
     QLabel* processingStatusLabel_{};
 
     std::unique_ptr<D3D12Presenter> presenter_;
@@ -210,6 +219,9 @@ private:
     bool blurEnabled_{};
     float blurSigma_{1.0f};
     int blurRadius_{3};
+    bool spatialSharpenEnabled_{};
+    SpatialUpscaler spatialUpscaler_{SpatialUpscaler::kFsrEasuRcas};
+    float spatialSharpness_{0.25f};
     bool middlePanActive_{};
     QPointF middlePanLastPos_{};
     QSize middlePanWidgetSize_{};

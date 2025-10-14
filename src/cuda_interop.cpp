@@ -470,6 +470,25 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
             swapBuffers();
         }
 
+        if (settings.enableSpatialSharpen) {
+            if (settings.spatialUpscaler == SpatialUpscaler::kNis) {
+                LaunchNisLinear(alternate, alternatePitch,
+                                current, currentPitch,
+                                static_cast<int>(input.width), static_cast<int>(input.height),
+                                static_cast<int>(input.width), static_cast<int>(input.height),
+                                settings.spatialSharpness,
+                                stream_);
+            } else {
+                LaunchFsrEasuRcasLinear(alternate, alternatePitch,
+                                        current, currentPitch,
+                                        static_cast<int>(input.width), static_cast<int>(input.height),
+                                        static_cast<int>(input.width), static_cast<int>(input.height),
+                                        settings.spatialSharpness,
+                                        stream_);
+            }
+            swapBuffers();
+        }
+
         if (settings.enableZoom) {
             LaunchZoomLinear(alternate, alternatePitch, current, currentPitch,
                              static_cast<int>(input.width), static_cast<int>(input.height),

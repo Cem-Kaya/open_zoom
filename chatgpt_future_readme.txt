@@ -93,3 +93,8 @@ Update (2025-11): Input polish and deployment fix
 - GPU processing path is live: frames upload into a shared D3D12 texture, CUDA kernels run black/white, zoom (with focus), separable blur, and focus-marker passes, and the presenter copies the texture directly to the swap chain. CPU compositing remains as a fallback (auto-enabled whenever the debug grid is requested).
 - Added verbose CUDA interop diagnostics (LUID matching, external memory import, per-call cudaError strings) so future failures surface actionable detail.
 - The control tray now exposes a "Processing: ..." badge so you can confirm when the CUDA path is active versus when the pipeline has fallen back to the CPU.
+
+Update (2025-11-??): AI upscaling exploration
+- Objective: go beyond Gaussian blur so magnified text stays legible without the soft-focus side effects.
+- Fast spatial sharpeners (AMD FSR1-style and NVIDIA NIS) are now exposed as a dedicated toggle with sharpness control; Gaussian blur remains a separate post-stage.
+- Upcoming tiers: lightweight DL SR via OpenCV DNN, Real-ESRGAN via TensorRT, and text-aware SR models. Keep pipeline modular, log per-backend health, and retain CPU fallbacks.

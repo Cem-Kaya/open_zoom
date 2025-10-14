@@ -31,6 +31,20 @@ void LaunchFocusMarkerLinear(uchar4* buffer, size_t pitchBytes,
                              float centerXNorm, float centerYNorm,
                              cudaStream_t stream);
 
+void LaunchFsrEasuRcasLinear(uchar4* dst, size_t dstPitchBytes,
+                             const uchar4* src, size_t srcPitchBytes,
+                             int srcWidth, int srcHeight,
+                             int dstWidth, int dstHeight,
+                             float sharpness,
+                             cudaStream_t stream);
+
+void LaunchNisLinear(uchar4* dst, size_t dstPitchBytes,
+                     const uchar4* src, size_t srcPitchBytes,
+                     int srcWidth, int srcHeight,
+                     int dstWidth, int dstHeight,
+                     float sharpness,
+                     cudaStream_t stream);
+
 bool UploadGaussianKernel(int radius, float sigma, cudaStream_t stream);
 
 } // namespace openzoom
