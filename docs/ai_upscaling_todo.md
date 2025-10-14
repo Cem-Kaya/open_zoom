@@ -53,8 +53,22 @@
 - [ ] Document build/runtime dependencies (OpenCV, TensorRT, model downloads) in `docs/README`.
 - [ ] Prepare automated smoke-test script: run minimal harness per backend to validate startup.
 - [ ] Coordinate with deployment pipeline to bundle necessary DLLs/engine files.
+- [ ] Migrate debug 2×2 view to GPU textures (optional copies per stage) so we can inspect CUDA path without CPU fallbacks.
 
 ## Stretch Goals
 - [ ] Add ImGui debug overlay showing per-backend perf stats and quality toggles.
 - [ ] Implement dynamic quality scaling (auto swap to faster backend when FPS drops).
 - [ ] Investigate multi-frame SR (temporal) once single-frame path stable.
+
+## Repo Hygiene / Architecture (feedback backlog)
+- [ ] Add top-level LICENSE, description, topics, and releases metadata.
+- [ ] Introduce CI (GitHub Actions Windows build with CUDA/Qt cache) and package artifacts.
+- [ ] Wire `OPENZOOM_ENABLE_TESTS`, add CMake options/presets, and provide infrastructure for CPU golden-image tests.
+- [ ] Refactor source tree into feature modules (`src/app`, `src/capture`, `src/d3d12`, `src/cuda`, `src/ui`, `src/common`) with mirrored headers under `include/openzoom/`.
+- [ ] Replace ad-hoc logging with structured logger (spdlog or custom) capturing negotiated formats and GPU path health.
+- [ ] Provide tooling (editorconfig/clang-format, pre-commit hook, vcpkg/CPM story) for consistent DevX.
+- [ ] Author docs/architecture.md, CONTRIBUTING.md, issue/PR templates; add testing strategy (golden images, synthetic MF source, interop guards).
+- [ ] Address Qt moc hygiene (no `app.moc` in non-Q_OBJECT files; break out QObject subclasses per widget).
+- [ ] Encapsulate Media Foundation `IMF*` pointers behind PImpl and normalize BGRA at boundary with explicit format enum.
+- [ ] Build FeatureFlags struct to gate CUDA path, ensure device-loss handling, validate CUDA external memory size/pitch.
+- [ ] Explore optional OpenCL backend to mirror CUDA pipeline for broader GPU support (future stretch goal; evaluate feasibility).
