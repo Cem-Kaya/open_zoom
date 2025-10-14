@@ -242,6 +242,14 @@ __device__ inline uchar4* RowAt(uchar4* base, size_t pitchBytes, int y) {
     return reinterpret_cast<uchar4*>(reinterpret_cast<char*>(base) + static_cast<size_t>(y) * pitchBytes);
 }
 
+__device__ inline const float4* RowAt(const float4* base, size_t pitchBytes, int y) {
+    return reinterpret_cast<const float4*>(reinterpret_cast<const char*>(base) + static_cast<size_t>(y) * pitchBytes);
+}
+
+__device__ inline float4* RowAt(float4* base, size_t pitchBytes, int y) {
+    return reinterpret_cast<float4*>(reinterpret_cast<char*>(base) + static_cast<size_t>(y) * pitchBytes);
+}
+
 __global__ void BlackWhiteLinearKernel(uchar4* dst, size_t dstPitch,
                                        const uchar4* src, size_t srcPitch,
                                        int width, int height, float threshold) {
@@ -420,6 +428,54 @@ __global__ void FocusMarkerKernel(uchar4* buffer, size_t pitchBytes,
     } else {
         row[x] = make_uchar4(0, 0, 255, 255);
     }
+}
+
+__global__ void TemporalSmoothKernel(uchar4* dst, size_t dstPitch,
+                                     const uchar4* src, size_t srcPitch,
+                                     float4* history, size_t historyPitch,
+                                     int width, int height,
+                                     float alpha, int historySeed) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+
+    const float clampedAlpha = fminf(fmaxf(alpha, 0.0f), 1.0f);
+    const float oneMinusAlpha = 1.0f - clampedAlpha;
+    const bool hasHistory = historySeed != 0;
+
+    const uchar4* srcRow = RowAt(src, srcPitch, y);
+    uchar4 current = srcRow[x];
+
+    float4* historyRow = RowAt(history, historyPitch, y);
+    float4 previous = hasHistory ? historyRow[x]
+                                 : make_float4(static_cast<float>(current.x),
+                                              static_cast<float>(current.y),
+                                              static_cast<float>(current.z),
+                                              255.0f);
+
+    const float currB = static_cast<float>(current.x);
+    const float currG = static_cast<float>(current.y);
+    const float currR = static_cast<float>(current.z);
+
+    float4 blended;
+    blended.x = clampedAlpha * currB + oneMinusAlpha * previous.x;
+    blended.y = clampedAlpha * currG + oneMinusAlpha * previous.y;
+    blended.z = clampedAlpha * currR + oneMinusAlpha * previous.z;
+    blended.w = 255.0f;
+
+    blended.x = fminf(fmaxf(blended.x, 0.0f), 255.0f);
+    blended.y = fminf(fmaxf(blended.y, 0.0f), 255.0f);
+    blended.z = fminf(fmaxf(blended.z, 0.0f), 255.0f);
+
+    historyRow[x] = blended;
+
+    uchar4* dstRow = RowAt(dst, dstPitch, y);
+    dstRow[x] = make_uchar4(static_cast<unsigned char>(blended.x + 0.5f),
+                            static_cast<unsigned char>(blended.y + 0.5f),
+                            static_cast<unsigned char>(blended.z + 0.5f),
+                            255u);
 }
 
 __global__ void FsrEasuRcasKernel(uchar4* dst, size_t dstPitchBytes,
@@ -606,6 +662,30 @@ void LaunchNisLinear(uchar4* dst, size_t dstPitchBytes,
                                                  dstWidth, dstHeight,
                                                  sharpness);
     CheckCuda("NisKernel launch failed");
+}
+
+void LaunchTemporalSmoothLinear(uchar4* dst, size_t dstPitchBytes,
+                                const uchar4* src, size_t srcPitchBytes,
+                                float4* history, size_t historyPitchBytes,
+                                int width, int height,
+                                float alpha,
+                                bool historyValid,
+                                cudaStream_t stream) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    const dim3 blockSize(16, 16);
+    const dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
+                        (height + blockSize.y - 1) / blockSize.y);
+
+    TemporalSmoothKernel<<<gridSize, blockSize, 0, stream>>>(dst, dstPitchBytes,
+                                                            src, srcPitchBytes,
+                                                            history, historyPitchBytes,
+                                                            width, height,
+                                                            alpha,
+                                                            historyValid ? 1 : 0);
+    CheckCuda("TemporalSmoothKernel launch failed");
 }
 
 bool UploadGaussianKernel(int radius, float sigma, cudaStream_t stream) {

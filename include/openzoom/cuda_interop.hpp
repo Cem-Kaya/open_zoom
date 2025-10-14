@@ -4,21 +4,30 @@
 
 #include <wrl/client.h>
 #include <d3d12.h>
-#include <cuda.h>
-#include <cuda_runtime_api.h>
 #include <cstdint>
 #include <string>
 #include <vector>
 
-#if defined(__has_include)
-#  if __has_include(<cuda_runtime.h>)
-#    include <cuda_runtime.h>
-#    define OPENZOOM_HAS_CUDA_EXT_MEMORY 1
+#ifndef OPENZOOM_HAS_CUDA_EXT_MEMORY
+#  if defined(__has_include)
+#    if __has_include(<cuda_runtime.h>)
+#      define OPENZOOM_HAS_CUDA_EXT_MEMORY 1
+#    else
+#      define OPENZOOM_HAS_CUDA_EXT_MEMORY 0
+#    endif
 #  else
 #    define OPENZOOM_HAS_CUDA_EXT_MEMORY 1
 #  endif
-#else
-#  define OPENZOOM_HAS_CUDA_EXT_MEMORY 1
+#endif
+
+#if OPENZOOM_HAS_CUDA_EXT_MEMORY
+#  include <cuda.h>
+#  include <cuda_runtime_api.h>
+#  if defined(__has_include)
+#    if __has_include(<cuda_runtime.h>)
+#      include <cuda_runtime.h>
+#    endif
+#  endif
 #endif
 
 struct ID3D12Device;
@@ -38,6 +47,11 @@ enum class SpatialUpscaler : int {
     kNis = 1,
 };
 
+enum class CudaBufferFormat : int {
+    kRgba8 = 0,
+    kRgba16F = 1,
+};
+
 struct ProcessingSettings {
     bool enableBlackWhite{false};
     float blackWhiteThreshold{0.5f};
@@ -50,13 +64,17 @@ struct ProcessingSettings {
     float blurSigma{1.0f};
     bool drawFocusMarker{false};
     bool enableSpatialSharpen{false};
-    SpatialUpscaler spatialUpscaler{SpatialUpscaler::kFsrEasuRcas};
+    SpatialUpscaler spatialUpscaler{SpatialUpscaler::kNis};
     float spatialSharpness{0.2f};
+    CudaBufferFormat stagingFormat{CudaBufferFormat::kRgba8};
+    bool enableTemporalSmoothing{false};
+    float temporalSmoothingAlpha{0.25f};
 };
 
 struct ProcessingInput {
-    const uint8_t* hostBgra{nullptr};
-    unsigned int hostStride{0};
+    const void* hostPixels{nullptr};
+    unsigned int hostStrideBytes{0};
+    unsigned int pixelSizeBytes{0};
     unsigned int width{0};
     unsigned int height{0};
 };
@@ -76,6 +94,7 @@ public:
                       const ProcessingSettings& settings,
                       const FenceSyncParams& fenceSync);
     const std::string& LastError() const { return lastError_; }
+    void ResetTemporalHistory();
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;
@@ -86,8 +105,10 @@ private:
     bool SelectCudaDeviceMatching(LUID adapterLuid);
     bool CreateSurfaceFromResource(ID3D12Device* device, ID3D12Resource* texture);
     void ImportFenceSemaphore(ID3D12Device* device, ID3D12Fence* fence);
-    bool EnsureDeviceBuffers(unsigned int width, unsigned int height);
+    bool EnsureDeviceBuffers(unsigned int width, unsigned int height, CudaBufferFormat format);
+    bool EnsureTemporalHistory(unsigned int width, unsigned int height);
     void ReleaseDeviceBuffers();
+    void ReleaseTemporalHistory();
     bool EnsureGaussianKernel(int radius, float sigma);
 
     cudaExternalMemory_t externalMemory_{};
@@ -111,6 +132,12 @@ private:
     size_t devicePitchScratch_{};
     unsigned int deviceWidth_{};
     unsigned int deviceHeight_{};
+    CudaBufferFormat bufferFormat_{CudaBufferFormat::kRgba8};
+    float4* deviceTemporalHistory_{};
+    size_t devicePitchHistory_{};
+    unsigned int historyWidth_{};
+    unsigned int historyHeight_{};
+    bool temporalHistoryValid_{};
     int cachedKernelRadius_{-1};
     float cachedKernelSigma_{0.0f};
     bool kernelUploaded_{};

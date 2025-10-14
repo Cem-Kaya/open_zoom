@@ -45,6 +45,14 @@ void LaunchNisLinear(uchar4* dst, size_t dstPitchBytes,
                      float sharpness,
                      cudaStream_t stream);
 
+void LaunchTemporalSmoothLinear(uchar4* dst, size_t dstPitchBytes,
+                                const uchar4* src, size_t srcPitchBytes,
+                                float4* history, size_t historyPitchBytes,
+                                int width, int height,
+                                float alpha,
+                                bool historyValid,
+                                cudaStream_t stream);
+
 bool UploadGaussianKernel(int radius, float sigma, cudaStream_t stream);
 
 } // namespace openzoom

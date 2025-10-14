@@ -5,8 +5,9 @@ OpenZoom is a Windows-only camera magnification playground that experiments with
 ## Highlights
 - Media Foundation capture thread that speaks BGRA32, RGB32, NV12, and YUY2 and normalises everything into BGRA for rendering.
 - Qt 6 widget shell hosting a Direct3D 12 swap chain, including resize-aware layout and clean shutdown handling.
-- Debug-friendly 2×2 compositor that shows raw input, grayscale, zoom, and combined output so filter stages are easy to inspect.
+- Debug-friendly grid compositor (defaults to 2×2 but now flexes to fit active views) that shows raw input, grayscale, zoom, and combined output so filter stages are easy to inspect.
 - CUDA external-memory interop path now active with optional spatial sharpening (FSR 1.0-style or NVIDIA NIS) plus the legacy Gaussian blur toggle for clearer zoomed text.
+- Temporal smoothing kernel adds an exponential running average to tame shimmer without losing responsiveness.
 - Batch script that bootstraps a Visual Studio 2022 build, scrubs stale CMake caches, and launches the app when compilation succeeds.
 
 ## Project Status
@@ -36,11 +37,18 @@ cmake --build build-ninja
 ```
 Run the produced `open_zoom.exe` from `build-ninja` (ensure Qt DLLs are discoverable).
 
+### Bundled Release build
+```bat
+scripts\build_release_bundle.bat
+```
+Creates `dist\OpenZoom\` with `open_zoom.exe`, the required Qt DLLs, and CUDA runtime components (when CUDA is enabled) so the app can be copied to another machine.
+
 ## Runtime Controls
 - Camera picker combo box selects the active Media Foundation device.
 - `Black & White` checkbox toggles grayscale processing.
 - `Zoom` checkbox enables the magnifier.
-- The 2×2 debug view displays: top-left raw feed, top-right grayscale, bottom-left zoom, bottom-right combined result.
+- `Temporal Smooth` checkbox blends frames using an exponential running average (slider controls the new-frame weight).
+- The debug grid displays: top-left raw feed, top-right grayscale, bottom-left zoom, bottom-right combined result, expanding beyond 2×2 when additional stages are enabled.
 
 ## Repository Layout
 - `src/` – Qt application, Media Foundation capture, Direct3D12 presentation, and CUDA stubs.
@@ -62,3 +70,16 @@ Run the produced `open_zoom.exe` from `build-ninja` (ensure Qt DLLs are discover
 - Expand automated checks for kernel outputs and add regression tests via `OPENZOOM_ENABLE_TESTS`.
 
 For deeper architectural context and historical notes, start with `docs/README.md`.
+
+## License
+
+This project is dual-licensed:
+
+- **GPL-3.0** — open-source usage under the GNU General Public License
+  (license text included in `LICENSE`).
+- **Commercial License** — proprietary terms available by contacting
+  `sales@example.com`.
+
+By submitting a pull request you agree that your contribution may be
+distributed under both licenses. Third-party notices are collected in
+`docs/THIRD_PARTY_LICENSES.md`.

@@ -16,11 +16,28 @@ OpenZoom is a Windows-only experimental camera magnification playground combinin
    ```
 3. If you see "Qt6*.dll was not found", add `C:\Qt\6.9.3\msvc2022_64\bin` to `PATH` or copy the DLLs next to the executable.
 
+## External Dependencies
+- **Visual Studio 2022** with Desktop C++ workload and Windows 10/11 SDK (minimum 10.0.19041).
+- **Qt 6.9.3 MSVC 64-bit** binaries with matching debug/release builds; ensure `Qt6_DIR` resolves to the `lib/cmake/Qt6` folder.
+- **CUDA Toolkit 13.x** (tested with 13.4); add `bin`, `lib/x64`, and `include` to PATH/LIB/INCLUDE or configure `CUDA_PATH`.
+- **NVIDIA drivers** supporting CUDA external-memory interop (R555+ recommended).
+- **CMake ≥ 3.23** and **Ninja** (optional but faster for incremental builds).
+- (Planned) **OpenCV DNN + CUDA** and **TensorRT 10.x** for advanced upscalers—documented install scripts will land alongside their integration.
+
 ## Runtime Controls
 - Toggle cameras via the combo box.
 - Enable grayscale via **Black & White**.
 - Enable zoom via **Zoom**.
+- Enable **Temporal Smooth** to run an exponential moving average across frames (slider controls how much of the new frame is blended in).
+- Enable **Spatial Sharpen** to choose between AMD FSR 1.0 or NVIDIA NIS (NIS is selected by default).
 - Both effects can run simultaneously; the bottom-right quadrant shows the combined output.
+
+## Runtime Flags
+- `--cuda-buffer-format=<rgba8|fp16>` or `OPENZOOM_CUDA_BUFFER_FORMAT` (defaults to `rgba8`; `fp16` is reserved for upcoming deep-learning kernels).
+
+See `docs/hardcoded_paths.md` for a list of hard-coded toolchain paths and
+defaults that may need adjustment on new machines. License attributions live
+in `docs/THIRD_PARTY_LICENSES.md`.
 
 ## Next Steps
 - Validate CUDA interop on systems with the full external-memory headers.

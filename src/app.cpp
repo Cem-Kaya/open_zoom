@@ -29,6 +29,7 @@
 #include <QResizeEvent>
 #include <QShowEvent>
 #include <QDebug>
+#include <QMessageBox>
 
 #include <windows.h>
 #include <combaseapi.h>
@@ -85,6 +86,35 @@ int NormalizeRadiusValue(int sliderValue) {
         }
     }
     return radius;
+}
+
+CudaBufferFormat ParseCudaBufferFormatToken(const QString& token, bool* ok)
+{
+    const QString normalized = token.trimmed().toLower();
+    if (normalized == QStringLiteral("rgba8") ||
+        normalized == QStringLiteral("bgra8") ||
+        normalized == QStringLiteral("uint8") ||
+        normalized == QStringLiteral("8bit")) {
+        if (ok) {
+            *ok = true;
+        }
+        return CudaBufferFormat::kRgba8;
+    }
+
+    if (normalized == QStringLiteral("rgba16f") ||
+        normalized == QStringLiteral("fp16") ||
+        normalized == QStringLiteral("half") ||
+        normalized == QStringLiteral("16f")) {
+        if (ok) {
+            *ok = true;
+        }
+        return CudaBufferFormat::kRgba16F;
+    }
+
+    if (ok) {
+        *ok = false;
+    }
+    return CudaBufferFormat::kRgba8;
 }
 
 void ApplyGaussianBlur(const std::vector<uint8_t>& src,
@@ -1150,13 +1180,31 @@ public:
         blurLayout->addWidget(blurRadiusValueLabel_);
         controlsLayout->addLayout(blurLayout);
 
+        auto* temporalLayout = new QHBoxLayout();
+        temporalLayout->setSpacing(8);
+        temporalSmoothCheckbox_ = new QCheckBox("Temporal Smooth");
+        temporalSmoothCheckbox_->setChecked(false);
+        temporalSmoothSlider_ = new QSlider(Qt::Horizontal);
+        temporalSmoothSlider_->setRange(5, 100);
+        temporalSmoothSlider_->setPageStep(5);
+        temporalSmoothSlider_->setValue(25);
+        temporalSmoothSlider_->setEnabled(false);
+        temporalSmoothValueLabel_ = new QLabel("0.25");
+        temporalSmoothValueLabel_->setMinimumWidth(40);
+        temporalLayout->addWidget(temporalSmoothCheckbox_);
+        temporalLayout->addSpacing(12);
+        temporalLayout->addWidget(new QLabel("Blend:"));
+        temporalLayout->addWidget(temporalSmoothSlider_, 1);
+        temporalLayout->addWidget(temporalSmoothValueLabel_);
+        controlsLayout->addLayout(temporalLayout);
+
         auto* spatialRow = new QHBoxLayout();
         spatialRow->setSpacing(8);
         spatialSharpenCheckbox_ = new QCheckBox("Spatial Sharpen");
         spatialSharpenCheckbox_->setChecked(false);
         spatialBackendCombo_ = new QComboBox();
-        spatialBackendCombo_->addItem("FSR 1.0 (EASU + RCAS)");
-        spatialBackendCombo_->addItem("NVIDIA Image Scaling");
+        spatialBackendCombo_->addItem("AMD FSR 1.0 (EASU + RCAS)");
+        spatialBackendCombo_->addItem("NVIDIA Image Scaling (default)");
         spatialBackendCombo_->setEnabled(false);
         spatialSharpnessSlider_ = new QSlider(Qt::Horizontal);
         spatialSharpnessSlider_->setRange(0, 100);
@@ -1243,6 +1291,9 @@ public:
     QSlider* blurRadiusSlider() const { return blurRadiusSlider_; }
     QLabel* blurSigmaValueLabel() const { return blurSigmaValueLabel_; }
     QLabel* blurRadiusValueLabel() const { return blurRadiusValueLabel_; }
+    QCheckBox* temporalSmoothCheckbox() const { return temporalSmoothCheckbox_; }
+    QSlider* temporalSmoothSlider() const { return temporalSmoothSlider_; }
+    QLabel* temporalSmoothValueLabel() const { return temporalSmoothValueLabel_; }
     QCheckBox* spatialSharpenCheckbox() const { return spatialSharpenCheckbox_; }
     QComboBox* spatialBackendCombo() const { return spatialBackendCombo_; }
     QSlider* spatialSharpnessSlider() const { return spatialSharpnessSlider_; }
@@ -1339,6 +1390,9 @@ private:
     QSlider* blurRadiusSlider_{};
     QLabel* blurSigmaValueLabel_{};
     QLabel* blurRadiusValueLabel_{};
+    QCheckBox* temporalSmoothCheckbox_{};
+    QSlider* temporalSmoothSlider_{};
+    QLabel* temporalSmoothValueLabel_{};
     QCheckBox* spatialSharpenCheckbox_{};
     QComboBox* spatialBackendCombo_{};
     QSlider* spatialSharpnessSlider_{};
@@ -1351,6 +1405,7 @@ private:
 OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     : QObject(nullptr) {
     qtApp_ = new QApplication(argc, argv);
+    ResolveCudaBufferFormatFromOptions();
     InitializePlatform();
 
     presenter_ = std::make_unique<D3D12Presenter>();
@@ -1377,6 +1432,9 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     blurRadiusSlider_ = mainWindow_->blurRadiusSlider();
     blurSigmaValueLabel_ = mainWindow_->blurSigmaValueLabel();
     blurRadiusValueLabel_ = mainWindow_->blurRadiusValueLabel();
+    temporalSmoothCheckbox_ = mainWindow_->temporalSmoothCheckbox();
+    temporalSmoothSlider_ = mainWindow_->temporalSmoothSlider();
+    temporalSmoothValueLabel_ = mainWindow_->temporalSmoothValueLabel();
     spatialSharpenCheckbox_ = mainWindow_->spatialSharpenCheckbox();
     spatialBackendCombo_ = mainWindow_->spatialBackendCombo();
     spatialSharpnessSlider_ = mainWindow_->spatialSharpnessSlider();
@@ -1411,16 +1469,21 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
         }
     }
     blurEnabled_ = blurCheckbox_ ? blurCheckbox_->isChecked() : false;
+    temporalSmoothEnabled_ = temporalSmoothCheckbox_ ? temporalSmoothCheckbox_->isChecked() : false;
+    if (temporalSmoothSlider_) {
+        temporalSmoothAlpha_ = std::clamp(static_cast<float>(temporalSmoothSlider_->value()) / 100.0f, 0.0f, 1.0f);
+    }
     spatialSharpenEnabled_ = spatialSharpenCheckbox_ ? spatialSharpenCheckbox_->isChecked() : false;
     if (spatialBackendCombo_) {
-        spatialUpscaler_ = static_cast<SpatialUpscaler>(std::clamp(spatialBackendCombo_->currentIndex(), 0, 1));
-    } else {
-        spatialUpscaler_ = SpatialUpscaler::kFsrEasuRcas;
+        QSignalBlocker block(spatialBackendCombo_);
+        spatialBackendCombo_->setCurrentIndex(static_cast<int>(SpatialUpscaler::kNis));
     }
+    spatialUpscaler_ = SpatialUpscaler::kNis;
     if (spatialSharpnessSlider_) {
         spatialSharpness_ = std::clamp(static_cast<float>(spatialSharpnessSlider_->value()) / 100.0f, 0.0f, 1.0f);
     }
     UpdateBlurUiLabels();
+    UpdateTemporalSmoothUi();
     UpdateSpatialSharpenUi();
     UpdateProcessingStatusLabel();
     if (focusMarkerCheckbox_) {
@@ -1474,6 +1537,14 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     if (blurRadiusSlider_) {
         connect(blurRadiusSlider_, &QSlider::valueChanged,
                 this, &OpenZoomApp::OnBlurRadiusChanged);
+    }
+    if (temporalSmoothCheckbox_) {
+        connect(temporalSmoothCheckbox_, &QCheckBox::toggled,
+                this, &OpenZoomApp::OnTemporalSmoothToggled);
+    }
+    if (temporalSmoothSlider_) {
+        connect(temporalSmoothSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnTemporalSmoothStrengthChanged);
     }
     if (spatialSharpenCheckbox_) {
         connect(spatialSharpenCheckbox_, &QCheckBox::toggled,
@@ -1543,6 +1614,41 @@ void OpenZoomApp::InitializePlatform() {
     mfInitialized_ = true;
 
     EnumerateCameras();
+}
+
+void OpenZoomApp::ResolveCudaBufferFormatFromOptions() {
+    cudaBufferFormat_ = CudaBufferFormat::kRgba8;
+
+    bool ok = false;
+    const QByteArray envValue = qgetenv("OPENZOOM_CUDA_BUFFER_FORMAT");
+    if (!envValue.isEmpty()) {
+        const auto parsed = ParseCudaBufferFormatToken(QString::fromUtf8(envValue), &ok);
+        if (ok) {
+            cudaBufferFormat_ = parsed;
+        } else {
+            qWarning() << "Ignoring unknown OPENZOOM_CUDA_BUFFER_FORMAT value" << envValue;
+        }
+    }
+
+    const QStringList args = qtApp_->arguments();
+    for (const QString& arg : args) {
+        if (arg.startsWith(QStringLiteral("--cuda-buffer-format="), Qt::CaseInsensitive)) {
+            const QString value = arg.section('=', 1);
+            const auto parsed = ParseCudaBufferFormatToken(value, &ok);
+            if (ok) {
+                cudaBufferFormat_ = parsed;
+            } else {
+                qWarning() << "Ignoring unknown --cuda-buffer-format option" << value;
+            }
+        } else if (arg.compare(QStringLiteral("--cuda-buffer-fp16"), Qt::CaseInsensitive) == 0) {
+            cudaBufferFormat_ = CudaBufferFormat::kRgba16F;
+        } else if (arg.compare(QStringLiteral("--cuda-buffer-rgba8"), Qt::CaseInsensitive) == 0) {
+            cudaBufferFormat_ = CudaBufferFormat::kRgba8;
+        }
+    }
+
+    const char* label = (cudaBufferFormat_ == CudaBufferFormat::kRgba16F) ? "RGBA16F" : "RGBA8";
+    qInfo() << "CUDA staging buffer format set to" << label;
 }
 
 void OpenZoomApp::EnumerateCameras() {
@@ -1736,6 +1842,39 @@ void OpenZoomApp::OnSpatialSharpnessChanged(int value) {
     UpdateProcessingStatusLabel();
 }
 
+void OpenZoomApp::OnTemporalSmoothToggled(bool checked) {
+    temporalSmoothEnabled_ = checked;
+    if (temporalSmoothSlider_) {
+        temporalSmoothSlider_->setEnabled(checked);
+    }
+    temporalHistoryValid_ = false;
+    temporalHistoryCpu_.clear();
+    if (cudaSurface_) {
+        cudaSurface_->ResetTemporalHistory();
+    }
+    UpdateTemporalSmoothUi();
+}
+
+void OpenZoomApp::OnTemporalSmoothStrengthChanged(int value) {
+    const int sliderMin = temporalSmoothSlider_ ? temporalSmoothSlider_->minimum() : 1;
+    const int sliderMax = temporalSmoothSlider_ ? temporalSmoothSlider_->maximum() : 100;
+    const int clamped = std::clamp(value, sliderMin, sliderMax);
+    if (temporalSmoothSlider_ && clamped != value) {
+        QSignalBlocker block(temporalSmoothSlider_);
+        temporalSmoothSlider_->setValue(clamped);
+    }
+    temporalSmoothAlpha_ = std::clamp(static_cast<float>(clamped) / 100.0f, 0.0f, 1.0f);
+    if (temporalSmoothValueLabel_) {
+        temporalSmoothValueLabel_->setText(QString::number(temporalSmoothAlpha_, 'f', 2));
+    }
+    temporalHistoryValid_ = false;
+    temporalHistoryCpu_.clear();
+    if (cudaSurface_) {
+        cudaSurface_->ResetTemporalHistory();
+    }
+    UpdateTemporalSmoothUi();
+}
+
 void OpenZoomApp::SetZoomCenter(float normX, float normY, bool syncUi) {
     const float clampedX = std::clamp(normX, 0.0f, 1.0f);
     const float clampedY = std::clamp(normY, 0.0f, 1.0f);
@@ -1921,6 +2060,72 @@ void OpenZoomApp::UpdateBlurUiLabels() {
     }
 }
 
+void OpenZoomApp::UpdateTemporalSmoothUi() {
+    if (temporalSmoothCheckbox_) {
+        QSignalBlocker block(temporalSmoothCheckbox_);
+        temporalSmoothCheckbox_->setChecked(temporalSmoothEnabled_);
+    }
+    if (temporalSmoothSlider_) {
+        temporalSmoothSlider_->setEnabled(temporalSmoothEnabled_);
+        const int sliderValue = static_cast<int>(std::round(temporalSmoothAlpha_ * 100.0f));
+        QSignalBlocker block(temporalSmoothSlider_);
+        temporalSmoothSlider_->setValue(std::clamp(sliderValue,
+                                                  temporalSmoothSlider_->minimum(),
+                                                  temporalSmoothSlider_->maximum()));
+    }
+    if (temporalSmoothValueLabel_) {
+        temporalSmoothValueLabel_->setEnabled(temporalSmoothEnabled_);
+        temporalSmoothValueLabel_->setText(QString::number(temporalSmoothAlpha_, 'f', 2));
+    }
+}
+
+void OpenZoomApp::ApplyTemporalSmoothCpu(std::vector<uint8_t>& frame, UINT width, UINT height) {
+    if (!temporalSmoothEnabled_) {
+        temporalHistoryValid_ = false;
+        temporalHistoryCpu_.clear();
+        return;
+    }
+
+    if (frame.empty() || width == 0 || height == 0) {
+        return;
+    }
+
+    const size_t channelCount = static_cast<size_t>(width) * static_cast<size_t>(height) * 4u;
+    if (frame.size() < channelCount) {
+        return;
+    }
+
+    if (temporalHistoryCpu_.size() != channelCount) {
+        temporalHistoryCpu_.assign(channelCount, 0.0f);
+        temporalHistoryValid_ = false;
+    }
+
+    const float alpha = std::clamp(temporalSmoothAlpha_, 0.0f, 1.0f);
+    const float oneMinusAlpha = 1.0f - alpha;
+
+    if (!temporalHistoryValid_) {
+        for (size_t i = 0; i < channelCount; ++i) {
+            temporalHistoryCpu_[i] = static_cast<float>(frame[i]);
+        }
+        temporalHistoryValid_ = true;
+        return;
+    }
+
+    for (size_t i = 0; i < channelCount; ++i) {
+        if ((i & 3u) == 3u) {
+            temporalHistoryCpu_[i] = 255.0f;
+            frame[i] = 255u;
+            continue;
+        }
+
+        const float curr = static_cast<float>(frame[i]);
+        const float prev = temporalHistoryCpu_[i];
+        const float blended = alpha * curr + oneMinusAlpha * prev;
+        temporalHistoryCpu_[i] = blended;
+        frame[i] = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(blended)), 0, 255));
+    }
+}
+
 void OpenZoomApp::UpdateSpatialSharpenUi() {
     const bool enabled = spatialSharpenEnabled_;
 
@@ -1929,11 +2134,9 @@ void OpenZoomApp::UpdateSpatialSharpenUi() {
         spatialSharpenCheckbox_->setChecked(enabled);
     }
     if (spatialBackendCombo_) {
+        QSignalBlocker block(spatialBackendCombo_);
+        spatialBackendCombo_->setCurrentIndex(static_cast<int>(spatialUpscaler_));
         spatialBackendCombo_->setEnabled(enabled);
-        if (enabled) {
-            QSignalBlocker block(spatialBackendCombo_);
-            spatialBackendCombo_->setCurrentIndex(static_cast<int>(spatialUpscaler_));
-        }
     }
     if (spatialSharpnessSlider_) {
         spatialSharpnessSlider_->setEnabled(enabled);
@@ -1958,9 +2161,10 @@ void OpenZoomApp::UpdateProcessingStatusLabel() {
 
     auto backendLabel = [this]() -> QString {
         if (spatialSharpenEnabled_) {
-            return (spatialUpscaler_ == SpatialUpscaler::kNis)
-                       ? QStringLiteral("Spatial Sharpen (NIS)")
-                       : QStringLiteral("Spatial Sharpen (FSR)");
+            if (spatialUpscaler_ == SpatialUpscaler::kNis) {
+                return QStringLiteral("Spatial Sharpen (NIS)");
+            }
+            return QStringLiteral("Spatial Sharpen (FSR)");
         }
         if (blurEnabled_) {
             return QStringLiteral("Gaussian Blur");
@@ -1968,7 +2172,14 @@ void OpenZoomApp::UpdateProcessingStatusLabel() {
         return QStringLiteral("None");
     };
 
-    if (debugViewEnabled_) {
+    if (!cameraActive_) {
+        if (lastCameraError_.isEmpty()) {
+            text = QStringLiteral("Processing: Idle (camera offline)");
+        } else {
+            text = QStringLiteral("Processing: Idle (camera offline — %1)").arg(lastCameraError_);
+        }
+        color = QStringLiteral("#c0392b");
+    } else if (debugViewEnabled_) {
         text = QStringLiteral("Processing: CPU (debug view)");
         color = QStringLiteral("#d17c00");
     } else if (usingCudaLastFrame_ && cudaPipelineAvailable_) {
@@ -2258,8 +2469,9 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
     }
 
     ProcessingInput input{};
-    input.hostBgra = stageRaw_.data();
-    input.hostStride = width * 4;
+    input.hostPixels = stageRaw_.data();
+    input.hostStrideBytes = width * 4;
+    input.pixelSizeBytes = static_cast<unsigned int>(sizeof(uint32_t));
     input.width = width;
     input.height = height;
 
@@ -2277,6 +2489,9 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
     settings.enableSpatialSharpen = spatialSharpenEnabled_;
     settings.spatialUpscaler = spatialUpscaler_;
     settings.spatialSharpness = spatialSharpness_;
+    settings.stagingFormat = cudaBufferFormat_;
+    settings.enableTemporalSmoothing = temporalSmoothEnabled_;
+    settings.temporalSmoothingAlpha = temporalSmoothAlpha_;
 
     FenceSyncParams cudaSyncParams{};
     uint64_t cudaSignalCandidate = 0;
@@ -2383,122 +2598,135 @@ void OpenZoomApp::StartCameraCapture(size_t index) {
 
     selectedCameraIndex_ = static_cast<int>(index);
     StopCameraCapture();
-
-    CameraInfo& camera = cameras_[index];
-    if (!camera.activation) {
-        return;
+    temporalHistoryValid_ = false;
+    temporalHistoryCpu_.clear();
+    if (cudaSurface_) {
+        cudaSurface_->ResetTemporalHistory();
     }
 
-    Microsoft::WRL::ComPtr<IMFMediaSource> mediaSource;
-    ThrowIfFailed(camera.activation->ActivateObject(__uuidof(IMFMediaSource),
+    try {
+        CameraInfo& camera = cameras_[index];
+        if (!camera.activation) {
+            throw std::runtime_error("Camera activation metadata missing");
+        }
+
+        Microsoft::WRL::ComPtr<IMFMediaSource> mediaSource;
+        ThrowIfFailed(camera.activation->ActivateObject(__uuidof(IMFMediaSource),
                                                     reinterpret_cast<void**>(mediaSource.GetAddressOf())),
-                  "Failed to activate camera");
+                      "Failed to activate camera");
 
-    Microsoft::WRL::ComPtr<IMFAttributes> readerAttributes;
-    ThrowIfFailed(MFCreateAttributes(readerAttributes.GetAddressOf(), 4),
-                  "Failed to create reader attributes");
-    ThrowIfFailed(readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE),
-                  "Failed to enable video processing");
-    ThrowIfFailed(readerAttributes->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA, TRUE),
-                  "Failed to disable DXVA");
-    ThrowIfFailed(readerAttributes->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, FALSE),
-                  "Failed to allow converters");
+        Microsoft::WRL::ComPtr<IMFAttributes> readerAttributes;
+        ThrowIfFailed(MFCreateAttributes(readerAttributes.GetAddressOf(), 4),
+                      "Failed to create reader attributes");
+        ThrowIfFailed(readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE),
+                      "Failed to enable video processing");
+        ThrowIfFailed(readerAttributes->SetUINT32(MF_SOURCE_READER_DISABLE_DXVA, TRUE),
+                      "Failed to disable DXVA");
+        ThrowIfFailed(readerAttributes->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, FALSE),
+                      "Failed to allow converters");
 
-    Microsoft::WRL::ComPtr<IMFSourceReader> reader;
-    ThrowIfFailed(MFCreateSourceReaderFromMediaSource(mediaSource.Get(),
+        Microsoft::WRL::ComPtr<IMFSourceReader> reader;
+        ThrowIfFailed(MFCreateSourceReaderFromMediaSource(mediaSource.Get(),
                                                       readerAttributes.Get(),
                                                       reader.GetAddressOf()),
-                  "Failed to create source reader");
+                      "Failed to create source reader");
 
-    ThrowIfFailed(reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE),
-                  "Failed to disable default streams");
-    ThrowIfFailed(reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE),
-                  "Failed to enable video stream");
+        ThrowIfFailed(reader->SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS, FALSE),
+                      "Failed to disable default streams");
+        ThrowIfFailed(reader->SetStreamSelection(MF_SOURCE_READER_FIRST_VIDEO_STREAM, TRUE),
+                      "Failed to enable video stream");
 
-    Microsoft::WRL::ComPtr<IMFMediaType> desiredType;
-    ThrowIfFailed(MFCreateMediaType(desiredType.GetAddressOf()),
-                  "Failed to create media type");
-    ThrowIfFailed(desiredType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
-                  "Failed to set major type");
-    ThrowIfFailed(desiredType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32),
-                  "Failed to set subtype");
+        Microsoft::WRL::ComPtr<IMFMediaType> desiredType;
+        ThrowIfFailed(MFCreateMediaType(desiredType.GetAddressOf()),
+                      "Failed to create media type");
+        ThrowIfFailed(desiredType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
+                      "Failed to set major type");
+        ThrowIfFailed(desiredType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_ARGB32),
+                      "Failed to set subtype");
 
-    HRESULT hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-                                             nullptr,
-                                             desiredType.Get());
+        HRESULT hr = reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                                                 nullptr,
+                                                 desiredType.Get());
 
-    if (FAILED(hr)) {
-        const std::array<GUID, 3> fallbacks{MFVideoFormat_RGB32, MFVideoFormat_NV12, MFVideoFormat_YUY2};
-        bool configured = false;
-        for (const GUID& format : fallbacks) {
-            Microsoft::WRL::ComPtr<IMFMediaType> fallback;
-            ThrowIfFailed(MFCreateMediaType(fallback.GetAddressOf()),
-                          "Failed to create fallback media type");
-            ThrowIfFailed(fallback->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
-                          "Failed to set fallback major type");
-            ThrowIfFailed(fallback->SetGUID(MF_MT_SUBTYPE, format),
-                          "Failed to set fallback subtype");
+        if (FAILED(hr)) {
+            const std::array<GUID, 3> fallbacks{MFVideoFormat_RGB32, MFVideoFormat_NV12, MFVideoFormat_YUY2};
+            bool configured = false;
+            for (const GUID& format : fallbacks) {
+                Microsoft::WRL::ComPtr<IMFMediaType> fallback;
+                ThrowIfFailed(MFCreateMediaType(fallback.GetAddressOf()),
+                              "Failed to create fallback media type");
+                ThrowIfFailed(fallback->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video),
+                              "Failed to set fallback major type");
+                ThrowIfFailed(fallback->SetGUID(MF_MT_SUBTYPE, format),
+                              "Failed to set fallback subtype");
 
-            if (SUCCEEDED(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                if (SUCCEEDED(reader->SetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
                                                       nullptr,
                                                       fallback.Get()))) {
-                desiredType = fallback;
-                configured = true;
-                break;
+                    desiredType = fallback;
+                    configured = true;
+                    break;
+                }
+            }
+
+            if (!configured) {
+                ThrowIfFailed(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+                                                      desiredType.GetAddressOf()),
+                              "Failed to retrieve native media type");
             }
         }
 
-        if (!configured) {
-            ThrowIfFailed(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-                                                      desiredType.GetAddressOf()),
-                          "Failed to retrieve native media type");
-        }
-    }
-
-    Microsoft::WRL::ComPtr<IMFMediaType> currentType;
-    ThrowIfFailed(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+        Microsoft::WRL::ComPtr<IMFMediaType> currentType;
+        ThrowIfFailed(reader->GetCurrentMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM,
                                               currentType.GetAddressOf()),
-                  "Failed to get current media type");
+                      "Failed to get current media type");
 
-    GUID subtype = GUID_NULL;
-    ThrowIfFailed(currentType->GetGUID(MF_MT_SUBTYPE, &subtype),
-                  "Failed to get subtype");
+        GUID subtype = GUID_NULL;
+        ThrowIfFailed(currentType->GetGUID(MF_MT_SUBTYPE, &subtype),
+                      "Failed to get subtype");
 
-    UINT32 frameWidth = 0;
-    UINT32 frameHeight = 0;
-    ThrowIfFailed(MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &frameWidth, &frameHeight),
-                  "Failed to get frame size");
+        UINT32 frameWidth = 0;
+        UINT32 frameHeight = 0;
+        ThrowIfFailed(MFGetAttributeSize(currentType.Get(), MF_MT_FRAME_SIZE, &frameWidth, &frameHeight),
+                      "Failed to get frame size");
 
-    LONG stride = 0;
-    if (FAILED(MFGetStrideForBitmapInfoHeader(subtype.Data1, frameWidth, &stride))) {
-        if (IsEqualGUID(subtype, MFVideoFormat_ARGB32) || IsEqualGUID(subtype, MFVideoFormat_RGB32)) {
-            stride = static_cast<LONG>(frameWidth * 4);
-        } else if (IsEqualGUID(subtype, MFVideoFormat_NV12)) {
-            stride = static_cast<LONG>(frameWidth);
-        } else if (IsEqualGUID(subtype, MFVideoFormat_YUY2)) {
-            stride = static_cast<LONG>(frameWidth * 2);
-        } else {
-            ThrowIfFailed(E_FAIL, "Unsupported camera format stride");
+        LONG stride = 0;
+        if (FAILED(MFGetStrideForBitmapInfoHeader(subtype.Data1, frameWidth, &stride))) {
+            if (IsEqualGUID(subtype, MFVideoFormat_ARGB32) || IsEqualGUID(subtype, MFVideoFormat_RGB32)) {
+                stride = static_cast<LONG>(frameWidth * 4);
+            } else if (IsEqualGUID(subtype, MFVideoFormat_NV12)) {
+                stride = static_cast<LONG>(frameWidth);
+            } else if (IsEqualGUID(subtype, MFVideoFormat_YUY2)) {
+                stride = static_cast<LONG>(frameWidth * 2);
+            } else {
+                ThrowIfFailed(E_FAIL, "Unsupported camera format stride");
+            }
         }
+
+        {
+            std::scoped_lock lock(cameraMutex_);
+            cameraFrameBuffer_.clear();
+            cameraFrameWidth_ = frameWidth;
+            cameraFrameHeight_ = frameHeight;
+            cameraFrameStride_ = static_cast<UINT>(std::abs(stride));
+            cameraFrameDataSize_ = 0;
+            cameraFrameSubtype_ = subtype;
+            cameraFrameValid_ = false;
+        }
+
+        cameraMediaSource_ = std::move(mediaSource);
+        cameraReader_ = std::move(reader);
+        cameraActive_ = true;
+        cameraCaptureRunning_ = true;
+        cameraThread_ = std::thread(&OpenZoomApp::CameraCaptureLoop, this);
+
+        lastCameraError_.clear();
+        UpdateProcessingStatusLabel();
+    } catch (const std::exception& e) {
+        HandleCameraStartFailure(QString::fromUtf8(e.what()));
+    } catch (...) {
+        HandleCameraStartFailure(QStringLiteral("Unknown camera initialization failure"));
     }
-
-    {
-        std::scoped_lock lock(cameraMutex_);
-        cameraFrameBuffer_.clear();
-        cameraFrameWidth_ = frameWidth;
-        cameraFrameHeight_ = frameHeight;
-        cameraFrameStride_ = static_cast<UINT>(std::abs(stride));
-        cameraFrameDataSize_ = 0;
-        cameraFrameSubtype_ = subtype;
-        cameraFrameValid_ = false;
-    }
-
-    cameraMediaSource_ = std::move(mediaSource);
-    cameraReader_ = std::move(reader);
-
-    cameraActive_ = true;
-    cameraCaptureRunning_ = true;
-    cameraThread_ = std::thread(&OpenZoomApp::CameraCaptureLoop, this);
 }
 
 void OpenZoomApp::StopCameraCapture() {
@@ -2528,7 +2756,23 @@ void OpenZoomApp::StopCameraCapture() {
     cameraFrameDataSize_ = 0;
     cameraFrameSubtype_ = GUID_NULL;
     cameraFrameValid_ = false;
+    temporalHistoryCpu_.clear();
+    temporalHistoryValid_ = false;
+    if (cudaSurface_) {
+        cudaSurface_->ResetTemporalHistory();
+    }
 }
+
+void OpenZoomApp::HandleCameraStartFailure(const QString& message) {
+    qWarning() << "Camera start failed:" << message;
+    lastCameraError_ = message;
+    StopCameraCapture();
+    UpdateProcessingStatusLabel();
+    if (mainWindow_) {
+        QMessageBox::warning(mainWindow_.get(), QStringLiteral("Camera Error"), message);
+    }
+}
+
 
 void OpenZoomApp::CameraCaptureLoop() {
     HRESULT coInit = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
@@ -2710,6 +2954,7 @@ void OpenZoomApp::BuildCompositeAndPresent(UINT width, UINT height) {
     }
 
     stageFinal_ = *currentStage;
+    ApplyTemporalSmoothCpu(stageFinal_, width, height);
 
     if (stageFinal_.empty()) {
         UpdateProcessingStatusLabel();

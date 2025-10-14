@@ -7,6 +7,7 @@
 #include <QPointF>
 #include <QRectF>
 #include <QSize>
+#include <QString>
 
 #include "openzoom/cuda_interop.hpp"
 
@@ -105,6 +106,8 @@ private slots:
     void OnSpatialSharpenToggled(bool checked);
     void OnSpatialUpscalerChanged(int index);
     void OnSpatialSharpnessChanged(int value);
+    void OnTemporalSmoothToggled(bool checked);
+    void OnTemporalSmoothStrengthChanged(int value);
 
 private:
     void InitializePlatform();
@@ -135,6 +138,7 @@ private:
     void UpdateBlurUiLabels();
     void UpdateProcessingStatusLabel();
     void UpdateSpatialSharpenUi();
+    void UpdateTemporalSmoothUi();
     void BeginMousePan(const QPointF& pos, const QSize& widgetSize);
     bool UpdateMousePan(const QPointF& pos);
     void EndMousePan();
@@ -143,6 +147,9 @@ private:
     bool EnsureCudaSurface(UINT width, UINT height);
     bool ProcessFrameWithCuda(UINT width, UINT height);
     void ResetCudaFenceState();
+    void ResolveCudaBufferFormatFromOptions();
+    void HandleCameraStartFailure(const QString& message);
+    void ApplyTemporalSmoothCpu(std::vector<uint8_t>& frame, UINT width, UINT height);
 
     QApplication* qtApp_{};
     std::unique_ptr<MainWindow> mainWindow_;
@@ -165,6 +172,9 @@ private:
     QSlider* blurRadiusSlider_{};
     QLabel* blurSigmaValueLabel_{};
     QLabel* blurRadiusValueLabel_{};
+    QCheckBox* temporalSmoothCheckbox_{};
+    QSlider* temporalSmoothSlider_{};
+    QLabel* temporalSmoothValueLabel_{};
     QCheckBox* spatialSharpenCheckbox_{};
     QComboBox* spatialBackendCombo_{};
     QSlider* spatialSharpnessSlider_{};
@@ -219,8 +229,10 @@ private:
     bool blurEnabled_{};
     float blurSigma_{1.0f};
     int blurRadius_{3};
+    bool temporalSmoothEnabled_{};
+    float temporalSmoothAlpha_{0.25f};
     bool spatialSharpenEnabled_{};
-    SpatialUpscaler spatialUpscaler_{SpatialUpscaler::kFsrEasuRcas};
+    SpatialUpscaler spatialUpscaler_{SpatialUpscaler::kNis};
     float spatialSharpness_{0.25f};
     bool middlePanActive_{};
     QPointF middlePanLastPos_{};
@@ -234,6 +246,8 @@ private:
     std::vector<uint8_t> presentationBuffer_;
     std::vector<uint8_t> stageBlur_;
     std::vector<uint8_t> blurScratch_;
+    std::vector<float> temporalHistoryCpu_;
+    bool temporalHistoryValid_{};
 
     JoystickOverlay* joystickOverlay_{};
 
@@ -247,6 +261,8 @@ private:
     uint64_t lastCudaSignalValue_{};
     uint64_t lastGraphicsSignalValue_{};
     bool cudaFenceInteropEnabled_{};
+    CudaBufferFormat cudaBufferFormat_{CudaBufferFormat::kRgba8};
+    QString lastCameraError_;
 };
 
 } // namespace openzoom

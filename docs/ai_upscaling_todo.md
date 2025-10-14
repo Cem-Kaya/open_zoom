@@ -14,11 +14,11 @@
 - [ ] Refactor configuration so blur radius/sigma map cleanly when mode 0 is active and are hidden/disabled otherwise.
 - [ ] Write regression test notes: capture before/after frames to validate baseline still works.
 
-## Mode 1 – Spatial Upscalers (FSR1 + NIS)
+## Mode 1 – Spatial Upscaler (NVIDIA NIS default)
 - [x] Research minimal licensing/attribution requirements for AMD FSR1 and NVIDIA NIS.
 - [x] Implement initial CUDA kernels (Lanczos + RCAS-style sharpen) for FSR-like and NIS-like paths with shared sharpness slider.
 - [x] Expose a dedicated “Spatial Sharpen” toggle (FSR/NIS + sharpness) independent of other stages.
-- [ ] Add heuristics to auto-pick FSR vs NIS based on vendor (allow override).
+- [x] Default to NVIDIA NIS when the spatial upscaler is enabled; leave FSR evaluation as future optional work.
 - [ ] Benchmark latency on 720p→1080p and 1080p→1440p paths; target <2 ms per frame.
 - [ ] Log full configuration per frame when debug logging enabled (scales, sharpness, adapter).
 
@@ -49,7 +49,6 @@
 ## Cross-Cutting Concerns
 - [ ] Update telemetry/logging to record chosen backend, average processing time, and failure counts.
 - [ ] Ensure fence synchronization and shared texture ownership remain correct across new kernels.
-- [ ] Add command-line flag (e.g., `--upscale-mode`) for QA automation.
 - [ ] Document build/runtime dependencies (OpenCV, TensorRT, model downloads) in `docs/README`.
 - [ ] Prepare automated smoke-test script: run minimal harness per backend to validate startup.
 - [ ] Coordinate with deployment pipeline to bundle necessary DLLs/engine files.

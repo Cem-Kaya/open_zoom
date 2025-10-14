@@ -23,6 +23,8 @@ namespace openzoom {
 
 namespace {
 
+bool gWarnedFp16Unsupported = false;
+
 void ThrowIfFailed(HRESULT hr, const char* message) {
     if (FAILED(hr)) {
         qWarning() << message << "hr=0x" << Qt::hex << static_cast<unsigned long>(hr);
@@ -296,8 +298,19 @@ void CudaInteropSurface::Initialize(ID3D12Resource* texture, ID3D12Fence* shared
     }
 }
 
-bool CudaInteropSurface::EnsureDeviceBuffers(unsigned int width, unsigned int height) {
-    if (deviceBufferA_ && deviceBufferB_ && deviceWidth_ == width && deviceHeight_ == height) {
+bool CudaInteropSurface::EnsureDeviceBuffers(unsigned int width, unsigned int height, CudaBufferFormat format) {
+    CudaBufferFormat resolvedFormat = format;
+    if (format == CudaBufferFormat::kRgba16F) {
+        if (!gWarnedFp16Unsupported) {
+            qWarning() << "CUDA staging format RGBA16F not yet implemented; falling back to RGBA8";
+            gWarnedFp16Unsupported = true;
+        }
+        resolvedFormat = CudaBufferFormat::kRgba8;
+    }
+
+    if (deviceBufferA_ && deviceBufferB_ &&
+        deviceWidth_ == width && deviceHeight_ == height &&
+        bufferFormat_ == resolvedFormat) {
         return true;
     }
 
@@ -320,6 +333,7 @@ bool CudaInteropSurface::EnsureDeviceBuffers(unsigned int width, unsigned int he
 
     deviceWidth_ = width;
     deviceHeight_ = height;
+    bufferFormat_ = resolvedFormat;
     return true;
 }
 
@@ -379,7 +393,44 @@ void CudaInteropSurface::ReleaseDeviceBuffers() {
     devicePitchScratch_ = 0;
     deviceWidth_ = 0;
     deviceHeight_ = 0;
+    bufferFormat_ = CudaBufferFormat::kRgba8;
+    ReleaseTemporalHistory();
     kernelUploaded_ = false;
+}
+
+bool CudaInteropSurface::EnsureTemporalHistory(unsigned int width, unsigned int height) {
+    if (deviceTemporalHistory_ && historyWidth_ == width && historyHeight_ == height) {
+        return true;
+    }
+
+    ReleaseTemporalHistory();
+
+    if (cudaDeviceId_ >= 0) {
+        ThrowIfCudaFailed(cudaSetDevice(cudaDeviceId_), "cudaSetDevice failed");
+    }
+
+    ThrowIfCudaFailed(cudaMallocPitch(reinterpret_cast<void**>(&deviceTemporalHistory_), &devicePitchHistory_,
+                                      static_cast<size_t>(width) * sizeof(float4), height),
+                      "cudaMallocPitch history buffer failed");
+    historyWidth_ = width;
+    historyHeight_ = height;
+    temporalHistoryValid_ = false;
+    return true;
+}
+
+void CudaInteropSurface::ReleaseTemporalHistory() {
+    if (deviceTemporalHistory_) {
+        cudaFree(deviceTemporalHistory_);
+        deviceTemporalHistory_ = nullptr;
+    }
+    devicePitchHistory_ = 0;
+    historyWidth_ = 0;
+    historyHeight_ = 0;
+    temporalHistoryValid_ = false;
+}
+
+void CudaInteropSurface::ResetTemporalHistory() {
+    temporalHistoryValid_ = false;
 }
 
 bool CudaInteropSurface::EnsureGaussianKernel(int radius, float sigma) {
@@ -426,12 +477,23 @@ void CudaInteropSurface::RunGradientDemoKernel(unsigned int width, unsigned int 
 bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
                                       const ProcessingSettings& settings,
                                       const FenceSyncParams& fenceSync) {
-    if (!valid_ || !input.hostBgra || input.width == 0 || input.height == 0) {
+    if (!valid_ || !input.hostPixels || input.width == 0 || input.height == 0) {
         return false;
     }
 
     if (input.width != width_ || input.height != height_) {
         return false;
+    }
+
+    const size_t pixelSize = static_cast<size_t>(input.pixelSizeBytes);
+    if (pixelSize == 0) {
+        qWarning() << "ProcessFrame aborted: invalid pixel size";
+        return false;
+    }
+
+    CudaBufferFormat resolvedFormat = settings.stagingFormat;
+    if (resolvedFormat == CudaBufferFormat::kRgba16F) {
+        resolvedFormat = CudaBufferFormat::kRgba8;
     }
 
     try {
@@ -443,12 +505,19 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
                               "cudaWaitExternalSemaphoresAsync failed");
         }
 
-        if (!EnsureDeviceBuffers(input.width, input.height)) {
+        if (!EnsureDeviceBuffers(input.width, input.height, resolvedFormat)) {
             return false;
         }
 
+        if (pixelSize != sizeof(uchar4)) {
+            if (!gWarnedFp16Unsupported) {
+                qWarning() << "ProcessFrame RGBA16F upload requested but GPU kernel path expects RGBA8; using RGBA8 upload";
+                gWarnedFp16Unsupported = true;
+            }
+        }
+
         ThrowIfCudaFailed(cudaMemcpy2DAsync(deviceBufferA_, devicePitchA_,
-                                            input.hostBgra, input.hostStride,
+                                            static_cast<const uint8_t*>(input.hostPixels), input.hostStrideBytes,
                                             static_cast<size_t>(input.width) * sizeof(uchar4), input.height,
                                             cudaMemcpyHostToDevice, stream_),
                           "cudaMemcpy2DAsync host->device failed");
@@ -510,6 +579,25 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
             swapBuffers();
         }
 
+        if (settings.enableTemporalSmoothing && resolvedFormat == CudaBufferFormat::kRgba8) {
+            if (!EnsureTemporalHistory(input.width, input.height)) {
+                return false;
+            }
+
+            const float alpha = std::clamp(settings.temporalSmoothingAlpha, 0.0f, 1.0f);
+            LaunchTemporalSmoothLinear(alternate, alternatePitch,
+                                       current, currentPitch,
+                                       deviceTemporalHistory_, devicePitchHistory_,
+                                       static_cast<int>(input.width), static_cast<int>(input.height),
+                                       alpha,
+                                       temporalHistoryValid_,
+                                       stream_);
+            temporalHistoryValid_ = true;
+            swapBuffers();
+        } else {
+            temporalHistoryValid_ = false;
+        }
+
         if (settings.drawFocusMarker) {
             LaunchFocusMarkerLinear(current, currentPitch,
                                     static_cast<int>(input.width), static_cast<int>(input.height),
@@ -536,10 +624,12 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
     } catch (const std::exception& e) {
         lastError_ = e.what();
         qWarning() << "ProcessFrame exception:" << e.what();
+        temporalHistoryValid_ = false;
         return false;
     } catch (...) {
         lastError_ = "Unknown CUDA exception during ProcessFrame";
         qWarning() << "ProcessFrame encountered unknown exception";
+        temporalHistoryValid_ = false;
         return false;
     }
 }
