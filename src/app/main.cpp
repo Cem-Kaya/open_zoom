@@ -3,7 +3,7 @@
 #include <exception>
 
 #ifdef _WIN32
-#include "openzoom/app.hpp"
+#include "openzoom/app/app.hpp"
 #endif
 
 int main(int argc, char* argv[]) {

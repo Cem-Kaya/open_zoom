@@ -9,7 +9,7 @@
 #include <QSize>
 #include <QString>
 
-#include "openzoom/cuda_interop.hpp"
+#include "openzoom/cuda/cuda_interop.hpp"
 
 #include <wrl/client.h>
 #include <mfidl.h>
@@ -22,6 +22,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <optional>
 
 QT_BEGIN_NAMESPACE
 class QApplication;
@@ -97,6 +98,7 @@ private slots:
     void OnDebugViewToggled(bool checked);
     void OnZoomCenterXChanged(int value);
     void OnZoomCenterYChanged(int value);
+    void OnRotateButtonClicked();
     void OnControlsCollapsedToggled(bool checked);
     void OnVirtualJoystickToggled(bool checked);
     void OnBlurToggled(bool checked);
@@ -150,6 +152,36 @@ private:
     void ResolveCudaBufferFormatFromOptions();
     void HandleCameraStartFailure(const QString& message);
     void ApplyTemporalSmoothCpu(std::vector<uint8_t>& frame, UINT width, UINT height);
+    void UpdateRotateButtonLabel();
+    void ApplyRotationToStageRaw(UINT& width, UINT& height);
+    static void RotateNormalizedPoint(float inX, float inY, int quarterTurns, float& outX, float& outY);
+    struct PersistentSettings {
+        int cameraIndex{-1};
+        bool blackWhiteEnabled{false};
+        float blackWhiteThreshold{0.5f};
+        bool zoomEnabled{false};
+        float zoomAmount{1.0f};
+        float zoomCenterX{0.5f};
+        float zoomCenterY{0.5f};
+        bool blurEnabled{false};
+        float blurSigma{1.0f};
+        int blurRadius{3};
+        bool temporalSmoothEnabled{false};
+        float temporalSmoothAlpha{0.25f};
+        bool spatialSharpenEnabled{false};
+        SpatialUpscaler spatialUpscaler{SpatialUpscaler::kNis};
+        float spatialSharpness{0.25f};
+        bool debugView{false};
+        bool focusMarker{false};
+        bool virtualJoystick{false};
+        bool controlsCollapsed{false};
+        int rotationQuarterTurns{0};
+    };
+    std::optional<PersistentSettings> LoadPersistentSettingsFromDisk();
+    void ApplyPersistentSettings(const PersistentSettings& settings);
+    void SavePersistentSettings();
+    QString ResolveSettingsPath() const;
+    void EnsureSettingsDirectory(const QString& path) const;
 
     QApplication* qtApp_{};
     std::unique_ptr<MainWindow> mainWindow_;
@@ -161,6 +193,7 @@ private:
     QCheckBox* zoomCheckbox_{};
     QSlider* zoomSlider_{};
     QPushButton* debugButton_{};
+    QPushButton* rotateButton_{};
     QCheckBox* focusMarkerCheckbox_{};
     QSlider* zoomCenterXSlider_{};
     QSlider* zoomCenterYSlider_{};
@@ -205,6 +238,8 @@ private:
     std::atomic<bool> cameraCaptureRunning_{false};
     bool cameraActive_{};
     int selectedCameraIndex_{-1};
+    UINT processedFrameWidth_{};
+    UINT processedFrameHeight_{};
 
     bool comInitialized_{};
     bool mfInitialized_{};
@@ -234,6 +269,7 @@ private:
     bool spatialSharpenEnabled_{};
     SpatialUpscaler spatialUpscaler_{SpatialUpscaler::kNis};
     float spatialSharpness_{0.25f};
+    int rotationQuarterTurns_{0};
     bool middlePanActive_{};
     QPointF middlePanLastPos_{};
     QSize middlePanWidgetSize_{};
@@ -248,6 +284,7 @@ private:
     std::vector<uint8_t> blurScratch_;
     std::vector<float> temporalHistoryCpu_;
     bool temporalHistoryValid_{};
+    std::vector<uint8_t> rotatedStageBuffer_;
 
     JoystickOverlay* joystickOverlay_{};
 
@@ -263,6 +300,7 @@ private:
     bool cudaFenceInteropEnabled_{};
     CudaBufferFormat cudaBufferFormat_{CudaBufferFormat::kRgba8};
     QString lastCameraError_;
+    QString settingsPath_;
 };
 
 } // namespace openzoom

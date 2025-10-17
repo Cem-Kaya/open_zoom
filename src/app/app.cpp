@@ -1,8 +1,9 @@
 #ifdef _WIN32
 
-#include "openzoom/app.hpp"
-#include "openzoom/cuda_interop.hpp"
+#include "openzoom/app/app.hpp"
+#include "openzoom/cuda/cuda_interop.hpp"
 #include <QApplication>
+#include <QCoreApplication>
 #include <QCheckBox>
 #include <QComboBox>
 #include <QHBoxLayout>
@@ -30,6 +31,14 @@
 #include <QShowEvent>
 #include <QDebug>
 #include <QMessageBox>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
+#include <QFile>
+#include <QSaveFile>
+#include <QFileInfo>
+#include <QDir>
+#include <QStandardPaths>
 
 #include <windows.h>
 #include <combaseapi.h>
@@ -49,6 +58,7 @@
 #include <cmath>
 #include <cstring>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -68,24 +78,31 @@ constexpr float kPanJoystickStep = 0.008f;
 constexpr int kBlurSigmaSliderMin = 1;
 constexpr int kBlurSigmaSliderMax = 50;
 constexpr float kBlurSigmaStep = 0.1f;
-constexpr int kBlurRadiusMin = 1;
-constexpr int kBlurRadiusMax = 15;
+constexpr std::array<int, 19> kSupportedBlurRadii{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 35, 40, 45, 50};
 
 float SliderValueToSigma(int sliderValue) {
     int clamped = std::clamp(sliderValue, kBlurSigmaSliderMin, kBlurSigmaSliderMax);
     return static_cast<float>(clamped) * kBlurSigmaStep;
 }
 
-int NormalizeRadiusValue(int sliderValue) {
-    int radius = std::clamp(sliderValue, kBlurRadiusMin, kBlurRadiusMax);
-    if ((radius & 1) == 0) {
-        if (radius >= kBlurRadiusMax) {
-            radius -= 1;
-        } else {
-            radius += 1;
+int SnapBlurRadius(int value) {
+    if (kSupportedBlurRadii.empty()) {
+        return 0;
+    }
+
+    const int clamped = std::clamp(value, kSupportedBlurRadii.front(), kSupportedBlurRadii.back());
+    int bestRadius = kSupportedBlurRadii.front();
+    int bestDelta = std::numeric_limits<int>::max();
+    for (const int candidate : kSupportedBlurRadii) {
+        const int delta = std::abs(candidate - clamped);
+        if (delta < bestDelta) {
+            bestDelta = delta;
+            bestRadius = candidate;
+        } else if (delta == bestDelta && candidate > bestRadius) {
+            bestRadius = candidate;
         }
     }
-    return radius;
+    return bestRadius;
 }
 
 CudaBufferFormat ParseCudaBufferFormatToken(const QString& token, bool* ok)
@@ -1162,13 +1179,15 @@ public:
         blurSigmaValueLabel_->setMinimumWidth(40);
 
         blurRadiusSlider_ = new QSlider(Qt::Horizontal);
-        blurRadiusSlider_->setRange(1, 15);
-        blurRadiusSlider_->setPageStep(2);
-        blurRadiusSlider_->setSingleStep(2);
+        blurRadiusSlider_->setRange(kSupportedBlurRadii.front(), kSupportedBlurRadii.back());
+        blurRadiusSlider_->setPageStep(1);
+        blurRadiusSlider_->setSingleStep(1);
+        blurRadiusSlider_->setTickInterval(1);
+        blurRadiusSlider_->setTickPosition(QSlider::TicksBelow);
         blurRadiusSlider_->setValue(3);
         blurRadiusSlider_->setEnabled(false);
         blurRadiusValueLabel_ = new QLabel("3");
-        blurRadiusValueLabel_->setMinimumWidth(30);
+        blurRadiusValueLabel_->setMinimumWidth(40);
 
         blurLayout->addWidget(blurCheckbox_);
         blurLayout->addWidget(new QLabel("Sigma:"));
@@ -1249,6 +1268,9 @@ public:
         debugButton_->setCheckable(true);
         debugButton_->setChecked(false);
         debugLayout->addWidget(debugButton_);
+        rotateButton_ = new QPushButton("Rotate 90°");
+        rotateButton_->setToolTip("Rotate output clockwise in 90° steps");
+        debugLayout->addWidget(rotateButton_);
         focusMarkerCheckbox_ = new QCheckBox("Show Focus Point");
         focusMarkerCheckbox_->setChecked(false);
         focusMarkerCheckbox_->setToolTip("Overlay a red marker at the current zoom focus");
@@ -1280,6 +1302,7 @@ public:
     QCheckBox* zoomCheckbox() const { return zoomCheckbox_; }
     QSlider* zoomSlider() const { return zoomSlider_; }
     QPushButton* debugButton() const { return debugButton_; }
+    QPushButton* rotateButton() const { return rotateButton_; }
     QCheckBox* focusMarkerCheckbox() const { return focusMarkerCheckbox_; }
     QSlider* zoomCenterXSlider() const { return zoomCenterXSlider_; }
     QSlider* zoomCenterYSlider() const { return zoomCenterYSlider_; }
@@ -1379,6 +1402,7 @@ private:
     QCheckBox* zoomCheckbox_{};
     QSlider* zoomSlider_{};
     QPushButton* debugButton_{};
+    QPushButton* rotateButton_{};
     QCheckBox* focusMarkerCheckbox_{};
     QSlider* zoomCenterXSlider_{};
     QSlider* zoomCenterYSlider_{};
@@ -1405,6 +1429,8 @@ private:
 OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     : QObject(nullptr) {
     qtApp_ = new QApplication(argc, argv);
+    QCoreApplication::setOrganizationName(QStringLiteral("OpenZoom"));
+    QCoreApplication::setApplicationName(QStringLiteral("OpenZoom"));
     ResolveCudaBufferFormatFromOptions();
     InitializePlatform();
 
@@ -1415,12 +1441,15 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     mainWindow_->setApp(this);
     renderWidget_ = mainWindow_->renderWidget();
     renderWidget_->setPresenter(presenter_.get());
+    settingsPath_ = ResolveSettingsPath();
+    connect(qtApp_, &QCoreApplication::aboutToQuit, this, [this]() { SavePersistentSettings(); });
     cameraCombo_ = mainWindow_->cameraCombo();
     bwCheckbox_ = mainWindow_->blackWhiteCheckbox();
     bwSlider_ = mainWindow_->blackWhiteSlider();
     zoomCheckbox_ = mainWindow_->zoomCheckbox();
     zoomSlider_ = mainWindow_->zoomSlider();
     debugButton_ = mainWindow_->debugButton();
+    rotateButton_ = mainWindow_->rotateButton();
     focusMarkerCheckbox_ = mainWindow_->focusMarkerCheckbox();
     zoomCenterXSlider_ = mainWindow_->zoomCenterXSlider();
     zoomCenterYSlider_ = mainWindow_->zoomCenterYSlider();
@@ -1462,11 +1491,16 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
         blurSigma_ = SliderValueToSigma(blurSigmaSlider_->value());
     }
     if (blurRadiusSlider_) {
-        int normalized = NormalizeRadiusValue(blurRadiusSlider_->value());
-        blurRadius_ = normalized;
-        if (blurRadiusSlider_->value() != normalized) {
-            blurRadiusSlider_->setValue(normalized);
+        const int sliderValue = blurRadiusSlider_->value();
+        const int snapped = SnapBlurRadius(sliderValue);
+        blurRadius_ = snapped;
+        if (sliderValue != snapped) {
+            QSignalBlocker block(blurRadiusSlider_);
+            blurRadiusSlider_->setValue(snapped);
         }
+    }
+    if (blurRadiusValueLabel_) {
+        blurRadiusValueLabel_->setText(QString::number(blurRadius_));
     }
     blurEnabled_ = blurCheckbox_ ? blurCheckbox_->isChecked() : false;
     temporalSmoothEnabled_ = temporalSmoothCheckbox_ ? temporalSmoothCheckbox_->isChecked() : false;
@@ -1482,15 +1516,13 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     if (spatialSharpnessSlider_) {
         spatialSharpness_ = std::clamp(static_cast<float>(spatialSharpnessSlider_->value()) / 100.0f, 0.0f, 1.0f);
     }
-    UpdateBlurUiLabels();
-    UpdateTemporalSmoothUi();
-    UpdateSpatialSharpenUi();
-    UpdateProcessingStatusLabel();
     if (focusMarkerCheckbox_) {
         focusMarkerEnabled_ = focusMarkerCheckbox_->isChecked();
     }
 
     PopulateCameraCombo();
+
+    auto loadedSettings = LoadPersistentSettingsFromDisk();
 
     connect(cameraCombo_, &QComboBox::currentIndexChanged,
             this, &OpenZoomApp::OnCameraSelectionChanged);
@@ -1505,6 +1537,10 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     if (debugButton_) {
         connect(debugButton_, &QPushButton::toggled,
                 this, &OpenZoomApp::OnDebugViewToggled);
+    }
+    if (rotateButton_) {
+        connect(rotateButton_, &QPushButton::clicked,
+                this, &OpenZoomApp::OnRotateButtonClicked);
     }
     if (zoomCenterXSlider_) {
         connect(zoomCenterXSlider_, &QSlider::valueChanged,
@@ -1563,19 +1599,42 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
                 this, &OpenZoomApp::OnFocusMarkerToggled);
     }
 
+    if (loadedSettings) {
+        ApplyPersistentSettings(*loadedSettings);
+    }
+
+    UpdateBlurUiLabels();
+    UpdateTemporalSmoothUi();
+    UpdateSpatialSharpenUi();
+    UpdateProcessingStatusLabel();
+    UpdateRotateButtonLabel();
+
     frameTimer_ = new QTimer(this);
     connect(frameTimer_, &QTimer::timeout, this, &OpenZoomApp::OnFrameTick);
     frameTimer_->start(16);
 
     mainWindow_->show();
 
+    int initialCameraIndex = 0;
+    if (loadedSettings) {
+        const int candidate = loadedSettings->cameraIndex;
+        if (candidate >= 0 && static_cast<size_t>(candidate) < cameras_.size()) {
+            initialCameraIndex = candidate;
+        }
+    }
+
     if (!cameras_.empty()) {
-        cameraCombo_->setCurrentIndex(0);
-        StartCameraCapture(0);
+        initialCameraIndex = std::clamp(initialCameraIndex, 0, static_cast<int>(cameras_.size()) - 1);
+        {
+            QSignalBlocker blocker(cameraCombo_);
+            cameraCombo_->setCurrentIndex(initialCameraIndex);
+        }
+        StartCameraCapture(static_cast<size_t>(initialCameraIndex));
     }
 }
 
 OpenZoomApp::~OpenZoomApp() {
+    SavePersistentSettings();
     if (frameTimer_) {
         frameTimer_->stop();
     }
@@ -1767,6 +1826,27 @@ void OpenZoomApp::OnZoomCenterYChanged(int value) {
     SetZoomCenter(zoomCenterX_, norm, false);
 }
 
+void OpenZoomApp::OnRotateButtonClicked() {
+    rotationQuarterTurns_ = (rotationQuarterTurns_ + 1) % 4;
+
+    float rotatedX = zoomCenterX_;
+    float rotatedY = zoomCenterY_;
+    RotateNormalizedPoint(zoomCenterX_, zoomCenterY_, 1, rotatedX, rotatedY);
+    SetZoomCenter(rotatedX, rotatedY, true);
+
+    temporalHistoryCpu_.clear();
+    temporalHistoryValid_ = false;
+    if (cudaSurface_) {
+        cudaSurface_->ResetTemporalHistory();
+    }
+    ResetCudaFenceState();
+
+    processedFrameWidth_ = 0;
+    processedFrameHeight_ = 0;
+
+    UpdateRotateButtonLabel();
+}
+
 void OpenZoomApp::OnControlsCollapsedToggled(bool checked) {
     controlsCollapsed_ = !checked;
     if (controlsContainer_) {
@@ -1806,12 +1886,12 @@ void OpenZoomApp::OnBlurSigmaChanged(int value) {
 }
 
 void OpenZoomApp::OnBlurRadiusChanged(int value) {
-    int normalized = NormalizeRadiusValue(value);
-    if (blurRadiusSlider_ && normalized != value) {
+    const int snapped = SnapBlurRadius(value);
+    if (blurRadiusSlider_ && snapped != value) {
         QSignalBlocker blocker(blurRadiusSlider_);
-        blurRadiusSlider_->setValue(normalized);
+        blurRadiusSlider_->setValue(snapped);
     }
-    blurRadius_ = normalized;
+    blurRadius_ = snapped;
     UpdateBlurUiLabels();
     UpdateProcessingStatusLabel();
 }
@@ -2051,6 +2131,8 @@ void OpenZoomApp::UpdateBlurUiLabels() {
         blurSigmaSlider_->setEnabled(blurActive);
     }
     if (blurRadiusSlider_) {
+        QSignalBlocker block(blurRadiusSlider_);
+        blurRadiusSlider_->setValue(blurRadius_);
         blurRadiusSlider_->setEnabled(blurActive);
     }
     if (blurCheckbox_) {
@@ -2124,6 +2206,404 @@ void OpenZoomApp::ApplyTemporalSmoothCpu(std::vector<uint8_t>& frame, UINT width
         temporalHistoryCpu_[i] = blended;
         frame[i] = static_cast<uint8_t>(std::clamp<int>(static_cast<int>(std::lround(blended)), 0, 255));
     }
+}
+
+void OpenZoomApp::ApplyRotationToStageRaw(UINT& width, UINT& height) {
+    const int turnsRaw = rotationQuarterTurns_ % 4;
+    const int turns = turnsRaw < 0 ? turnsRaw + 4 : turnsRaw;
+    if (turns == 0 || stageRaw_.empty() || width == 0 || height == 0) {
+        rotatedStageBuffer_.clear();
+        return;
+    }
+
+    const UINT srcWidth = width;
+    const UINT srcHeight = height;
+    const UINT dstWidth = (turns % 2 == 0) ? srcWidth : srcHeight;
+    const UINT dstHeight = (turns % 2 == 0) ? srcHeight : srcWidth;
+    rotatedStageBuffer_.assign(static_cast<size_t>(dstWidth) * dstHeight * 4u, 0u);
+
+    const uint8_t* src = stageRaw_.data();
+    uint8_t* dst = rotatedStageBuffer_.data();
+    const size_t srcStride = static_cast<size_t>(srcWidth) * 4u;
+    const size_t dstStride = static_cast<size_t>(dstWidth) * 4u;
+
+    if (turns == 1) {
+        for (UINT y = 0; y < dstHeight; ++y) {
+            uint8_t* dstRow = dst + static_cast<size_t>(y) * dstStride;
+            for (UINT x = 0; x < dstWidth; ++x) {
+                const UINT srcX = y;
+                const UINT srcY = srcHeight - 1u - x;
+                const uint8_t* srcPixel = src + static_cast<size_t>(srcY) * srcStride + static_cast<size_t>(srcX) * 4u;
+                std::memcpy(dstRow + static_cast<size_t>(x) * 4u, srcPixel, 4u);
+            }
+        }
+    } else if (turns == 2) {
+        for (UINT y = 0; y < dstHeight; ++y) {
+            uint8_t* dstRow = dst + static_cast<size_t>(y) * dstStride;
+            const UINT srcY = srcHeight - 1u - y;
+            for (UINT x = 0; x < dstWidth; ++x) {
+                const UINT srcX = srcWidth - 1u - x;
+                const uint8_t* srcPixel = src + static_cast<size_t>(srcY) * srcStride + static_cast<size_t>(srcX) * 4u;
+                std::memcpy(dstRow + static_cast<size_t>(x) * 4u, srcPixel, 4u);
+            }
+        }
+    } else { // turns == 3
+        for (UINT y = 0; y < dstHeight; ++y) {
+            uint8_t* dstRow = dst + static_cast<size_t>(y) * dstStride;
+            for (UINT x = 0; x < dstWidth; ++x) {
+                const UINT srcX = srcWidth - 1u - y;
+                const UINT srcY = x;
+                const uint8_t* srcPixel = src + static_cast<size_t>(srcY) * srcStride + static_cast<size_t>(srcX) * 4u;
+                std::memcpy(dstRow + static_cast<size_t>(x) * 4u, srcPixel, 4u);
+            }
+        }
+    }
+
+    stageRaw_ = std::move(rotatedStageBuffer_);
+    rotatedStageBuffer_.clear();
+    width = dstWidth;
+    height = dstHeight;
+}
+
+void OpenZoomApp::RotateNormalizedPoint(float inX, float inY, int quarterTurns, float& outX, float& outY) {
+    const int turnsRaw = quarterTurns % 4;
+    const int turns = turnsRaw < 0 ? turnsRaw + 4 : turnsRaw;
+    switch (turns) {
+    case 0:
+        outX = inX;
+        outY = inY;
+        break;
+    case 1:
+        outX = 1.0f - inY;
+        outY = std::clamp(inX, 0.0f, 1.0f);
+        break;
+    case 2:
+        outX = 1.0f - inX;
+        outY = 1.0f - inY;
+        break;
+    case 3:
+        outX = std::clamp(inY, 0.0f, 1.0f);
+        outY = 1.0f - inX;
+        break;
+    default:
+        outX = inX;
+        outY = inY;
+        break;
+    }
+    outX = std::clamp(outX, 0.0f, 1.0f);
+    outY = std::clamp(outY, 0.0f, 1.0f);
+}
+
+QString OpenZoomApp::ResolveSettingsPath() const {
+    QString basePath = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation);
+    if (basePath.isEmpty()) {
+        basePath = QCoreApplication::applicationDirPath();
+    }
+    QDir dir(basePath);
+    return dir.filePath(QStringLiteral("settings.json"));
+}
+
+void OpenZoomApp::EnsureSettingsDirectory(const QString& path) const {
+    QFileInfo info(path);
+    QDir dir = info.dir();
+    if (!dir.exists()) {
+        dir.mkpath(QStringLiteral("."));
+    }
+}
+
+std::optional<OpenZoomApp::PersistentSettings> OpenZoomApp::LoadPersistentSettingsFromDisk() {
+    if (settingsPath_.isEmpty()) {
+        return std::nullopt;
+    }
+
+    QFile file(settingsPath_);
+    if (!file.exists()) {
+        return std::nullopt;
+    }
+
+    if (!file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        qWarning() << "Failed to open settings file for reading:" << settingsPath_ << file.errorString();
+        return std::nullopt;
+    }
+
+    const QByteArray data = file.readAll();
+    file.close();
+
+    QJsonParseError parseError{};
+    const QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
+    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+        qWarning() << "Settings JSON parse error:" << parseError.errorString();
+        return std::nullopt;
+    }
+
+    const QJsonObject root = doc.object();
+
+    PersistentSettings settings;
+    settings.cameraIndex = root.value(QStringLiteral("cameraIndex")).toInt(settings.cameraIndex);
+
+    const QJsonObject blackWhite = root.value(QStringLiteral("blackWhite")).toObject();
+    settings.blackWhiteEnabled = blackWhite.value(QStringLiteral("enabled")).toBool(settings.blackWhiteEnabled);
+    settings.blackWhiteThreshold = static_cast<float>(blackWhite.value(QStringLiteral("threshold")).toDouble(settings.blackWhiteThreshold));
+    settings.blackWhiteThreshold = std::clamp(settings.blackWhiteThreshold, 0.0f, 1.0f);
+
+    const QJsonObject zoom = root.value(QStringLiteral("zoom")).toObject();
+    settings.zoomEnabled = zoom.value(QStringLiteral("enabled")).toBool(settings.zoomEnabled);
+    settings.zoomAmount = static_cast<float>(zoom.value(QStringLiteral("amount")).toDouble(settings.zoomAmount));
+    if (!(settings.zoomAmount > 0.0f) || !std::isfinite(settings.zoomAmount)) {
+        settings.zoomAmount = 1.0f;
+    }
+    settings.zoomCenterX = static_cast<float>(zoom.value(QStringLiteral("centerX")).toDouble(settings.zoomCenterX));
+    settings.zoomCenterY = static_cast<float>(zoom.value(QStringLiteral("centerY")).toDouble(settings.zoomCenterY));
+    settings.zoomCenterX = std::clamp(settings.zoomCenterX, 0.0f, 1.0f);
+    settings.zoomCenterY = std::clamp(settings.zoomCenterY, 0.0f, 1.0f);
+
+    const QJsonObject blur = root.value(QStringLiteral("blur")).toObject();
+    settings.blurEnabled = blur.value(QStringLiteral("enabled")).toBool(settings.blurEnabled);
+    settings.blurSigma = static_cast<float>(blur.value(QStringLiteral("sigma")).toDouble(settings.blurSigma));
+    if (!(settings.blurSigma > 0.0f) || !std::isfinite(settings.blurSigma)) {
+        settings.blurSigma = 1.0f;
+    }
+    const int blurRadiusCandidate = blur.value(QStringLiteral("radius")).toInt(settings.blurRadius);
+    settings.blurRadius = SnapBlurRadius(blurRadiusCandidate);
+
+    const QJsonObject temporal = root.value(QStringLiteral("temporalSmooth")).toObject();
+    settings.temporalSmoothEnabled = temporal.value(QStringLiteral("enabled")).toBool(settings.temporalSmoothEnabled);
+    settings.temporalSmoothAlpha = static_cast<float>(temporal.value(QStringLiteral("alpha")).toDouble(settings.temporalSmoothAlpha));
+    settings.temporalSmoothAlpha = std::clamp(settings.temporalSmoothAlpha, 0.0f, 1.0f);
+
+    const QJsonObject spatial = root.value(QStringLiteral("spatialSharpen")).toObject();
+    settings.spatialSharpenEnabled = spatial.value(QStringLiteral("enabled")).toBool(settings.spatialSharpenEnabled);
+    const QString backend = spatial.value(QStringLiteral("backend")).toString();
+    if (backend.compare(QStringLiteral("fsr"), Qt::CaseInsensitive) == 0) {
+        settings.spatialUpscaler = SpatialUpscaler::kFsrEasuRcas;
+    } else if (backend.compare(QStringLiteral("nis"), Qt::CaseInsensitive) == 0) {
+        settings.spatialUpscaler = SpatialUpscaler::kNis;
+    }
+    settings.spatialSharpness = static_cast<float>(spatial.value(QStringLiteral("sharpness")).toDouble(settings.spatialSharpness));
+    settings.spatialSharpness = std::clamp(settings.spatialSharpness, 0.0f, 1.0f);
+
+    settings.debugView = root.value(QStringLiteral("debugView")).toBool(settings.debugView);
+    settings.focusMarker = root.value(QStringLiteral("focusMarker")).toBool(settings.focusMarker);
+    settings.virtualJoystick = root.value(QStringLiteral("virtualJoystick")).toBool(settings.virtualJoystick);
+    settings.controlsCollapsed = root.value(QStringLiteral("controlsCollapsed")).toBool(settings.controlsCollapsed);
+    settings.rotationQuarterTurns = root.value(QStringLiteral("rotationQuarterTurns")).toInt(settings.rotationQuarterTurns);
+    settings.rotationQuarterTurns %= 4;
+    if (settings.rotationQuarterTurns < 0) {
+        settings.rotationQuarterTurns += 4;
+    }
+
+    return settings;
+}
+
+void OpenZoomApp::ApplyPersistentSettings(const PersistentSettings& settings) {
+    blackWhiteEnabled_ = settings.blackWhiteEnabled;
+    blackWhiteThreshold_ = std::clamp(settings.blackWhiteThreshold, 0.0f, 1.0f);
+
+    zoomEnabled_ = settings.zoomEnabled;
+    zoomAmount_ = std::clamp(settings.zoomAmount, 1.0f, static_cast<float>(kZoomSliderMaxMultiplier));
+    zoomCenterX_ = std::clamp(settings.zoomCenterX, 0.0f, 1.0f);
+    zoomCenterY_ = std::clamp(settings.zoomCenterY, 0.0f, 1.0f);
+
+    blurEnabled_ = settings.blurEnabled;
+    blurSigma_ = std::clamp(settings.blurSigma, kBlurSigmaStep, static_cast<float>(kBlurSigmaSliderMax) * kBlurSigmaStep);
+    blurRadius_ = SnapBlurRadius(settings.blurRadius);
+
+    temporalSmoothEnabled_ = settings.temporalSmoothEnabled;
+    temporalSmoothAlpha_ = std::clamp(settings.temporalSmoothAlpha, 0.0f, 1.0f);
+
+    spatialSharpenEnabled_ = settings.spatialSharpenEnabled;
+    spatialUpscaler_ = settings.spatialUpscaler;
+    if (spatialUpscaler_ != SpatialUpscaler::kFsrEasuRcas && spatialUpscaler_ != SpatialUpscaler::kNis) {
+        spatialUpscaler_ = SpatialUpscaler::kNis;
+    }
+    spatialSharpness_ = std::clamp(settings.spatialSharpness, 0.0f, 1.0f);
+
+    debugViewEnabled_ = settings.debugView;
+    focusMarkerEnabled_ = settings.focusMarker;
+    virtualJoystickEnabled_ = settings.virtualJoystick;
+    controlsCollapsed_ = settings.controlsCollapsed;
+
+    rotationQuarterTurns_ = settings.rotationQuarterTurns % 4;
+    if (rotationQuarterTurns_ < 0) {
+        rotationQuarterTurns_ += 4;
+    }
+
+    if (bwCheckbox_) {
+        QSignalBlocker block(bwCheckbox_);
+        bwCheckbox_->setChecked(blackWhiteEnabled_);
+    }
+    if (bwSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(blackWhiteThreshold_ * 255.0f)),
+                                           bwSlider_->minimum(), bwSlider_->maximum());
+        QSignalBlocker block(bwSlider_);
+        bwSlider_->setValue(sliderValue);
+    }
+    OnBlackWhiteToggled(blackWhiteEnabled_);
+    OnBlackWhiteThresholdChanged(bwSlider_ ? bwSlider_->value() : static_cast<int>(std::round(blackWhiteThreshold_ * 255.0f)));
+
+    if (zoomCheckbox_) {
+        QSignalBlocker block(zoomCheckbox_);
+        zoomCheckbox_->setChecked(zoomEnabled_);
+    }
+    if (zoomSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(zoomAmount_ * kZoomSliderScale)),
+                                           zoomSlider_->minimum(), zoomSlider_->maximum());
+        QSignalBlocker block(zoomSlider_);
+        zoomSlider_->setValue(sliderValue);
+    }
+    OnZoomToggled(zoomEnabled_);
+    OnZoomAmountChanged(zoomSlider_ ? zoomSlider_->value() : static_cast<int>(std::round(zoomAmount_ * kZoomSliderScale)));
+    SetZoomCenter(zoomCenterX_, zoomCenterY_, true);
+
+    if (blurCheckbox_) {
+        QSignalBlocker block(blurCheckbox_);
+        blurCheckbox_->setChecked(blurEnabled_);
+    }
+    if (blurSigmaSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(blurSigma_ / kBlurSigmaStep)),
+                                           blurSigmaSlider_->minimum(), blurSigmaSlider_->maximum());
+        QSignalBlocker block(blurSigmaSlider_);
+        blurSigmaSlider_->setValue(sliderValue);
+    }
+    if (blurRadiusSlider_) {
+        QSignalBlocker block(blurRadiusSlider_);
+        blurRadiusSlider_->setValue(blurRadius_);
+    }
+    OnBlurToggled(blurEnabled_);
+    OnBlurSigmaChanged(blurSigmaSlider_ ? blurSigmaSlider_->value() : static_cast<int>(std::round(blurSigma_ / kBlurSigmaStep)));
+    OnBlurRadiusChanged(blurRadius_);
+
+    if (temporalSmoothCheckbox_) {
+        QSignalBlocker block(temporalSmoothCheckbox_);
+        temporalSmoothCheckbox_->setChecked(temporalSmoothEnabled_);
+    }
+    if (temporalSmoothSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(temporalSmoothAlpha_ * 100.0f)),
+                                           temporalSmoothSlider_->minimum(), temporalSmoothSlider_->maximum());
+        QSignalBlocker block(temporalSmoothSlider_);
+        temporalSmoothSlider_->setValue(sliderValue);
+    }
+    OnTemporalSmoothToggled(temporalSmoothEnabled_);
+    OnTemporalSmoothStrengthChanged(temporalSmoothSlider_ ? temporalSmoothSlider_->value() : static_cast<int>(std::round(temporalSmoothAlpha_ * 100.0f)));
+
+    if (spatialSharpenCheckbox_) {
+        QSignalBlocker block(spatialSharpenCheckbox_);
+        spatialSharpenCheckbox_->setChecked(spatialSharpenEnabled_);
+    }
+    if (spatialBackendCombo_) {
+        const int backendIndex = spatialUpscaler_ == SpatialUpscaler::kFsrEasuRcas ? 0 : 1;
+        QSignalBlocker block(spatialBackendCombo_);
+        spatialBackendCombo_->setCurrentIndex(backendIndex);
+    }
+    if (spatialSharpnessSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(spatialSharpness_ * 100.0f)),
+                                           spatialSharpnessSlider_->minimum(), spatialSharpnessSlider_->maximum());
+        QSignalBlocker block(spatialSharpnessSlider_);
+        spatialSharpnessSlider_->setValue(sliderValue);
+    }
+    OnSpatialSharpenToggled(spatialSharpenEnabled_);
+    OnSpatialUpscalerChanged(spatialBackendCombo_ ? spatialBackendCombo_->currentIndex() : static_cast<int>(spatialUpscaler_));
+    OnSpatialSharpnessChanged(spatialSharpnessSlider_ ? spatialSharpnessSlider_->value() : static_cast<int>(std::round(spatialSharpness_ * 100.0f)));
+
+    if (debugButton_) {
+        QSignalBlocker block(debugButton_);
+        debugButton_->setChecked(debugViewEnabled_);
+    }
+    OnDebugViewToggled(debugViewEnabled_);
+
+    if (focusMarkerCheckbox_) {
+        QSignalBlocker block(focusMarkerCheckbox_);
+        focusMarkerCheckbox_->setChecked(focusMarkerEnabled_);
+    }
+    OnFocusMarkerToggled(focusMarkerEnabled_);
+
+    if (joystickCheckbox_) {
+        QSignalBlocker block(joystickCheckbox_);
+        joystickCheckbox_->setChecked(virtualJoystickEnabled_);
+    }
+    OnVirtualJoystickToggled(virtualJoystickEnabled_);
+
+    if (collapseButton_) {
+        QSignalBlocker block(collapseButton_);
+        collapseButton_->setChecked(!controlsCollapsed_);
+    }
+    OnControlsCollapsedToggled(collapseButton_ ? collapseButton_->isChecked() : !controlsCollapsed_);
+
+    UpdateBlurUiLabels();
+    UpdateTemporalSmoothUi();
+    UpdateSpatialSharpenUi();
+    UpdateJoystickVisibility();
+    UpdateProcessingStatusLabel();
+    UpdateRotateButtonLabel();
+}
+
+void OpenZoomApp::SavePersistentSettings() {
+    if (settingsPath_.isEmpty()) {
+        return;
+    }
+
+    EnsureSettingsDirectory(settingsPath_);
+
+    QJsonObject root;
+    root.insert(QStringLiteral("version"), 1);
+    root.insert(QStringLiteral("cameraIndex"), selectedCameraIndex_);
+
+    QJsonObject blackWhite;
+    blackWhite.insert(QStringLiteral("enabled"), blackWhiteEnabled_);
+    blackWhite.insert(QStringLiteral("threshold"), blackWhiteThreshold_);
+    root.insert(QStringLiteral("blackWhite"), blackWhite);
+
+    QJsonObject zoom;
+    zoom.insert(QStringLiteral("enabled"), zoomEnabled_);
+    zoom.insert(QStringLiteral("amount"), zoomAmount_);
+    zoom.insert(QStringLiteral("centerX"), zoomCenterX_);
+    zoom.insert(QStringLiteral("centerY"), zoomCenterY_);
+    root.insert(QStringLiteral("zoom"), zoom);
+
+    QJsonObject blur;
+    blur.insert(QStringLiteral("enabled"), blurEnabled_);
+    blur.insert(QStringLiteral("sigma"), blurSigma_);
+    blur.insert(QStringLiteral("radius"), blurRadius_);
+    root.insert(QStringLiteral("blur"), blur);
+
+    QJsonObject temporal;
+    temporal.insert(QStringLiteral("enabled"), temporalSmoothEnabled_);
+    temporal.insert(QStringLiteral("alpha"), temporalSmoothAlpha_);
+    root.insert(QStringLiteral("temporalSmooth"), temporal);
+
+    QJsonObject spatial;
+    spatial.insert(QStringLiteral("enabled"), spatialSharpenEnabled_);
+    spatial.insert(QStringLiteral("backend"), spatialUpscaler_ == SpatialUpscaler::kFsrEasuRcas ? QStringLiteral("fsr") : QStringLiteral("nis"));
+    spatial.insert(QStringLiteral("sharpness"), spatialSharpness_);
+    root.insert(QStringLiteral("spatialSharpen"), spatial);
+
+    root.insert(QStringLiteral("debugView"), debugViewEnabled_);
+    root.insert(QStringLiteral("focusMarker"), focusMarkerEnabled_);
+    root.insert(QStringLiteral("virtualJoystick"), virtualJoystickEnabled_);
+    root.insert(QStringLiteral("controlsCollapsed"), controlsCollapsed_);
+    root.insert(QStringLiteral("rotationQuarterTurns"), rotationQuarterTurns_ % 4);
+
+    const QJsonDocument doc(root);
+    QSaveFile file(settingsPath_);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+        qWarning() << "Failed to open settings file for writing:" << settingsPath_ << file.errorString();
+        return;
+    }
+
+    file.write(doc.toJson(QJsonDocument::Indented));
+    if (!file.commit()) {
+        qWarning() << "Failed to commit settings file:" << settingsPath_ << file.errorString();
+    }
+}
+
+void OpenZoomApp::UpdateRotateButtonLabel() {
+    if (!rotateButton_) {
+        return;
+    }
+    const int turnsRaw = rotationQuarterTurns_ % 4;
+    const int turns = turnsRaw < 0 ? turnsRaw + 4 : turnsRaw;
+    const int degrees = turns * 90;
+    rotateButton_->setText(QStringLiteral("Rotation: %1°").arg(degrees));
 }
 
 void OpenZoomApp::UpdateSpatialSharpenUi() {
@@ -2253,15 +2733,15 @@ void OpenZoomApp::HandleZoomWheel(int delta, const QPointF& localPos) {
 }
 
 bool OpenZoomApp::MapViewToSource(const QPointF& pos, float& outX, float& outY) const {
-    if (!renderWidget_ || cameraFrameWidth_ == 0 || cameraFrameHeight_ == 0) {
+    if (!renderWidget_ || processedFrameWidth_ == 0 || processedFrameHeight_ == 0) {
         return false;
     }
 
     const int targetWidth = std::max(1, renderWidget_->width());
     const int targetHeight = std::max(1, renderWidget_->height());
 
-    const float srcWidth = static_cast<float>(cameraFrameWidth_);
-    const float srcHeight = static_cast<float>(cameraFrameHeight_);
+    const float srcWidth = static_cast<float>(processedFrameWidth_);
+    const float srcHeight = static_cast<float>(processedFrameHeight_);
 
     bool cropToFill = !debugViewEnabled_;
     float cropWidth = srcWidth;
@@ -2483,7 +2963,7 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
     settings.zoomCenterX = zoomCenterX_;
     settings.zoomCenterY = zoomCenterY_;
     settings.enableBlur = blurEnabled_;
-    settings.blurRadius = std::clamp(blurRadius_, 1, 15);
+    settings.blurRadius = std::max(blurRadius_, 0);
     settings.blurSigma = blurSigma_;
     settings.drawFocusMarker = focusMarkerEnabled_ && !debugViewEnabled_;
     settings.enableSpatialSharpen = spatialSharpenEnabled_;
@@ -2714,6 +3194,9 @@ void OpenZoomApp::StartCameraCapture(size_t index) {
             cameraFrameValid_ = false;
         }
 
+        processedFrameWidth_ = 0;
+        processedFrameHeight_ = 0;
+
         cameraMediaSource_ = std::move(mediaSource);
         cameraReader_ = std::move(reader);
         cameraActive_ = true;
@@ -2761,6 +3244,8 @@ void OpenZoomApp::StopCameraCapture() {
     if (cudaSurface_) {
         cudaSurface_->ResetTemporalHistory();
     }
+    processedFrameWidth_ = 0;
+    processedFrameHeight_ = 0;
 }
 
 void OpenZoomApp::HandleCameraStartFailure(const QString& message) {
@@ -2893,6 +3378,10 @@ void OpenZoomApp::OnFrameTick() {
         return;
     }
 
+    ApplyRotationToStageRaw(width, height);
+    processedFrameWidth_ = width;
+    processedFrameHeight_ = height;
+
     BuildCompositeAndPresent(width, height);
 }
 
@@ -2925,6 +3414,8 @@ bool OpenZoomApp::ConvertFrameToBgra(const std::vector<uint8_t>& frame,
 }
 
 void OpenZoomApp::BuildCompositeAndPresent(UINT width, UINT height) {
+    processedFrameWidth_ = width;
+    processedFrameHeight_ = height;
     usingCudaLastFrame_ = false;
     if (!debugViewEnabled_ && ProcessFrameWithCuda(width, height)) {
         usingCudaLastFrame_ = true;
@@ -3218,7 +3709,5 @@ void OpenZoomApp::PresentFitted(const uint8_t* data,
 }
 
 } // namespace openzoom
-
-#include "app.moc"
 
 #endif // _WIN32

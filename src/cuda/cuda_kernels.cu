@@ -1,6 +1,6 @@
 #ifdef _WIN32
 
-#include "openzoom/cuda_kernels.hpp"
+#include "openzoom/cuda/cuda_kernels.hpp"
 
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
@@ -326,7 +326,7 @@ __global__ void ZoomLinearKernel(uchar4* dst, size_t dstPitch,
     dstRow[x] = sampled;
 }
 
-constexpr int kMaxBlurRadius = 15;
+constexpr int kMaxBlurRadius = 50;
 __constant__ float gGaussianKernel[(kMaxBlurRadius * 2) + 1];
 __constant__ int gGaussianRadius;
 __constant__ int gGaussianKernelSize;

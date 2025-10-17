@@ -48,13 +48,19 @@ Creates `dist\OpenZoom\` with `open_zoom.exe`, the required Qt DLLs, and CUDA ru
 - `Black & White` checkbox toggles grayscale processing.
 - `Zoom` checkbox enables the magnifier.
 - `Temporal Smooth` checkbox blends frames using an exponential running average (slider controls the new-frame weight).
+- `Rotation` button cycles the scene clockwise in 90° steps and updates the full processing pipeline, keeping focus tools aligned with the rotated view.
 - The debug grid displays: top-left raw feed, top-right grayscale, bottom-left zoom, bottom-right combined result, expanding beyond 2×2 when additional stages are enabled.
+- Session preferences persist automatically. OpenZoom saves the most recent camera choice and tuning values to `%APPDATA%\OpenZoom\OpenZoom\settings.json`; delete that file to reset back to the defaults.
 
 ## Repository Layout
-- `src/` – Qt application, Media Foundation capture, Direct3D12 presentation, and CUDA stubs.
-- `include/` – Public headers for the application shell and interop helpers.
-- `docs/` – Supplemental design notes and progress tracking.
-- `scripts/` – Local tooling (currently `build_and_run.bat`).
+- `src/app/` – Qt application shell, entry point, and high-level wiring.
+- `src/cuda/` – CUDA interop surface, kernels, and future GPU helpers.
+- `src/d3d12/`, `src/capture/`, `src/ui/`, `src/common/` – stubs reserved for
+  the ongoing modularisation work (see module README files).
+- `include/openzoom/` – Public headers mirroring the `src/` tree.
+- `docs/` – Supplemental design notes, license notices, agent guides.
+- `scripts/` – Local tooling (build, bundling, automation helpers).
+- `cmake/` – CMake option definitions and shared configuration fragments.
 - `ref/` – External references and scratch assets (ignored by git).
 - `build/` – Default out-of-source build directory (generated).
 

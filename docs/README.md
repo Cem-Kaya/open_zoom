@@ -29,6 +29,8 @@ OpenZoom is a Windows-only experimental camera magnification playground combinin
 - Enable grayscale via **Black & White**.
 - Enable zoom via **Zoom**.
 - Enable **Temporal Smooth** to run an exponential moving average across frames (slider controls how much of the new frame is blended in).
+- Use **Rotation** to rotate the live feed clockwise in 90° increments; the frame is rotated at the start of the pipeline so CUDA, zooming, and focus aids all track the new orientation.
+- OpenZoom remembers the last-used camera, effect toggles, and tuning values in `settings.json` under `%APPDATA%\OpenZoom\OpenZoom`; remove the file if you need to return to factory defaults.
 - Enable **Spatial Sharpen** to choose between AMD FSR 1.0 or NVIDIA NIS (NIS is selected by default).
 - Both effects can run simultaneously; the bottom-right quadrant shows the combined output.
 

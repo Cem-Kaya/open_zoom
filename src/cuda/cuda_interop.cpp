@@ -1,7 +1,7 @@
 #ifdef _WIN32
 
-#include "openzoom/cuda_interop.hpp"
-#include "openzoom/cuda_kernels.hpp"
+#include "openzoom/cuda/cuda_interop.hpp"
+#include "openzoom/cuda/cuda_kernels.hpp"
 
 #include <d3d12.h>
 
@@ -69,7 +69,7 @@ cudaChannelFormatDesc MakeChannelDescForFormat(DXGI_FORMAT format) {
     }
 }
 
-constexpr int kMaxCudaBlurRadius = 15;
+constexpr int kMaxCudaBlurRadius = 50;
 
 bool EnsureCudaDriverInitialized()
 {
