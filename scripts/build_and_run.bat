@@ -53,7 +53,10 @@ if errorlevel 1 goto :fail
 cmake --build "%BUILD_DIR%" --config Release
 if errorlevel 1 goto :fail
 
-set EXE_PATH=%BUILD_DIR%\Release\open_zoom.exe
+set EXE_PATH=%BUILD_DIR%\cmake\Release\open_zoom.exe
+if not exist "%EXE_PATH%" set EXE_PATH=%BUILD_DIR%\Release\open_zoom.exe
+if not exist "%EXE_PATH%" set EXE_PATH=%BUILD_DIR%\open_zoom.exe
+
 if /I "%OPENZOOM_SKIP_RUN%"=="1" goto after_run
 
 if exist "%EXE_PATH%" (
@@ -61,15 +64,8 @@ if exist "%EXE_PATH%" (
     call :prepare_qt_runtime "%EXE_PATH%"
     "%EXE_PATH%"
 ) else (
-    set EXE_PATH=%BUILD_DIR%\open_zoom.exe
-    if exist "%EXE_PATH%" (
-        echo Launching %EXE_PATH%
-        call :prepare_qt_runtime "%EXE_PATH%"
-        "%EXE_PATH%"
-    ) else (
-        echo Executable not found. Build may have failed.
-        goto :fail
-    )
+    echo Executable not found. Build may have failed.
+    goto :fail
 )
 
 :after_run

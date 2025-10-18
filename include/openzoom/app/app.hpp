@@ -9,11 +9,12 @@
 #include <QSize>
 #include <QString>
 
+#include "openzoom/app/settings_store.hpp"
+#include "openzoom/capture/media_capture.hpp"
+#include "openzoom/common/frame_pipeline.hpp"
 #include "openzoom/cuda/cuda_interop.hpp"
 
 #include <wrl/client.h>
-#include <mfidl.h>
-#include <mfreadwrite.h>
 
 #include <atomic>
 #include <cstdint>
@@ -22,7 +23,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <optional>
 
 QT_BEGIN_NAMESPACE
 class QApplication;
@@ -45,43 +45,18 @@ struct ID3D12Resource;
 
 namespace openzoom {
 
-class D3D12Presenter;
 class RenderWidget;
-class MainWindow;
 class JoystickOverlay;
+class MainWindow;
+class InteractionController;
+
+class D3D12Presenter;
 class CudaInteropSurface;
-class JoystickOverlay : public QWidget {
-    Q_OBJECT
-public:
-    explicit JoystickOverlay(QWidget* parent = nullptr);
-
-    void ResetKnob();
-
-signals:
-    void JoystickChanged(float normX, float normY);
-
-protected:
-    bool eventFilter(QObject* watched, QEvent* event) override;
-    void showEvent(QShowEvent* event) override;
-    void paintEvent(QPaintEvent* event) override;
-    void mousePressEvent(QMouseEvent* event) override;
-    void mouseMoveEvent(QMouseEvent* event) override;
-    void mouseReleaseEvent(QMouseEvent* event) override;
-    void resizeEvent(QResizeEvent* event) override;
-
-private:
-    QRectF KnobRect() const;
-    void UpdatePlacement();
-    void UpdateFromPosition(const QPointF& pos);
-    void UpdateMask();
-
-    bool dragging_{};
-    QPointF knobPos_{};
-};
 
 class OpenZoomApp : public QObject {
     Q_OBJECT
     friend class MainWindow;
+    friend class InteractionController;
 public:
     OpenZoomApp(int& argc, char** argv);
     ~OpenZoomApp() override;
@@ -98,7 +73,7 @@ private slots:
     void OnDebugViewToggled(bool checked);
     void OnZoomCenterXChanged(int value);
     void OnZoomCenterYChanged(int value);
-    void OnRotateButtonClicked();
+    void OnRotationSelectionChanged(int index);
     void OnControlsCollapsedToggled(bool checked);
     void OnVirtualJoystickToggled(bool checked);
     void OnBlurToggled(bool checked);
@@ -117,13 +92,6 @@ private:
     void PopulateCameraCombo();
     void StartCameraCapture(size_t index);
     void StopCameraCapture();
-    void CameraCaptureLoop();
-    bool ConvertFrameToBgra(const std::vector<uint8_t>& frame,
-                            const GUID& subtype,
-                            UINT width,
-                            UINT height,
-                            UINT stride,
-                            UINT dataSize);
     void BuildCompositeAndPresent(UINT width, UINT height);
     void PresentFitted(const uint8_t* data,
                        UINT srcWidth,
@@ -144,44 +112,17 @@ private:
     void BeginMousePan(const QPointF& pos, const QSize& widgetSize);
     bool UpdateMousePan(const QPointF& pos);
     void EndMousePan();
-    bool IsMousePanActive() const { return middlePanActive_; }
+    bool IsMousePanActive() const;
     bool MapViewToSource(const QPointF& pos, float& outX, float& outY) const;
     bool EnsureCudaSurface(UINT width, UINT height);
     bool ProcessFrameWithCuda(UINT width, UINT height);
     void ResetCudaFenceState();
     void ResolveCudaBufferFormatFromOptions();
     void HandleCameraStartFailure(const QString& message);
-    void ApplyTemporalSmoothCpu(std::vector<uint8_t>& frame, UINT width, UINT height);
-    void UpdateRotateButtonLabel();
-    void ApplyRotationToStageRaw(UINT& width, UINT& height);
+    void UpdateRotationUi();
     static void RotateNormalizedPoint(float inX, float inY, int quarterTurns, float& outX, float& outY);
-    struct PersistentSettings {
-        int cameraIndex{-1};
-        bool blackWhiteEnabled{false};
-        float blackWhiteThreshold{0.5f};
-        bool zoomEnabled{false};
-        float zoomAmount{1.0f};
-        float zoomCenterX{0.5f};
-        float zoomCenterY{0.5f};
-        bool blurEnabled{false};
-        float blurSigma{1.0f};
-        int blurRadius{3};
-        bool temporalSmoothEnabled{false};
-        float temporalSmoothAlpha{0.25f};
-        bool spatialSharpenEnabled{false};
-        SpatialUpscaler spatialUpscaler{SpatialUpscaler::kNis};
-        float spatialSharpness{0.25f};
-        bool debugView{false};
-        bool focusMarker{false};
-        bool virtualJoystick{false};
-        bool controlsCollapsed{false};
-        int rotationQuarterTurns{0};
-    };
-    std::optional<PersistentSettings> LoadPersistentSettingsFromDisk();
-    void ApplyPersistentSettings(const PersistentSettings& settings);
+    void ApplyPersistentSettings(const settings::PersistentSettings& settings);
     void SavePersistentSettings();
-    QString ResolveSettingsPath() const;
-    void EnsureSettingsDirectory(const QString& path) const;
 
     QApplication* qtApp_{};
     std::unique_ptr<MainWindow> mainWindow_;
@@ -193,10 +134,10 @@ private:
     QCheckBox* zoomCheckbox_{};
     QSlider* zoomSlider_{};
     QPushButton* debugButton_{};
-    QPushButton* rotateButton_{};
     QCheckBox* focusMarkerCheckbox_{};
     QSlider* zoomCenterXSlider_{};
     QSlider* zoomCenterYSlider_{};
+    QComboBox* rotationCombo_{};
     QCheckBox* joystickCheckbox_{};
     QToolButton* collapseButton_{};
     QWidget* controlsContainer_{};
@@ -216,26 +157,10 @@ private:
 
     std::unique_ptr<D3D12Presenter> presenter_;
 
-    struct CameraInfo {
-        std::wstring name;
-        std::wstring symbolicLink;
-        Microsoft::WRL::ComPtr<IMFActivate> activation;
-    };
-
-    std::vector<CameraInfo> cameras_;
-
-    Microsoft::WRL::ComPtr<IMFMediaSource> cameraMediaSource_;
-    Microsoft::WRL::ComPtr<IMFSourceReader> cameraReader_;
-    std::thread cameraThread_;
+    std::vector<CameraDescriptor> cameras_;
+    MediaCapture mediaCapture_;
     std::mutex cameraMutex_;
-    std::vector<uint8_t> cameraFrameBuffer_;
-    UINT cameraFrameWidth_{};
-    UINT cameraFrameHeight_{};
-    UINT cameraFrameStride_{};
-    size_t cameraFrameDataSize_{};
-    GUID cameraFrameSubtype_{GUID_NULL};
-    bool cameraFrameValid_{};
-    std::atomic<bool> cameraCaptureRunning_{false};
+    MediaFrame latestFrame_;
     bool cameraActive_{};
     int selectedCameraIndex_{-1};
     UINT processedFrameWidth_{};
@@ -254,12 +179,6 @@ private:
     float zoomCenterY_{0.5f};
     bool controlsCollapsed_{};
     bool virtualJoystickEnabled_{};
-    bool panLeftPressed_{};
-    bool panRightPressed_{};
-    bool panUpPressed_{};
-    bool panDownPressed_{};
-    float joystickPanX_{};
-    float joystickPanY_{};
     bool suspendControlSync_{};
     bool blurEnabled_{};
     float blurSigma_{1.0f};
@@ -270,23 +189,11 @@ private:
     SpatialUpscaler spatialUpscaler_{SpatialUpscaler::kNis};
     float spatialSharpness_{0.25f};
     int rotationQuarterTurns_{0};
-    bool middlePanActive_{};
-    QPointF middlePanLastPos_{};
-    QSize middlePanWidgetSize_{};
-
-    std::vector<uint8_t> stageRaw_;
-    std::vector<uint8_t> stageBw_;
-    std::vector<uint8_t> stageZoom_;
-    std::vector<uint8_t> stageFinal_;
-    std::vector<uint8_t> compositeBuffer_;
     std::vector<uint8_t> presentationBuffer_;
-    std::vector<uint8_t> stageBlur_;
-    std::vector<uint8_t> blurScratch_;
-    std::vector<float> temporalHistoryCpu_;
-    bool temporalHistoryValid_{};
-    std::vector<uint8_t> rotatedStageBuffer_;
+    processing::CpuFramePipeline cpuPipeline_;
 
     JoystickOverlay* joystickOverlay_{};
+    std::unique_ptr<InteractionController> interactionController_;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> cudaSharedTexture_;
     std::unique_ptr<CudaInteropSurface> cudaSurface_;

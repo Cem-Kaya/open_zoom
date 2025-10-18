@@ -36,6 +36,14 @@ endif()
 
 target_sources(open_zoom PRIVATE
     ${PROJECT_SOURCE_DIR}/include/openzoom/app/app.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/constants.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/interaction_controller.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/settings_store.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/capture/media_capture.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/common/image_processing.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/common/frame_pipeline.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/d3d12/presenter.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/ui/main_window.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/cuda/cuda_interop.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/cuda/cuda_kernels.hpp
 )
