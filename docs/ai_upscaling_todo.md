@@ -1,73 +1,42 @@
 # AI Upscaling Implementation Plan
 
-> Drafted 2025-11-??. Refine as work progresses; keep tasks scoped to GPU execution path first, CPU fallback second.
+Refreshed on 2026-03-31 after auditing the current repository state.
 
-## Global Prep
-- [ ] Audit current CUDA pipeline entry points (`OpenZoomApp::ProcessFrameWithCuda`, `CudaInteropSurface`) to verify hook points for new upscalers.
-- [ ] Define a clean pipeline configuration object once DL/TensorRT tiers arrive (current UI uses independent toggles for spatial sharpen and Gaussian blur).
-- [ ] Extend settings UI (dropdown) and persistence so the selected mode survives restarts.
-- [ ] Introduce a shared staging buffer format (RGBA8 or FP16) to pass between kernels consistently.
-- [ ] Decide how to gate experimental backends (warning label, telemetry logging, debug toggles).
+## What Already Exists
+- [x] Audit current GPU entry points: `OpenZoomApp::ProcessFrameWithCuda` and `CudaInteropSurface::ProcessFrame`.
+- [x] Add a persistent UI toggle for spatial sharpening plus backend selection.
+- [x] Introduce a staging format switch (`rgba8` or `fp16`) for future expansion.
+- [x] Keep Gaussian blur available as a non-AI baseline path.
+- [x] Document current build and licensing constraints for FSR and NIS.
 
-## Mode 0 – Gaussian Blur (Baseline)
-- [ ] Keep existing separable Gaussian path as-is; ensure it is selectable via the new dropdown.
-- [ ] Refactor configuration so blur radius/sigma map cleanly when mode 0 is active and are hidden/disabled otherwise.
-- [ ] Write regression test notes: capture before/after frames to validate baseline still works.
+## Near-Term GPU Work
+- [ ] Measure end-to-end GPU latency for the current NIS and FSR-style paths at common camera resolutions.
+- [ ] Add better timing and failure telemetry around CUDA interop setup and per-frame processing.
+- [ ] Decide whether the shipping UI should continue exposing both NIS and FSR-style modes or narrow to a single default backend.
+- [ ] Move more debug-stage visibility onto GPU-backed inspection surfaces so CUDA runs can be debugged without dropping fully to the CPU path.
 
-## Mode 1 – Spatial Upscaler (NVIDIA NIS default)
-- [x] Research minimal licensing/attribution requirements for AMD FSR1 and NVIDIA NIS.
-- [x] Implement initial CUDA kernels (Lanczos + RCAS-style sharpen) for FSR-like and NIS-like paths with shared sharpness slider.
-- [x] Expose a dedicated “Spatial Sharpen” toggle (FSR/NIS + sharpness) independent of other stages.
-- [x] Default to NVIDIA NIS when the spatial upscaler is enabled; leave FSR evaluation as future optional work.
-- [ ] Benchmark latency on 720p→1080p and 1080p→1440p paths; target <2 ms per frame.
-- [ ] Log full configuration per frame when debug logging enabled (scales, sharpness, adapter).
+## Mode 0: Baseline Filters
+- [ ] Keep Gaussian blur as the simple readability baseline.
+- [ ] Clarify how blur, temporal smoothing, and spatial sharpening are composed when multiple stages are enabled.
+- [ ] Add regression captures for representative text-heavy scenes.
 
-## Mode 2 – Lightweight DL SR (OpenCV DNN)
-- [ ] Package/verify OpenCV DNN with CUDA backend; ensure binaries load in deployed app.
-- [ ] Integrate FSRCNN, ESPCN, EDSR, and LapSRN models (choose 2–3 for launch) with runtime selection.
-- [ ] Manage model caching (load once per session, reuse across frames); add progress logs.
-- [ ] Ensure asynchronous CUDA stream interop between Media Foundation upload and DNN inference.
-- [ ] Provide fallback to CPU inference if CUDA backend unavailable (with warning banner).
-- [ ] Implement quality/perf toggles (e.g., half/quarter tiling, precision control).
+## Mode 1: Spatial Sharpen / Classic Upscaling
+- [x] Wire NIS-style and FSR-style kernels into the CUDA path.
+- [ ] Tune sharpness defaults against real magnification tasks instead of synthetic test images.
+- [ ] Capture performance numbers for 720p, 1080p, and 1440p source sizes.
 
-## Mode 3 – Real-ESRGAN (TensorRT/Torch-TensorRT)
-- [ ] Export Real-ESRGAN weights to ONNX; verify compatibility with TensorRT 10.x.
-- [ ] Build TensorRT engine(s) ahead of time or on first launch; cache serialized plans per GPU model.
-- [ ] Integrate slight deblocking pre-pass (e.g., Bilateral) and subtle unsharp mask post-pass.
-- [ ] Tune execution to stay under ~8 ms at 1080p input on RTX 4060/4090.
-- [ ] Add watchdog for engine build failures; surface actionable errors with hint to fall back.
-- [ ] Extend logging UI with per-frame timing (capture, inference, post-process).
+## Mode 2: Lightweight DL Super Resolution
+- [ ] Decide whether OpenCV DNN is still the right first deep-learning integration point.
+- [ ] Define model loading, caching, and fallback behavior before introducing new runtime dependencies.
+- [ ] Document deployment impact early: DLLs, model weights, and bundle size.
 
-## Mode 4 – Text-Aware SR (TensorRT)
-- [ ] Evaluate STT/TBSRN/TextSR/TADiSR models; select 1–2 with manageable latency.
-- [ ] Convert chosen model(s) to TensorRT (FP16) with dynamic shape support.
-- [ ] Add optional text-region detection heuristic to prioritize high-value areas (optional first-iteration skip).
-- [ ] Expose "Experimental" badge in UI when mode 4 selected; warn about GPU load.
-- [ ] Gather subjective readability metrics (test on UI/IDE screenshots) to confirm benefit.
-- [ ] Instrument fallback path to auto-drop to mode 1 if inference exceeds pre-set latency budget.
+## Mode 3: TensorRT-Class Backends
+- [ ] Evaluate whether TensorRT is worth the added setup complexity for the intended user base.
+- [ ] Specify a plan for engine caching, versioning, and GPU compatibility.
+- [ ] Design watchdog and fallback behavior so failed engine initialization drops cleanly to the current CUDA or CPU path.
 
-## Cross-Cutting Concerns
-- [ ] Update telemetry/logging to record chosen backend, average processing time, and failure counts.
-- [ ] Ensure fence synchronization and shared texture ownership remain correct across new kernels.
-- [ ] Document build/runtime dependencies (OpenCV, TensorRT, model downloads) in `docs/README`.
-- [ ] Prepare automated smoke-test script: run minimal harness per backend to validate startup.
-- [ ] Coordinate with deployment pipeline to bundle necessary DLLs/engine files.
-- [ ] Migrate debug 2×2 view to GPU textures (optional copies per stage) so we can inspect CUDA path without CPU fallbacks.
-
-## Stretch Goals
-- [ ] Add ImGui debug overlay showing per-backend perf stats and quality toggles.
-- [ ] Implement dynamic quality scaling (auto swap to faster backend when FPS drops).
-- [ ] Investigate multi-frame SR (temporal) once single-frame path stable.
-
-## Repo Hygiene / Architecture (feedback backlog)
-- [ ] Add top-level LICENSE, description, topics, and releases metadata.
-- [ ] Introduce CI (GitHub Actions Windows build with CUDA/Qt cache) and package artifacts.
-- [ ] Wire `OPENZOOM_ENABLE_TESTS`, add CMake options/presets, and provide infrastructure for CPU golden-image tests.
-- [ ] Refactor source tree into feature modules (`src/app`, `src/capture`, `src/d3d12`, `src/cuda`, `src/ui`, `src/common`) with mirrored headers under `include/openzoom/`.
-- [ ] Replace ad-hoc logging with structured logger (spdlog or custom) capturing negotiated formats and GPU path health.
-- [ ] Provide tooling (editorconfig/clang-format, pre-commit hook, vcpkg/CPM story) for consistent DevX.
-- [ ] Author docs/architecture.md, CONTRIBUTING.md, issue/PR templates; add testing strategy (golden images, synthetic MF source, interop guards).
-- [ ] Address Qt moc hygiene (no `app.moc` in non-Q_OBJECT files; break out QObject subclasses per widget).
-- [ ] Encapsulate Media Foundation `IMF*` pointers behind PImpl and normalize BGRA at boundary with explicit format enum.
-- [ ] Build FeatureFlags struct to gate CUDA path, ensure device-loss handling, validate CUDA external memory size/pitch.
-- [ ] Explore optional OpenCL backend to mirror CUDA pipeline for broader GPU support (future stretch goal; evaluate feasibility).
+## Cross-Cutting Work
+- [ ] Add build and test infrastructure for golden-image validation.
+- [ ] Expand docs when new inference dependencies, model downloads, or licensing obligations are introduced.
+- [ ] Keep the CUDA buffer-format story coherent if true FP16 processing is implemented later.
+- [ ] Ensure accessibility and low-vision use cases, not benchmark scores alone, drive quality decisions.

@@ -33,6 +33,13 @@ struct CameraDescriptor {
     Microsoft::WRL::ComPtr<IMFActivate> activation;
 };
 
+struct VideoFormat {
+    UINT width{0};
+    UINT height{0};
+    UINT numerator{0};
+    UINT denominator{0};
+};
+
 class MediaCapture {
 public:
     MediaCapture();
@@ -42,11 +49,14 @@ public:
     void Shutdown();
 
     std::vector<CameraDescriptor> EnumerateCameras();
+    std::vector<VideoFormat> EnumerateFormats(const CameraDescriptor& descriptor);
 
     bool StartCapture(const CameraDescriptor& descriptor,
                       FrameCallback callback,
                       GUID preferredSubtype = MFVideoFormat_ARGB32);
     void StopCapture();
+
+    const std::string& LastError() const { return lastError_; }
 
 private:
     struct FrameFormat {
@@ -60,12 +70,15 @@ private:
                          GUID preferredSubtype,
                          FrameFormat& outFormat);
     void CaptureLoop(FrameCallback callback);
+    std::vector<VideoFormat> ExtractFormats(IMFSourceReader* reader);
+    static std::string HrToString(HRESULT hr);
 
     Microsoft::WRL::ComPtr<IMFMediaSource> mediaSource_;
     Microsoft::WRL::ComPtr<IMFSourceReader> sourceReader_;
     std::thread captureThread_;
     std::atomic<bool> running_{false};
     FrameFormat currentFormat_{};
+    std::string lastError_;
 };
 
 } // namespace openzoom

@@ -1,11 +1,12 @@
 #ifdef _WIN32
 
 #include "openzoom/cuda/cuda_interop.hpp"
-#include "openzoom/cuda/cuda_kernels.hpp"
 
 #include <d3d12.h>
 
 #if OPENZOOM_HAS_CUDA_EXT_MEMORY
+
+#include "openzoom/cuda/cuda_kernels.hpp"
 
 #include <windows.h>
 

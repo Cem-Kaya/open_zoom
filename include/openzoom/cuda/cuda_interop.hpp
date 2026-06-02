@@ -4,6 +4,7 @@
 
 #include <wrl/client.h>
 #include <d3d12.h>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -159,6 +160,7 @@ public:
                       const FenceSyncParams& /*fenceSync*/) { return false; }
 
     const std::string& LastError() const { static std::string dummy; return dummy; }
+    void ResetTemporalHistory() {}
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;

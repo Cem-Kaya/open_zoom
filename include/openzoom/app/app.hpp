@@ -8,10 +8,13 @@
 #include <QRectF>
 #include <QSize>
 #include <QString>
+#include <QElapsedTimer>
 
 #include "openzoom/app/settings_store.hpp"
 #include "openzoom/capture/media_capture.hpp"
 #include "openzoom/common/frame_pipeline.hpp"
+#include "openzoom/common/media_writer.hpp"
+#include "openzoom/common/assistive_runtime.hpp"
 #include "openzoom/cuda/cuda_interop.hpp"
 
 #include <wrl/client.h>
@@ -33,6 +36,8 @@ class QSlider;
 class QPushButton;
 class QToolButton;
 class QLabel;
+class QListWidget;
+class QListWidgetItem;
 class QEvent;
 class QShowEvent;
 class QPaintEvent;
@@ -46,6 +51,7 @@ struct ID3D12Resource;
 namespace openzoom {
 
 class RenderWidget;
+class AssistiveOverlay;
 class JoystickOverlay;
 class MainWindow;
 class InteractionController;
@@ -65,6 +71,7 @@ public:
 
 private slots:
     void OnFrameTick();
+    void OnPresetSelectionChanged(QListWidgetItem* current, QListWidgetItem* previous);
     void OnCameraSelectionChanged(int index);
     void OnBlackWhiteToggled(bool checked);
     void OnBlackWhiteThresholdChanged(int value);
@@ -85,11 +92,25 @@ private slots:
     void OnSpatialSharpnessChanged(int value);
     void OnTemporalSmoothToggled(bool checked);
     void OnTemporalSmoothStrengthChanged(int value);
+    void OnOcrAssistToggled(bool checked);
+    void OnVlmAssistToggled(bool checked);
+    void OnAssistiveOverlayToggled(bool checked);
+    void OnAssistiveOverlayUpdated(const QString& title, const QString& body, bool visible);
 
 private:
+    settings::AdvancedConfig CaptureCurrentAdvancedConfig() const;
+    void ApplyAdvancedConfig(const settings::AdvancedConfig& config);
+    void PopulatePresetList();
+    void RefreshPresetSelection();
+    void UpdatePresetDescription();
+    void SyncCurrentConfigToPersistence();
+    void PromoteCurrentConfigToPreset();
+    void UpdateAssistiveRuntimeState();
+    void MaybeRequestAssistiveAnalysis(const uint8_t* data, UINT width, UINT height);
     void InitializePlatform();
     void EnumerateCameras();
     void PopulateCameraCombo();
+    void RefreshCameraModesList(size_t index);
     void StartCameraCapture(size_t index);
     void StopCameraCapture();
     void BuildCompositeAndPresent(UINT width, UINT height);
@@ -116,6 +137,9 @@ private:
     bool MapViewToSource(const QPointF& pos, float& outX, float& outY) const;
     bool EnsureCudaSurface(UINT width, UINT height);
     bool ProcessFrameWithCuda(UINT width, UINT height);
+    void CaptureSnapshot(const uint8_t* data, UINT width, UINT height);
+    void MaybeRecordFrame(const uint8_t* data, UINT width, UINT height, ID3D12Resource* texture = nullptr);
+    QString EnsureOutputSubdir(const QString& subdir);
     void ResetCudaFenceState();
     void ResolveCudaBufferFormatFromOptions();
     void HandleCameraStartFailure(const QString& message);
@@ -129,15 +153,21 @@ private:
     QTimer* frameTimer_{};
     RenderWidget* renderWidget_{};
     QComboBox* cameraCombo_{};
+    QListWidget* presetList_{};
+    QLabel* presetDescriptionLabel_{};
+    QPushButton* promotePresetButton_{};
     QCheckBox* bwCheckbox_{};
     QSlider* bwSlider_{};
     QCheckBox* zoomCheckbox_{};
     QSlider* zoomSlider_{};
     QPushButton* debugButton_{};
+    QPushButton* capturePhotoButton_{};
+    QPushButton* recordButton_{};
     QCheckBox* focusMarkerCheckbox_{};
     QSlider* zoomCenterXSlider_{};
     QSlider* zoomCenterYSlider_{};
     QComboBox* rotationCombo_{};
+    QListWidget* cameraModesList_{};
     QCheckBox* joystickCheckbox_{};
     QToolButton* collapseButton_{};
     QWidget* controlsContainer_{};
@@ -149,6 +179,9 @@ private:
     QCheckBox* temporalSmoothCheckbox_{};
     QSlider* temporalSmoothSlider_{};
     QLabel* temporalSmoothValueLabel_{};
+    QCheckBox* ocrAssistCheckbox_{};
+    QCheckBox* vlmAssistCheckbox_{};
+    QCheckBox* assistiveOverlayCheckbox_{};
     QCheckBox* spatialSharpenCheckbox_{};
     QComboBox* spatialBackendCombo_{};
     QSlider* spatialSharpnessSlider_{};
@@ -185,15 +218,27 @@ private:
     int blurRadius_{3};
     bool temporalSmoothEnabled_{};
     float temporalSmoothAlpha_{0.25f};
+    bool ocrAssistEnabled_{};
+    bool vlmAssistEnabled_{};
+    bool assistiveOverlayEnabled_{true};
     bool spatialSharpenEnabled_{};
     SpatialUpscaler spatialUpscaler_{SpatialUpscaler::kNis};
     float spatialSharpness_{0.25f};
     int rotationQuarterTurns_{0};
     std::vector<uint8_t> presentationBuffer_;
+    std::vector<uint8_t> recordingBuffer_;
+    std::vector<uint8_t> assistiveBuffer_;
     processing::CpuFramePipeline cpuPipeline_;
+    VideoRecorder videoRecorder_;
+    bool recording_{false};
+    QElapsedTimer recordingTimer_;
+    uint64_t recordingFrameCount_{0};
 
+    AssistiveOverlay* assistiveOverlay_{};
     JoystickOverlay* joystickOverlay_{};
+    std::unique_ptr<AssistiveRuntime> assistiveRuntime_;
     std::unique_ptr<InteractionController> interactionController_;
+    QElapsedTimer assistiveAnalysisTimer_;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> cudaSharedTexture_;
     std::unique_ptr<CudaInteropSurface> cudaSurface_;
@@ -208,6 +253,11 @@ private:
     CudaBufferFormat cudaBufferFormat_{CudaBufferFormat::kRgba8};
     QString lastCameraError_;
     QString settingsPath_;
+    settings::PersistentSettings persistentSettings_{};
+    bool presetSelectionSyncSuspended_{false};
+    bool configTrackingSuspended_{false};
+    UINT presentationWidth_{0};
+    UINT presentationHeight_{0};
 };
 
 } // namespace openzoom

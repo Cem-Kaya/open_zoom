@@ -1,47 +1,49 @@
 # Third-Party Licenses and Attributions
 
-OpenZoom depends on several external components. This document summarises
-license requirements, attribution, and redistribution notes. Keep it with any
-binary distribution (copied automatically by the release bundle script).
+OpenZoom relies on several third-party SDKs and code drops. Keep this summary with any redistributed build and update it whenever dependencies or bundled notices change.
 
----
+## Qt 6
+- Upstream: <https://www.qt.io/>
+- License family: LGPL-3.0 / GPL-3.0 / commercial, depending on how Qt is obtained
+- OpenZoom usage: dynamically linked Qt Widgets runtime deployed via `windeployqt`
+- Notes:
+  - If you redistribute Qt DLLs, include the required Qt notices and license text that apply to your distribution.
+  - If you modify Qt itself, those changes must be handled under Qt's licensing terms.
+  - Development builds expect the user to provide a local Qt installation.
 
-## Qt 6 (LGPL-3.0)
-- Website: <https://www.qt.io/>
-- License: GNU Lesser General Public License v3.0
-- Requirements:
-  - Use dynamic linking or provide object files to allow relinking.
-  - Provide a copy of the LGPL-3.0 license and state that Qt is used.
-  - Publish any modifications to Qt under the same license.
-- Source: Qt binaries and headers are not bundled in this repository; users
-  supply their own Qt installation.
+## NVIDIA Image Scaling
+- Upstream: <https://github.com/NVIDIAGameWorks/NVIDIAImageScaling>
+- Local notice file: [`third_party/nvidia_nis/LICENSE.txt`](../third_party/nvidia_nis/LICENSE.txt)
+- Usage: optional CUDA spatial sharpening path
+- Attribution: retain NVIDIA's notice when redistributing modified or bundled source material
 
-## NVIDIA Image Scaling (NIS)
-- Repository: <https://github.com/NVIDIAGameWorks/NVIDIAImageScaling>
-- License: NVIDIA Source Code License for NIS (permissive)
-- Attribution: “Contains NVIDIA Image Scaling technology. © NVIDIA Corporation.”
-- Redistribution: Allowed in binary form; include the license text if you ship
-  modified sources.
-
-## AMD FidelityFX Super Resolution 1.0 (FSR1)
-- Repository: <https://github.com/GPUOpen-Effects/FidelityFX-SuperResolution>
-- License: MIT License
-- Attribution: “FidelityFX Super Resolution by Advanced Micro Devices, Inc.”
-- Redistribution: Maintain the MIT license header in source and documentation.
+## AMD FidelityFX Super Resolution 1.0
+- Upstream: <https://github.com/GPUOpen-Effects/FidelityFX-SuperResolution>
+- Local notice file: [`third_party/amd_fsr1/LICENSE.txt`](../third_party/amd_fsr1/LICENSE.txt)
+- License: MIT
+- Usage: optional FSR-style CUDA spatial sharpening path
+- Attribution: preserve the MIT license text and AMD attribution in redistributed source packages
 
 ## NVIDIA CUDA Toolkit
-- Website: <https://developer.nvidia.com/cuda-toolkit>
-- License: CUDA Toolkit EULA (redistributables)
-- Redistribution: Only the runtime DLLs permitted by the EULA are packaged.
-  Include NVIDIA’s copyright notice and do not distribute development headers
-  or tools outside the terms of the EULA.
+- Upstream: <https://developer.nvidia.com/cuda-toolkit>
+- License: NVIDIA CUDA Toolkit EULA
+- OpenZoom redistribution scope:
+  - runtime DLLs only
+  - no CUDA headers, compilers, or developer tools are bundled
+- Review NVIDIA's current redistribution terms before shipping binaries that include CUDA runtime files
 
-## Other Dependencies
-- Windows Media Foundation, Direct3D, and other Windows SDK libraries are
-  provided by Microsoft and covered under the Windows SDK license. They are not
-  redistributed with OpenZoom.
+## Microsoft Platform Components
+- APIs used: Media Foundation, Direct3D 12, DXGI, Windows Imaging Component, and other Windows SDK libraries
+- License source: Windows SDK / Visual Studio / OS redistribution terms
+- Notes: these platform APIs are not copied into the repository as standalone third-party source code
 
----
+## Not Currently Bundled
+- OpenCV DNN
+- TensorRT
+- external AI model weights
 
-For the full license texts, see `LICENSE_GPL.txt`, `LICENSE_COMMERCIAL.txt`,
-and the upstream license files linked above.
+Those remain roadmap items. If they are added later, this file must be expanded in the same change.
+
+## Optional External Tools And Services
+- Tesseract OCR may be used at runtime if installed locally, but it is not bundled by this repository or the current Windows packaging scripts.
+- OpenAI-compatible VLM services may be used at runtime through user-supplied endpoint credentials, but no hosted model or service SDK is bundled here.

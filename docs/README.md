@@ -1,47 +1,72 @@
-# OpenZoom
+# OpenZoom Documentation Guide
 
-> Notes for future assistant: keep this file updated whenever the architecture evolves.
+OpenZoom is a Windows-only live magnification application that combines:
+- Qt 6 for the desktop shell and input handling
+- Media Foundation for camera discovery and frame capture
+- Direct3D 12 for presentation and GPU texture management
+- CUDA for optional GPU processing through D3D12 external-memory interop
 
-OpenZoom is a Windows-only experimental camera magnification playground combining:
-- **Qt 6** for the UI shell and event loop.
-- **Direct3D 12** for presentation and swap-chain management.
-- **Media Foundation** for camera capture.
-- **CUDA** (optional) for GPU-based image processing via the external-memory interop path.
+## Architecture At A Glance
+The current frame flow is:
 
-## Building
-1. Install CUDA Toolkit 13.x, Qt 6.9.3 (MSVC 2019/2022 64-bit), and MSVC 2022.
-2. From a VS Developer Command Prompt or PowerShell with the toolchain on PATH:
-   ```
-   scripts\build_and_run.bat
-   ```
-3. If you see "Qt6*.dll was not found", add `C:\Qt\6.9.3\msvc2022_64\bin` to `PATH` or copy the DLLs next to the executable.
+1. `MediaCapture` enumerates cameras and streams frames from the selected device.
+2. `CpuFramePipeline` converts camera frames into BGRA, applies rotation, and either builds the CPU output directly or prepares input for CUDA.
+3. `CudaInteropSurface` runs GPU effects when the interop surface is valid.
+4. `D3D12Presenter` presents the final frame and can read back GPU textures for recording.
+5. `VideoRecorder` writes processed output to H.264 MP4 through Media Foundation.
 
-## External Dependencies
-- **Visual Studio 2022** with Desktop C++ workload and Windows 10/11 SDK (minimum 10.0.19041).
-- **Qt 6.9.3 MSVC 64-bit** binaries with matching debug/release builds; ensure `Qt6_DIR` resolves to the `lib/cmake/Qt6` folder.
-- **CUDA Toolkit 13.x** (tested with 13.4); add `bin`, `lib/x64`, and `include` to PATH/LIB/INCLUDE or configure `CUDA_PATH`.
-- **NVIDIA drivers** supporting CUDA external-memory interop (R555+ recommended).
-- **CMake ≥ 3.23** and **Ninja** (optional but faster for incremental builds).
-- (Planned) **OpenCV DNN + CUDA** and **TensorRT 10.x** for advanced upscalers—documented install scripts will land alongside their integration.
+The app is intentionally resilient: debug view is CPU-only, and the normal view falls back to the CPU path whenever the CUDA path cannot run.
 
-## Runtime Controls
-- Toggle cameras via the combo box.
-- Enable grayscale via **Black & White**.
-- Enable zoom via **Zoom**.
-- Enable **Temporal Smooth** to run an exponential moving average across frames (slider controls how much of the new frame is blended in).
-- Use **Rotation** to rotate the live feed clockwise in 90° increments; the frame is rotated at the start of the pipeline so CUDA, zooming, and focus aids all track the new orientation.
-- OpenZoom remembers the last-used camera, effect toggles, and tuning values in `settings.json` under `%APPDATA%\OpenZoom\OpenZoom`; remove the file if you need to return to factory defaults.
-- Enable **Spatial Sharpen** to choose between AMD FSR 1.0 or NVIDIA NIS (NIS is selected by default).
-- Both effects can run simultaneously; the bottom-right quadrant shows the combined output.
+The UI now has two layers:
+- stage 1: quick modes for common low-vision tasks
+- stage 2: advanced tuning for power users and preset creation
 
-## Runtime Flags
-- `--cuda-buffer-format=<rgba8|fp16>` or `OPENZOOM_CUDA_BUFFER_FORMAT` (defaults to `rgba8`; `fp16` is reserved for upcoming deep-learning kernels).
+## Module Map
+- `src/app` / `include/openzoom/app`: application lifecycle, settings persistence, and interaction control.
+- `src/capture` / `include/openzoom/capture`: Media Foundation camera enumeration, mode discovery, and capture.
+- `src/common` / `include/openzoom/common`: CPU image conversion/effects, frame pipeline, and media writing.
+- `src/d3d12` / `include/openzoom/d3d12`: swap chain, upload, presentation, and texture readback.
+- `src/cuda` / `include/openzoom/cuda`: CUDA interop surface, kernels, and fence synchronization.
+- `src/ui` / `include/openzoom/ui`: Qt widgets, overlays, and event routing.
 
-See `docs/hardcoded_paths.md` for a list of hard-coded toolchain paths and
-defaults that may need adjustment on new machines. License attributions live
-in `docs/THIRD_PARTY_LICENSES.md`.
+## Build Matrix
+- `scripts/build_and_run.bat`: default local Windows build and launch helper.
+- `scripts/build_release_bundle.bat`: packages a distributable `dist/OpenZoom` folder.
+- `scripts/run_minimal_test.bat`: builds the app without launching it, then runs the DX12/CUDA sandbox harness if available.
+- `cmake/CMakePresets.json`: includes `msvc-debug`, `msvc-release`, and `msvc-cpu`.
 
-## Next Steps
-- Validate CUDA interop on systems with the full external-memory headers.
-- Re-enable the CUDA processing path in the presentation loop once a GPU device is available.
-- Port temporal filters and stabilization kernels from the original design.
+Core CMake options:
+- `OPENZOOM_ENABLE_CUDA=ON|OFF`
+- `OPENZOOM_ENABLE_TESTS=ON|OFF`
+
+When operating from the WSL/Linux agent shell, invoke Windows-side tooling with
+PowerShell 7 via `pwsh.exe -NoProfile -Command '...'`, for example
+`pwsh.exe -NoProfile -Command 'Get-Date'`. This PowerShell 7 bridge can also
+run the Windows build helpers, such as
+`pwsh.exe -NoProfile -Command '& .\scripts\build_and_run.bat'`; do not use the
+legacy `powershell.exe` bridge.
+
+## Runtime Behavior
+- Camera modes are listed in the UI for the selected device.
+- The main interaction surface is a preset list; each preset maps to a full advanced configuration.
+- Advanced edits update a live config and can be promoted into user-defined quick modes.
+- Rotation is applied before the rest of the processing pipeline.
+- Settings persist to `%APPDATA%\OpenZoom\OpenZoom\settings.json`.
+- Snapshots are saved to `output/img/`.
+- Recordings are saved to `output/vid/`.
+- The processing status label distinguishes CPU, GPU, fallback, debug-view, and recording states.
+- OCR runs through `tesseract.exe` and VLM requests run through a configurable OpenAI-compatible HTTP endpoint, with an in-app assistive overlay rendering the results.
+
+## Documentation Index
+- [`README.md`](../README.md): top-level project overview and usage.
+- [`docs/code_reference.md`](code_reference.md): authoritative file/class map.
+- [`docs/hardcoded_paths.md`](hardcoded_paths.md): machine defaults and magic values.
+- [`docs/progress.md`](progress.md): implementation tracker.
+- [`docs/ai_upscaling_todo.md`](ai_upscaling_todo.md): future GPU upscaling plan.
+- [`docs/THIRD_PARTY_LICENSES.md`](THIRD_PARTY_LICENSES.md): third-party attribution and redistribution notes.
+
+## Current Gaps
+- Automated tests are still limited.
+- CUDA interop still needs broader hardware validation across more driver/toolkit combinations.
+- OCR quality depends on an external Tesseract installation and the quality of the processed frame fed into it.
+- VLM mode depends on user-provided endpoint credentials and currently targets OpenAI-compatible `chat/completions` payloads.

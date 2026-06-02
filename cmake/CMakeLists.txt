@@ -42,6 +42,8 @@ target_sources(open_zoom PRIVATE
     ${PROJECT_SOURCE_DIR}/include/openzoom/capture/media_capture.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/image_processing.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/frame_pipeline.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/common/media_writer.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/common/assistive_runtime.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/d3d12/presenter.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/ui/main_window.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/cuda/cuda_interop.hpp
@@ -54,12 +56,12 @@ set_target_properties(open_zoom PROPERTIES
 )
 
 target_compile_definitions(open_zoom PRIVATE
-    OPENZOOM_ENABLE_CUDA=$<BOOL:OPENZOOM_ENABLE_CUDA>
-    OPENZOOM_HAS_CUDA_EXT_MEMORY=$<IF:$<BOOL:OPENZOOM_ENABLE_CUDA>,1,0>
+    OPENZOOM_ENABLE_CUDA=$<BOOL:${OPENZOOM_ENABLE_CUDA}>
+    OPENZOOM_HAS_CUDA_EXT_MEMORY=$<IF:$<BOOL:${OPENZOOM_ENABLE_CUDA}>,1,0>
 )
 
 if (WIN32)
-    find_package(Qt6 REQUIRED COMPONENTS Widgets)
+    find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
 
     if (OPENZOOM_ENABLE_CUDA)
         find_package(CUDAToolkit REQUIRED)
@@ -68,6 +70,7 @@ if (WIN32)
 
     target_link_libraries(open_zoom PRIVATE
         Qt6::Widgets
+        Qt6::Network
         d3d12
         dxgi
         mfplat
@@ -98,5 +101,9 @@ endif()
 
 if (OPENZOOM_ENABLE_TESTS)
     enable_testing()
-    add_subdirectory(${PROJECT_SOURCE_DIR}/tests ${CMAKE_BINARY_DIR}/tests)
+    if (EXISTS "${PROJECT_SOURCE_DIR}/tests/CMakeLists.txt")
+        add_subdirectory(${PROJECT_SOURCE_DIR}/tests ${CMAKE_BINARY_DIR}/tests)
+    else()
+        message(WARNING "OPENZOOM_ENABLE_TESTS=ON, but no tests/CMakeLists.txt exists yet.")
+    endif()
 endif()

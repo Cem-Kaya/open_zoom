@@ -33,6 +33,12 @@ public:
                             UINT height,
                             const FenceSyncParams* fenceSync = nullptr);
 
+    // Copy a GPU texture into a CPU buffer (BGRA8). Blocking; waits for GPU completion.
+    bool ReadbackTexture(ID3D12Resource* texture,
+                         UINT width,
+                         UINT height,
+                         std::vector<uint8_t>& outBgra);
+
     ID3D12Device* GetDevice() const;
     ID3D12Fence* GetFence() const;
     UINT64 GetLastSignaledFenceValue() const;
@@ -73,6 +79,14 @@ private:
     uint8_t* uploadMappedPtr_{};
     UINT uploadWidth_{};
     UINT uploadHeight_{};
+
+    Microsoft::WRL::ComPtr<ID3D12Resource> readbackBuffer_;
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT readbackFootprint_{};
+    UINT readbackNumRows_{};
+    UINT64 readbackRowSizeInBytes_{};
+    UINT64 readbackTotalBytes_{};
+    UINT readbackWidth_{};
+    UINT readbackHeight_{};
 };
 
 } // namespace openzoom

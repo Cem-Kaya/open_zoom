@@ -11,6 +11,9 @@
 #include <cwchar>
 #include <stdexcept>
 #include <utility>
+#include <set>
+#include <tuple>
+#include <cstdio>
 
 namespace openzoom {
 
@@ -121,13 +124,56 @@ std::vector<CameraDescriptor> MediaCapture::EnumerateCameras()
     return cameras;
 }
 
+std::vector<VideoFormat> MediaCapture::EnumerateFormats(const CameraDescriptor& descriptor)
+{
+    lastError_.clear();
+    std::vector<VideoFormat> formats;
+
+    if (!descriptor.activation) {
+        lastError_ = "Invalid camera activation";
+        return formats;
+    }
+
+    try {
+        Microsoft::WRL::ComPtr<IMFMediaSource> mediaSource;
+        ThrowIfFailed(descriptor.activation->ActivateObject(__uuidof(IMFMediaSource),
+                                                            reinterpret_cast<void**>(mediaSource.GetAddressOf())),
+                      "ActivateObject");
+
+        Microsoft::WRL::ComPtr<IMFAttributes> readerAttributes;
+        ThrowIfFailed(MFCreateAttributes(readerAttributes.GetAddressOf(), 2),
+                      "Create reader attributes");
+        ThrowIfFailed(readerAttributes->SetUINT32(MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, TRUE),
+                      "Enable video processing");
+        ThrowIfFailed(readerAttributes->SetUINT32(MF_READWRITE_DISABLE_CONVERTERS, FALSE),
+                      "Allow converters");
+
+        Microsoft::WRL::ComPtr<IMFSourceReader> reader;
+        ThrowIfFailed(MFCreateSourceReaderFromMediaSource(mediaSource.Get(),
+                                                          readerAttributes.Get(),
+                                                          reader.GetAddressOf()),
+                      "Create source reader");
+
+        formats = ExtractFormats(reader.Get());
+        SafeShutdown(mediaSource.Get());
+    } catch (const std::exception& e) {
+        lastError_ = e.what();
+    } catch (...) {
+        lastError_ = "Unknown exception while enumerating formats";
+    }
+
+    return formats;
+}
+
 bool MediaCapture::StartCapture(const CameraDescriptor& descriptor,
                                 FrameCallback callback,
                                 GUID preferredSubtype)
 {
     StopCapture();
+    lastError_.clear();
 
     if (!descriptor.activation) {
+        lastError_ = "Invalid camera activation";
         return false;
     }
 
@@ -155,6 +201,7 @@ bool MediaCapture::StartCapture(const CameraDescriptor& descriptor,
 
         FrameFormat format;
         if (!ConfigureReader(reader.Get(), preferredSubtype, format)) {
+            lastError_ = "ConfigureReader failed to select format";
             return false;
         }
 
@@ -166,8 +213,10 @@ bool MediaCapture::StartCapture(const CameraDescriptor& descriptor,
         captureThread_ = std::thread(&MediaCapture::CaptureLoop, this, std::move(callback));
         return true;
     } catch (const std::exception& e) {
+        lastError_ = e.what();
         qWarning() << "MediaCapture::StartCapture exception:" << e.what();
     } catch (...) {
+        lastError_ = "Unknown exception while starting capture";
         qWarning() << "MediaCapture::StartCapture unknown exception";
     }
 
@@ -263,6 +312,56 @@ bool MediaCapture::ConfigureReader(IMFSourceReader* reader,
     outFormat.height = height;
     outFormat.stride = static_cast<UINT>(std::abs(rawStride));
     return true;
+}
+
+std::vector<VideoFormat> MediaCapture::ExtractFormats(IMFSourceReader* reader)
+{
+    std::vector<VideoFormat> formats;
+    if (!reader) {
+        return formats;
+    }
+
+    std::set<std::tuple<UINT, UINT, UINT, UINT>> uniqueKeys;
+    for (DWORD index = 0;; ++index) {
+        Microsoft::WRL::ComPtr<IMFMediaType> mediaType;
+        HRESULT hr = reader->GetNativeMediaType(MF_SOURCE_READER_FIRST_VIDEO_STREAM, index, mediaType.GetAddressOf());
+        if (hr == MF_E_NO_MORE_TYPES) {
+            break;
+        }
+        if (FAILED(hr) || !mediaType) {
+            lastError_ = HrToString(hr);
+            break;
+        }
+
+        UINT32 width = 0, height = 0;
+        if (FAILED(MFGetAttributeSize(mediaType.Get(), MF_MT_FRAME_SIZE, &width, &height))) {
+            continue;
+        }
+
+        UINT32 num = 0, den = 0;
+        if (FAILED(MFGetAttributeRatio(mediaType.Get(), MF_MT_FRAME_RATE, &num, &den))) {
+            num = 0;
+            den = 0;
+        }
+
+        auto key = std::make_tuple(width, height, num, den);
+        if (uniqueKeys.insert(key).second) {
+            VideoFormat fmt;
+            fmt.width = width;
+            fmt.height = height;
+            fmt.numerator = num;
+            fmt.denominator = den;
+            formats.push_back(fmt);
+        }
+    }
+    return formats;
+}
+
+std::string MediaCapture::HrToString(HRESULT hr)
+{
+    char buffer[32];
+    std::snprintf(buffer, sizeof(buffer), "hr=0x%08lx", static_cast<unsigned long>(hr));
+    return std::string(buffer);
 }
 
 void MediaCapture::CaptureLoop(FrameCallback callback)

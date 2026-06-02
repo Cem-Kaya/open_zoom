@@ -12,6 +12,7 @@
 #include <iterator>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace openzoom {
 
@@ -407,6 +408,110 @@ void D3D12Presenter::EnsureUploadBuffer(UINT width, UINT height)
 
     uploadWidth_ = width;
     uploadHeight_ = height;
+}
+
+bool D3D12Presenter::ReadbackTexture(ID3D12Resource* texture,
+                                     UINT width,
+                                     UINT height,
+                                     std::vector<uint8_t>& outBgra)
+{
+    if (!initialized_ || !texture || width == 0 || height == 0) {
+        return false;
+    }
+
+    if (width != readbackWidth_ || height != readbackHeight_ || !readbackBuffer_) {
+        // Allocate readback buffer
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        device_->GetCopyableFootprints(&desc,
+                                       0,
+                                       1,
+                                       0,
+                                       &readbackFootprint_,
+                                       &readbackNumRows_,
+                                       &readbackRowSizeInBytes_,
+                                       &readbackTotalBytes_);
+
+        D3D12_RESOURCE_DESC bufferDesc{};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = readbackTotalBytes_;
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES heapProps{};
+        heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+
+        readbackBuffer_.Reset();
+        ThrowIfFailed(device_->CreateCommittedResource(&heapProps,
+                                                       D3D12_HEAP_FLAG_NONE,
+                                                       &bufferDesc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST,
+                                                       nullptr,
+                                                       IID_PPV_ARGS(&readbackBuffer_)),
+                      "Failed to create readback buffer");
+        readbackWidth_ = width;
+        readbackHeight_ = height;
+    }
+
+    ThrowIfFailed(commandAllocator_->Reset(), "Failed to reset command allocator");
+    ThrowIfFailed(commandList_->Reset(commandAllocator_.Get(), nullptr), "Failed to reset command list");
+
+    auto transitionSourceToCopy = TransitionBarrier(texture,
+                                                    D3D12_RESOURCE_STATE_COMMON,
+                                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commandList_->ResourceBarrier(1, &transitionSourceToCopy);
+
+    D3D12_TEXTURE_COPY_LOCATION dest{};
+    dest.pResource = readbackBuffer_.Get();
+    dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dest.PlacedFootprint = readbackFootprint_;
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = texture;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+
+    commandList_->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+
+    auto transitionSourceToCommon = TransitionBarrier(texture,
+                                                      D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_COMMON);
+    commandList_->ResourceBarrier(1, &transitionSourceToCommon);
+
+    ThrowIfFailed(commandList_->Close(), "Failed to close command list");
+
+    ID3D12CommandList* lists[] = { commandList_.Get() };
+    commandQueue_->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
+
+    WaitForGpu();
+
+    outBgra.resize(static_cast<size_t>(width) * height * 4u);
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE range{0, static_cast<SIZE_T>(readbackTotalBytes_)};
+    ThrowIfFailed(readbackBuffer_->Map(0, &range, reinterpret_cast<void**>(&mapped)),
+                  "Failed to map readback buffer");
+
+    const uint8_t* srcData = mapped + readbackFootprint_.Offset;
+    const size_t srcPitch = readbackFootprint_.Footprint.RowPitch;
+    for (UINT y = 0; y < height; ++y) {
+        const uint8_t* srcRow = srcData + static_cast<size_t>(y) * srcPitch;
+        uint8_t* dstRow = outBgra.data() + static_cast<size_t>(y) * width * 4u;
+        std::memcpy(dstRow, srcRow, static_cast<size_t>(width) * 4u);
+    }
+    readbackBuffer_->Unmap(0, nullptr);
+    return true;
 }
 
 void D3D12Presenter::CopyToUpload(const uint8_t* data, UINT width, UINT height)

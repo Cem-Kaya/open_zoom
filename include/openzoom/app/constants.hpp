@@ -2,6 +2,7 @@
 
 #include <array>
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 
 namespace openzoom::app_constants {

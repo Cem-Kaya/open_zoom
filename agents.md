@@ -16,6 +16,9 @@ open while contributing and update it whenever the workflow evolves.
 2. **Keep documentation current** – Any code or script change that affects
    usage, outputs, dependencies, or licensing must update the relevant doc.
    Never commit features or fixes without doc updates.
+   - Changes to classes, functions, or public structs require updating
+     `docs/code_reference.md` in the same PR/commit so the reference stays
+     authoritative.
 3. **Respect the dual license** – All contributions are accepted under GPL-3.0
    plus the commercial license. Do not add third-party code unless the license
    is compatible and you note it in `docs/THIRD_PARTY_LICENSES.md`.
@@ -38,6 +41,11 @@ open while contributing and update it whenever the workflow evolves.
 - Ensure build scripts (`scripts/build_and_run.bat` and
   `scripts/build_release_bundle.bat`) remain functional on Windows 10/11 with
   the documented toolchain.
+- From the WSL/Linux agent shell, launch Windows-side commands with PowerShell
+  7 via `pwsh.exe -NoProfile -Command '...'`, for example
+  `pwsh.exe -NoProfile -Command 'Get-Date'`. Use this PowerShell 7 bridge for
+  Windows build tooling and batch scripts when a native Linux command is not
+  enough; do not use the legacy `powershell.exe` bridge.
 - Run the appropriate build or test command locally before submitting
   automated changes; note the result in your summary.
 

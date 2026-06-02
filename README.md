@@ -1,91 +1,138 @@
 # OpenZoom
 
-OpenZoom is a Windows-only camera magnification playground that experiments with real-time capture, GPU/CPU image processing, and live presentation. The current milestone runs entirely on the CPU for stability while keeping the CUDA + Direct3D12 pathway wired up for future kernels.
+OpenZoom is a Windows-only camera magnifier built around Qt 6, Media Foundation, Direct3D 12, and an optional CUDA processing path. The current codebase already supports live camera capture, CPU and GPU frame processing, a two-stage preset/advanced UI, rotation-aware presentation, persistent settings, photo snapshots, and H.264 MP4 recording.
 
-## Highlights
-- Media Foundation capture thread that speaks BGRA32, RGB32, NV12, and YUY2 and normalises everything into BGRA for rendering.
-- Qt 6 widget shell hosting a Direct3D 12 swap chain, including resize-aware layout and clean shutdown handling.
-- Debug-friendly grid compositor (defaults to 2×2 but now flexes to fit active views) that shows raw input, grayscale, zoom, and combined output so filter stages are easy to inspect.
-- CUDA external-memory interop path now active with optional spatial sharpening (FSR 1.0-style or NVIDIA NIS) plus the legacy Gaussian blur toggle for clearer zoomed text.
-- Temporal smoothing kernel adds an exponential running average to tame shimmer without losing responsiveness.
-- Batch script that bootstraps a Visual Studio 2022 build, scrubs stale CMake caches, and launches the app when compilation succeeds.
+## Current Capabilities
+- Media Foundation camera enumeration with per-device mode listing (`width x height @ fps`).
+- CPU frame pipeline for format conversion, rotation, black-and-white thresholding, zoom, Gaussian blur, temporal smoothing, and debug compositing.
+- Direct3D 12 presenter for swap-chain output plus GPU texture readback for recording and snapshots.
+- CUDA external-memory interop path with black-and-white, zoom, Gaussian blur, temporal smoothing, focus marker, and spatial sharpening via NVIDIA NIS or AMD FSR 1.0 style kernels.
+- Stage-1 quick modes backed by full stage-2 advanced configurations, including promotion of advanced tuning into user-defined quick options.
+- CPU fallback when CUDA interop is unavailable or debug view is enabled.
+- OCR via `tesseract.exe`, VLM via an OpenAI-compatible HTTP endpoint, and an in-app assistive overlay.
+- Session persistence in `%APPDATA%\OpenZoom\OpenZoom\settings.json`.
+- Processed output capture to `output/img/IMG_*.jpg` and `output/vid/VID_*.mp4` next to the executable.
 
-## Project Status
-> CPU presentation path is production-ready for debugging. CUDA kernels and zero-copy plumbing are staged but inactive. Next major push is to restore GPU processing inside the Qt/D3D12 architecture.
-
-See `docs/progress.md` for a live task board and `chatgpt_future_readme.txt` for long-term design notes.
+## Status
+OpenZoom is no longer just a CPU-only shell. The CPU path is the most deterministic debugging path, while the CUDA path is active when the D3D12/CUDA interop surface initializes successfully. When GPU processing cannot be used, the app falls back to the CPU pipeline automatically and exposes that state in the UI.
 
 ## Prerequisites
-- Windows 10/11 with a CUDA-capable NVIDIA GPU (SM 7.5, 8.6, or 8.9 tested).
-- Visual Studio 2022 with Desktop C++ workload and the Windows 10/11 SDK.
-- CUDA Toolkit 13.x (ensure `nvcc` and headers are on PATH/INCLUDE).
-- Qt 6.9.3 (MSVC 2022 64-bit build) or adjust `QT_PREFIX`/`Qt6_DIR` to match your install.
-- CMake ≥ 3.23; Ninja is optional but recommended for non-MSBuild workflows.
+- Windows 10 or Windows 11.
+- Visual Studio 2022 with the Desktop C++ workload and Windows SDK.
+- Qt 6.9.3 for `msvc2022_64`, or matching overrides via `QT_PREFIX` / `Qt6_DIR`.
+- CMake 3.23 or newer.
+- NVIDIA GPU plus CUDA Toolkit 13.x if you want the CUDA path.
 
-## Quick Start (Visual Studio generator)
-1. Open a "x64 Native Tools Command Prompt for VS 2022" or a PowerShell session with VS, Qt, and CUDA on PATH.
-2. Run the helper script:
-   ```bat
-   scripts\build_and_run.bat
-   ```
-3. If Windows reports missing `Qt6*.dll` files, append the Qt `bin` directory (for example `C:\Qt\6.9.3\msvc2022_64\bin`) to `PATH` or copy those DLLs next to `open_zoom.exe`.
+## Build And Run
+From a Visual Studio x64 developer prompt or a PowerShell 7 session (`pwsh.exe`) with MSVC, Qt, and optionally CUDA on `PATH`:
 
-### Alternative: Ninja build
-```powershell
-cmake -S . -B build-ninja -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="C:/Qt/6.9.3/msvc2022_64" -DCMAKE_CUDA_ARCHITECTURES="75;86;89"
-cmake --build build-ninja
+```bat
+scripts\build_and_run.bat
 ```
-Run the produced `open_zoom.exe` from `build-ninja` (ensure Qt DLLs are discoverable).
 
-### Bundled Release build
+From the WSL/Linux agent shell, run Windows-side commands through PowerShell 7
+with `pwsh.exe -NoProfile -Command '...'`, for example
+`pwsh.exe -NoProfile -Command 'Get-Date'`.
+
+The helper script:
+- configures `build\` with the Visual Studio 2022 generator,
+- clears stale CMake cache entries when the source path changes,
+- builds `open_zoom`,
+- prefers `build\cmake\Release\open_zoom.exe` when launching,
+- runs `windeployqt` automatically when it can find the Qt runtime.
+
+If Windows reports missing `Qt6*.dll` files, add the Qt `bin` directory to `PATH` or point `QT_PREFIX` / `Qt6_DIR` at the correct installation.
+
+## Alternative Builds
+### CMake presets
+
+```powershell
+cmake --preset msvc-release
+cmake --build --preset msvc-release-build
+```
+
+Available presets live in [`cmake/CMakePresets.json`](cmake/CMakePresets.json):
+- `msvc-debug`
+- `msvc-release`
+- `msvc-cpu`
+
+### CPU-only build
+
+```powershell
+cmake -S . -B build-cpu -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="C:/Qt/6.9.3/msvc2022_64" -DOPENZOOM_ENABLE_CUDA=OFF
+cmake --build build-cpu
+```
+
+### Release bundle
+
 ```bat
 scripts\build_release_bundle.bat
 ```
-Creates `dist\OpenZoom\` with `open_zoom.exe`, the required Qt DLLs, and CUDA runtime components (when CUDA is enabled) so the app can be copied to another machine.
+
+This produces `dist\OpenZoom\` with `open_zoom.exe`, Qt runtime files, `LICENSE`, `README.txt`, and `THIRD_PARTY_LICENSES.md`. CUDA redistributables are copied when they are available on the machine.
 
 ## Runtime Controls
-- Camera picker combo box selects the active Media Foundation device.
-- `Black & White` checkbox toggles grayscale processing.
-- `Zoom` checkbox enables the magnifier.
-- `Temporal Smooth` checkbox blends frames using an exponential running average (slider controls the new-frame weight).
-- `Rotation` button cycles the scene clockwise in 90° steps and updates the full processing pipeline, keeping focus tools aligned with the rotated view.
-- The debug grid displays: top-left raw feed, top-right grayscale, bottom-left zoom, bottom-right combined result, expanding beyond 2×2 when additional stages are enabled.
-- Session preferences persist automatically. OpenZoom saves the most recent camera choice and tuning values to `%APPDATA%\OpenZoom\OpenZoom\settings.json`; delete that file to reset back to the defaults.
+- `Quick Modes` is the primary stage-1 UI: choose task-oriented presets like reading, high contrast, OCR assist, or scene explain.
+- `Advanced Tuning` opens the stage-2 panel with the full set of low-level controls.
+- `Save As Quick Option` promotes the current advanced setup into a reusable stage-1 preset.
+- `Camera` selects the active Media Foundation device.
+- `Modes` shows the discovered capture modes for the selected camera.
+- `Rotation` rotates the pipeline in 90 degree clockwise steps before downstream processing.
+- `Black & White` applies thresholded monochrome conversion.
+- `Zoom` enables the magnifier and focus-point controls.
+- `Gaussian Blur` applies the CPU or CUDA blur stage with configurable sigma and supported discrete radii.
+- `Temporal Smooth` applies an exponential running average.
+- `OCR Assist`, `Scene Explain`, and `Assistive Overlay` drive asynchronous assistive analysis and on-screen text overlays.
+- `Spatial Sharpen` enables the CUDA sharpening/upscaling stage and lets you choose NIS or FSR-style processing when the GPU path is active.
+- `Debug View` switches to the CPU composite grid so intermediate stages can be inspected.
+- `Show Focus Point` overlays the current zoom center on the presented output.
+- `Capture Photo` saves the current processed frame to `output/img/`.
+- `Start Recording` writes processed video to `output/vid/` as H.264 MP4, with a 12 hour cap per file.
+
+## Navigation And Interaction
+- `Ctrl + mouse wheel`: zoom around the cursor.
+- `Mouse wheel`: pan while zoomed.
+- `Middle mouse drag`: pan the zoom focus.
+- Arrow keys: nudge the zoom focus.
+- `Virtual Joystick`: shows an on-canvas joystick overlay for panning.
+
+## Persistence And Output Paths
+- Settings persist to `%APPDATA%\OpenZoom\OpenZoom\settings.json`, including the selected quick mode, current advanced configuration, and user-created quick options.
+- Snapshots are written under `output/img/` relative to the executable.
+- Recordings are written under `output/vid/` relative to the executable.
+
+## Assistive Runtime Configuration
+- OCR uses `tesseract.exe`. If it is not on `PATH`, set `OPENZOOM_TESSERACT_PATH`.
+- VLM mode uses an OpenAI-compatible `chat/completions` endpoint.
+- Configure VLM with:
+  - `OPENZOOM_VLM_API_URL`
+  - `OPENZOOM_VLM_API_KEY`
+  - `OPENZOOM_VLM_MODEL`
+  - optional `OPENZOOM_VLM_PROMPT`
 
 ## Repository Layout
-- `src/app/` – Qt application shell, entry point, and high-level wiring.
-- `src/cuda/` – CUDA interop surface, kernels, and future GPU helpers.
-- `src/d3d12/`, `src/capture/`, `src/ui/`, `src/common/` – stubs reserved for
-  the ongoing modularisation work (see module README files).
-- `include/openzoom/` – Public headers mirroring the `src/` tree.
-- `docs/` – Supplemental design notes, license notices, agent guides.
-- `scripts/` – Local tooling (build, bundling, automation helpers).
-- `cmake/` – CMake option definitions and shared configuration fragments.
-- `ref/` – External references and scratch assets (ignored by git).
-- `build/` – Default out-of-source build directory (generated).
+- `src/app/` - application lifecycle, settings persistence, and interaction wiring.
+- `src/capture/` - Media Foundation camera discovery and capture loop.
+- `src/common/` - CPU frame pipeline, image processing helpers, and Media Foundation recording wrapper.
+- `src/d3d12/` - Direct3D 12 presenter, swap chain, upload, and readback logic.
+- `src/cuda/` - CUDA interop surface and kernels.
+- `src/ui/` - Qt widgets, overlays, and event routing.
+- `include/openzoom/` - public headers mirroring the source layout.
+- `docs/` - architecture notes, code reference, progress tracking, and licensing docs.
+- `scripts/` - build, bundle, and validation helpers.
 
-## Development Notes
-- The CPU path keeps frame processing deterministic for debugging; CUDA kernels will re-use the same pipeline once interop validation is complete.
-- Stale build trees (e.g., when switching between \wsl$ and local paths) can confuse CMake; the batch script auto-cleans mismatched caches.
-- When experimenting with CUDA interop, ensure `CudaInteropSurface::IsValid` gates presentation to avoid presenting invalid resources.
-
-## Roadmap
-- Restore CUDA external-memory interop and port temporal filters (averaging, stabilization scaffolding).
-- Add still-frame capture and encoding once GPU path returns.
-- Improve presentation overlays (FPS, format diagnostics, histogram views).
-- Expand automated checks for kernel outputs and add regression tests via `OPENZOOM_ENABLE_TESTS`.
-
-For deeper architectural context and historical notes, start with `docs/README.md`.
+## Documentation Map
+- [`docs/README.md`](docs/README.md) for the architecture overview.
+- [`docs/code_reference.md`](docs/code_reference.md) for the current class and file map.
+- [`docs/hardcoded_paths.md`](docs/hardcoded_paths.md) for machine-specific defaults.
+- [`docs/progress.md`](docs/progress.md) for implementation status.
+- [`docs/THIRD_PARTY_LICENSES.md`](docs/THIRD_PARTY_LICENSES.md) for redistribution notes.
 
 ## License
 
 This project is dual-licensed:
 
-- **GPL-3.0** — open-source usage under the GNU General Public License
-  (license text included in `LICENSE`).
-- **Commercial License** — proprietary terms available by contacting
-  `sales@example.com`.
+- GPL-3.0 via [`LICENSE`](LICENSE)
+- Commercial licensing by direct arrangement with the project owner
 
-By submitting a pull request you agree that your contribution may be
-distributed under both licenses. Third-party notices are collected in
-`docs/THIRD_PARTY_LICENSES.md`.
+By contributing, you agree that your changes may be distributed under both terms. Third-party notices are summarized in [`docs/THIRD_PARTY_LICENSES.md`](docs/THIRD_PARTY_LICENSES.md).

@@ -10,15 +10,18 @@
 #include <QComboBox>
 #include <QCursor>
 #include <QEvent>
+#include <QAbstractItemView>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QMouseEvent>
 #include <QPainter>
 #include <QPaintEvent>
 #include <QPushButton>
+#include <QListWidget>
 #include <QRegion>
 #include <QResizeEvent>
 #include <QShowEvent>
+#include <QSizePolicy>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QToolButton>
@@ -81,6 +84,88 @@ bool RenderWidget::EnsurePresenter()
     HWND hwnd = reinterpret_cast<HWND>(winId());
     presenter_->Initialize(hwnd, std::max(1, width()), std::max(1, height()));
     return true;
+}
+
+AssistiveOverlay::AssistiveOverlay(QWidget* parent)
+    : QWidget(parent)
+{
+    setAttribute(Qt::WA_NoSystemBackground, true);
+    setAttribute(Qt::WA_TranslucentBackground, true);
+    setVisible(false);
+    if (parent) {
+        parent->installEventFilter(this);
+    }
+}
+
+void AssistiveOverlay::SetContent(const QString& title, const QString& body, bool visible)
+{
+    title_ = title;
+    body_ = body;
+    const bool shouldShow = visible && (!title_.isEmpty() || !body_.isEmpty());
+    setVisible(shouldShow);
+    if (shouldShow) {
+        UpdatePlacement();
+        raise();
+        update();
+    }
+}
+
+bool AssistiveOverlay::eventFilter(QObject* watched, QEvent* event)
+{
+    if (watched == parentWidget() && event->type() == QEvent::Resize) {
+        UpdatePlacement();
+    }
+    return QWidget::eventFilter(watched, event);
+}
+
+void AssistiveOverlay::showEvent(QShowEvent* event)
+{
+    QWidget::showEvent(event);
+    UpdatePlacement();
+}
+
+void AssistiveOverlay::paintEvent(QPaintEvent*)
+{
+    QPainter painter(this);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    const QRectF panelRect = rect().adjusted(1, 1, -1, -1);
+    painter.setPen(QPen(QColor(255, 255, 255, 40), 1.0));
+    painter.setBrush(QColor(18, 18, 18, 212));
+    painter.drawRoundedRect(panelRect, 16.0, 16.0);
+
+    QRect textRect = rect().adjusted(16, 14, -16, -14);
+    painter.setPen(QColor(255, 247, 214));
+    QFont titleFont = painter.font();
+    titleFont.setBold(true);
+    titleFont.setPointSize(titleFont.pointSize() + 1);
+    painter.setFont(titleFont);
+    painter.drawText(textRect, Qt::TextWordWrap, title_);
+
+    QFontMetrics titleMetrics(titleFont);
+    const int titleHeight = titleMetrics.boundingRect(QRect(0, 0, textRect.width(), 200),
+                                                      Qt::TextWordWrap,
+                                                      title_).height();
+
+    QRect bodyRect = textRect.adjusted(0, titleHeight + 10, 0, 0);
+    QFont bodyFont = painter.font();
+    bodyFont.setBold(false);
+    painter.setFont(bodyFont);
+    painter.setPen(QColor(245, 245, 245));
+    painter.drawText(bodyRect, Qt::TextWordWrap, body_);
+}
+
+void AssistiveOverlay::UpdatePlacement()
+{
+    if (!parentWidget()) {
+        return;
+    }
+    const int margin = 20;
+    const int parentWidth = parentWidget()->width();
+    const int parentHeight = parentWidget()->height();
+    const int overlayWidth = std::clamp(parentWidth - margin * 2, 320, 560);
+    const int overlayHeight = std::clamp(parentHeight / 3, 120, 260);
+    setGeometry(margin, margin, overlayWidth, overlayHeight);
 }
 
 JoystickOverlay::JoystickOverlay(QWidget* parent)
@@ -233,25 +318,28 @@ MainWindow::MainWindow()
     rootLayout->setSpacing(8);
 
     controlsToggleButton_ = new QToolButton();
-    controlsToggleButton_->setText("Hide Controls");
+    controlsToggleButton_->setText("Advanced Tuning");
     controlsToggleButton_->setCheckable(true);
-    controlsToggleButton_->setChecked(true);
-    controlsToggleButton_->setArrowType(Qt::DownArrow);
+    controlsToggleButton_->setChecked(false);
+    controlsToggleButton_->setArrowType(Qt::RightArrow);
     controlsToggleButton_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    promotePresetButton_ = new QPushButton("Save As Quick Option");
+
+    capturePhotoButton_ = new QPushButton("Capture Photo");
+    recordButton_ = new QPushButton("Start Recording");
+    recordButton_->setCheckable(true);
 
     joystickCheckbox_ = new QCheckBox("Virtual Joystick");
 
     auto* headerLayout = new QHBoxLayout();
     headerLayout->setSpacing(8);
     headerLayout->addWidget(controlsToggleButton_);
+    headerLayout->addWidget(promotePresetButton_);
     headerLayout->addStretch(1);
+    headerLayout->addWidget(capturePhotoButton_);
+    headerLayout->addWidget(recordButton_);
     headerLayout->addWidget(joystickCheckbox_);
     rootLayout->addLayout(headerLayout);
-
-    controlsContainer_ = new QWidget();
-    auto* controlsLayout = new QVBoxLayout(controlsContainer_);
-    controlsLayout->setContentsMargins(0, 0, 0, 0);
-    controlsLayout->setSpacing(8);
 
     auto* cameraLayout = new QHBoxLayout();
     cameraLayout->setSpacing(8);
@@ -276,7 +364,46 @@ MainWindow::MainWindow()
     cameraCombo_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
     cameraLayout->addWidget(cameraLabel);
     cameraLayout->addWidget(cameraCombo_, 1);
-    controlsLayout->addLayout(cameraLayout);
+    cameraLayout->addSpacing(12);
+    auto* modesLabel = new QLabel("Modes:");
+    cameraModesList_ = new QListWidget();
+    cameraModesList_->setSelectionMode(QAbstractItemView::NoSelection);
+    cameraModesList_->setFocusPolicy(Qt::NoFocus);
+    cameraModesList_->setMinimumHeight(90);
+    cameraModesList_->setMaximumHeight(140);
+    cameraModesList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    cameraModesList_->setSizeAdjustPolicy(QListWidget::AdjustToContents);
+    auto* modesLayout = new QVBoxLayout();
+    modesLayout->setContentsMargins(0, 0, 0, 0);
+    modesLayout->setSpacing(4);
+    modesLayout->addWidget(modesLabel);
+    modesLayout->addWidget(cameraModesList_);
+    cameraLayout->addLayout(modesLayout, 1);
+    rootLayout->addLayout(cameraLayout);
+
+    auto* presetLabel = new QLabel("Quick Modes");
+    presetList_ = new QListWidget();
+    presetList_->setSelectionMode(QAbstractItemView::SingleSelection);
+    presetList_->setFocusPolicy(Qt::StrongFocus);
+    presetList_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    presetList_->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    presetList_->setMinimumHeight(220);
+    presetList_->setMaximumHeight(280);
+    presetList_->setSpacing(4);
+
+    presetDescriptionLabel_ = new QLabel(
+        "Choose a quick mode for the simplest experience. Open Advanced Tuning to fine tune or create a new quick option.");
+    presetDescriptionLabel_->setWordWrap(true);
+    presetDescriptionLabel_->setObjectName("presetDescriptionLabel");
+
+    rootLayout->addWidget(presetLabel);
+    rootLayout->addWidget(presetList_, 0);
+    rootLayout->addWidget(presetDescriptionLabel_, 0);
+
+    controlsContainer_ = new QWidget();
+    auto* controlsLayout = new QVBoxLayout(controlsContainer_);
+    controlsLayout->setContentsMargins(0, 0, 0, 0);
+    controlsLayout->setSpacing(8);
 
     auto* bwLayout = new QHBoxLayout();
     bwLayout->setSpacing(8);
@@ -352,6 +479,18 @@ MainWindow::MainWindow()
     temporalLayout->addWidget(temporalSmoothSlider_, 1);
     temporalLayout->addWidget(temporalSmoothValueLabel_);
     controlsLayout->addLayout(temporalLayout);
+
+    auto* assistiveRow = new QHBoxLayout();
+    assistiveRow->setSpacing(8);
+    ocrAssistCheckbox_ = new QCheckBox("OCR Assist");
+    vlmAssistCheckbox_ = new QCheckBox("Scene Explain");
+    assistiveOverlayCheckbox_ = new QCheckBox("Assistive Overlay");
+    assistiveOverlayCheckbox_->setChecked(true);
+    assistiveRow->addWidget(ocrAssistCheckbox_);
+    assistiveRow->addWidget(vlmAssistCheckbox_);
+    assistiveRow->addWidget(assistiveOverlayCheckbox_);
+    assistiveRow->addStretch(1);
+    controlsLayout->addLayout(assistiveRow);
 
     auto* spatialRow = new QHBoxLayout();
     spatialRow->setSpacing(8);
@@ -435,6 +574,9 @@ RenderWidget* MainWindow::renderWidget() const
 }
 
 QComboBox* MainWindow::cameraCombo() const { return cameraCombo_; }
+QListWidget* MainWindow::presetList() const { return presetList_; }
+QLabel* MainWindow::presetDescriptionLabel() const { return presetDescriptionLabel_; }
+QPushButton* MainWindow::promotePresetButton() const { return promotePresetButton_; }
 QCheckBox* MainWindow::blackWhiteCheckbox() const { return bwCheckbox_; }
 QSlider* MainWindow::blackWhiteSlider() const { return bwSlider_; }
 QCheckBox* MainWindow::zoomCheckbox() const { return zoomCheckbox_; }
@@ -452,9 +594,15 @@ QSlider* MainWindow::blurSigmaSlider() const { return blurSigmaSlider_; }
 QSlider* MainWindow::blurRadiusSlider() const { return blurRadiusSlider_; }
 QLabel* MainWindow::blurSigmaValueLabel() const { return blurSigmaValueLabel_; }
 QLabel* MainWindow::blurRadiusValueLabel() const { return blurRadiusValueLabel_; }
+QListWidget* MainWindow::cameraModesList() const { return cameraModesList_; }
+QPushButton* MainWindow::capturePhotoButton() const { return capturePhotoButton_; }
+QPushButton* MainWindow::recordButton() const { return recordButton_; }
 QCheckBox* MainWindow::temporalSmoothCheckbox() const { return temporalSmoothCheckbox_; }
 QSlider* MainWindow::temporalSmoothSlider() const { return temporalSmoothSlider_; }
 QLabel* MainWindow::temporalSmoothValueLabel() const { return temporalSmoothValueLabel_; }
+QCheckBox* MainWindow::ocrAssistCheckbox() const { return ocrAssistCheckbox_; }
+QCheckBox* MainWindow::vlmAssistCheckbox() const { return vlmAssistCheckbox_; }
+QCheckBox* MainWindow::assistiveOverlayCheckbox() const { return assistiveOverlayCheckbox_; }
 QCheckBox* MainWindow::spatialSharpenCheckbox() const { return spatialSharpenCheckbox_; }
 QComboBox* MainWindow::spatialBackendCombo() const { return spatialBackendCombo_; }
 QSlider* MainWindow::spatialSharpnessSlider() const { return spatialSharpnessSlider_; }
