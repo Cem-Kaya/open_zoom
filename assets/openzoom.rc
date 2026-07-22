@@ -1,0 +1,4 @@
+#include <windows.h>
+
+#define IDI_OPENZOOM 101
+IDI_OPENZOOM ICON "openzoom.ico"

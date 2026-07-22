@@ -160,6 +160,42 @@ const std::vector<AdvancedConfig>& BuiltInConfigsStorage()
                    false, 1, 0.25f,
                    false, false, 0,
                    false, true, true),
+        // MakeConfig's parameter list predates the keystone/auto-contrast and
+        // stabilization fields, so the newer presets set them afterwards.
+        []() {
+            AdvancedConfig config = MakeConfig(QStringLiteral("preset-projector-config"),
+                       QStringLiteral("Projector Screen"),
+                       QStringLiteral("Straightens the projected screen and fixes washed-out colors."),
+                       false, 0.5f, true, 1.4f, 0.5f, 0.5f,
+                       false, 1.0f, 3,
+                       true, 0.25f,
+                       false, 1, 0.25f,
+                       false, false, 0,
+                       false, false, true);
+            config.keystoneEnabled = true;
+            config.autoContrastEnabled = true;
+            config.autoContrastStrength = 0.7f;
+            config.stabilizationEnabled = true;
+            config.stabilizationStrength = 0.85f;
+            return config;
+        }(),
+        []() {
+            AdvancedConfig config = MakeConfig(QStringLiteral("preset-whiteboard-config"),
+                       QStringLiteral("Whiteboard"),
+                       QStringLiteral("High contrast and sharpening for handwriting on a board."),
+                       false, 0.5f, true, 1.5f, 0.5f, 0.5f,
+                       false, 1.0f, 3,
+                       false, 0.25f,
+                       true, 1, 0.35f,
+                       false, false, 0,
+                       false, false, true);
+            config.keystoneEnabled = true;
+            config.autoContrastEnabled = true;
+            config.autoContrastStrength = 0.85f;
+            config.stabilizationEnabled = true;
+            config.stabilizationStrength = 0.85f;
+            return config;
+        }(),
     };
     return kConfigs;
 }
@@ -183,6 +219,10 @@ const std::vector<PresetDefinition>& BuiltInPresetsStorage()
          QStringLiteral("Preset reserved for text extraction and readable overlays."), QStringLiteral("preset-ocr-assist-config"), true},
         {QStringLiteral("preset-scene-explain"), QStringLiteral("Scene Explain"),
          QStringLiteral("Preset reserved for future VLM-based scene summaries."), QStringLiteral("preset-scene-explain-config"), true},
+        {QStringLiteral("preset-projector"), QStringLiteral("Projector Screen"),
+         QStringLiteral("Straightens the projected screen and fixes washed-out colors."), QStringLiteral("preset-projector-config"), true},
+        {QStringLiteral("preset-whiteboard"), QStringLiteral("Whiteboard"),
+         QStringLiteral("High contrast and sharpening for handwriting on a board."), QStringLiteral("preset-whiteboard-config"), true},
     };
     return kPresets;
 }
@@ -209,10 +249,17 @@ QJsonObject ConfigToJson(const AdvancedConfig& config)
     object.insert(QStringLiteral("spatialSharpness"), config.spatialSharpness);
     object.insert(QStringLiteral("debugView"), config.debugView);
     object.insert(QStringLiteral("focusMarker"), config.focusMarker);
-    object.insert(QStringLiteral("rotationQuarterTurns"), config.rotationQuarterTurns);
     object.insert(QStringLiteral("ocrAssistEnabled"), config.ocrAssistEnabled);
     object.insert(QStringLiteral("vlmAssistEnabled"), config.vlmAssistEnabled);
     object.insert(QStringLiteral("assistiveOverlayEnabled"), config.assistiveOverlayEnabled);
+    object.insert(QStringLiteral("stabilizationEnabled"), config.stabilizationEnabled);
+    object.insert(QStringLiteral("stabilizationStrength"), config.stabilizationStrength);
+    object.insert(QStringLiteral("displayColorMode"), config.displayColorMode);
+    object.insert(QStringLiteral("contrast"), config.contrast);
+    object.insert(QStringLiteral("brightness"), config.brightness);
+    object.insert(QStringLiteral("keystoneEnabled"), config.keystoneEnabled);
+    object.insert(QStringLiteral("autoContrastEnabled"), config.autoContrastEnabled);
+    object.insert(QStringLiteral("autoContrastStrength"), config.autoContrastStrength);
     return object;
 }
 
@@ -242,7 +289,93 @@ AdvancedConfig ConfigFromJson(const QJsonObject& object, const AdvancedConfig& d
     config.ocrAssistEnabled = object.value(QStringLiteral("ocrAssistEnabled")).toBool(config.ocrAssistEnabled);
     config.vlmAssistEnabled = object.value(QStringLiteral("vlmAssistEnabled")).toBool(config.vlmAssistEnabled);
     config.assistiveOverlayEnabled = object.value(QStringLiteral("assistiveOverlayEnabled")).toBool(config.assistiveOverlayEnabled);
+    config.stabilizationEnabled = object.value(QStringLiteral("stabilizationEnabled")).toBool(config.stabilizationEnabled);
+    config.stabilizationStrength = Clamp01(static_cast<float>(object.value(QStringLiteral("stabilizationStrength")).toDouble(config.stabilizationStrength)));
+    config.displayColorMode = std::clamp(object.value(QStringLiteral("displayColorMode")).toInt(config.displayColorMode), 0, 4);
+    config.contrast = std::clamp(static_cast<float>(object.value(QStringLiteral("contrast")).toDouble(config.contrast)), 0.25f, 4.0f);
+    config.brightness = std::clamp(static_cast<float>(object.value(QStringLiteral("brightness")).toDouble(config.brightness)), -1.0f, 1.0f);
+    config.keystoneEnabled = object.value(QStringLiteral("keystoneEnabled")).toBool(config.keystoneEnabled);
+    config.autoContrastEnabled = object.value(QStringLiteral("autoContrastEnabled")).toBool(config.autoContrastEnabled);
+    config.autoContrastStrength = Clamp01(static_cast<float>(object.value(QStringLiteral("autoContrastStrength")).toDouble(config.autoContrastStrength)));
     return config;
+}
+
+QJsonObject AssistiveToJson(const AssistiveSettings& assistive)
+{
+    QJsonObject object;
+    object.insert(QStringLiteral("aiProvider"), assistive.aiProvider);
+    object.insert(QStringLiteral("codexExecutablePath"), assistive.codexExecutablePath);
+    object.insert(QStringLiteral("codexModel"), assistive.codexModel);
+    object.insert(QStringLiteral("codexReasoningEffort"), assistive.codexReasoningEffort);
+    object.insert(QStringLiteral("codexInternetEnabled"), assistive.codexInternetEnabled);
+    object.insert(QStringLiteral("codexCodingEnabled"), assistive.codexCodingEnabled);
+    object.insert(QStringLiteral("codexWorkspaceDirectory"), assistive.codexWorkspaceDirectory);
+    object.insert(QStringLiteral("assistantInstructions"), assistive.assistantInstructions);
+    object.insert(QStringLiteral("vlmApiUrl"), assistive.vlmApiUrl);
+    object.insert(QStringLiteral("vlmApiKey"), assistive.vlmApiKey);
+    object.insert(QStringLiteral("vlmModel"), assistive.vlmModel);
+    object.insert(QStringLiteral("vlmPrompt"), assistive.vlmPrompt);
+    object.insert(QStringLiteral("tesseractPath"), assistive.tesseractPath);
+    object.insert(QStringLiteral("ocrLanguage"), assistive.ocrLanguage);
+    object.insert(QStringLiteral("ttsEngine"), assistive.ttsEngine);
+    object.insert(QStringLiteral("ttsVoiceName"), assistive.ttsVoiceName);
+    object.insert(QStringLiteral("ttsVoiceLocale"), assistive.ttsVoiceLocale);
+    object.insert(QStringLiteral("ttsRate"), assistive.ttsRate);
+    object.insert(QStringLiteral("lectureNotesEnabled"), assistive.lectureNotesEnabled);
+    return object;
+}
+
+AssistiveSettings AssistiveFromJson(const QJsonObject& object)
+{
+    AssistiveSettings assistive;
+    assistive.aiProvider = object.value(QStringLiteral("aiProvider")).toString(assistive.aiProvider);
+    assistive.codexExecutablePath = object.value(QStringLiteral("codexExecutablePath")).toString();
+    assistive.codexModel = object.value(QStringLiteral("codexModel")).toString(assistive.codexModel);
+    assistive.codexReasoningEffort = object.value(QStringLiteral("codexReasoningEffort"))
+                                          .toString(assistive.codexReasoningEffort);
+    assistive.codexInternetEnabled = object.value(QStringLiteral("codexInternetEnabled"))
+                                          .toBool(assistive.codexInternetEnabled);
+    assistive.codexCodingEnabled = object.value(QStringLiteral("codexCodingEnabled"))
+                                        .toBool(assistive.codexCodingEnabled);
+    assistive.codexWorkspaceDirectory = object.value(QStringLiteral("codexWorkspaceDirectory"))
+                                             .toString();
+    assistive.assistantInstructions = object.value(QStringLiteral("assistantInstructions"))
+                                          .toString(assistive.assistantInstructions);
+    assistive.vlmApiUrl = object.value(QStringLiteral("vlmApiUrl")).toString(assistive.vlmApiUrl);
+    assistive.vlmApiKey = object.value(QStringLiteral("vlmApiKey")).toString(assistive.vlmApiKey);
+    assistive.vlmModel = object.value(QStringLiteral("vlmModel")).toString(assistive.vlmModel);
+    assistive.vlmPrompt = object.value(QStringLiteral("vlmPrompt")).toString(assistive.vlmPrompt);
+    assistive.tesseractPath = object.value(QStringLiteral("tesseractPath")).toString(assistive.tesseractPath);
+    assistive.ocrLanguage = object.value(QStringLiteral("ocrLanguage")).toString(assistive.ocrLanguage);
+    assistive.ttsEngine = object.value(QStringLiteral("ttsEngine")).toString();
+    assistive.ttsVoiceName = object.value(QStringLiteral("ttsVoiceName")).toString();
+    assistive.ttsVoiceLocale = object.value(QStringLiteral("ttsVoiceLocale")).toString();
+    assistive.ttsRate = std::clamp(object.value(QStringLiteral("ttsRate"))
+                                        .toDouble(assistive.ttsRate),
+                                    -1.0,
+                                    1.0);
+    assistive.lectureNotesEnabled = object.value(QStringLiteral("lectureNotesEnabled")).toBool(assistive.lectureNotesEnabled);
+    return assistive;
+}
+
+QJsonObject CodexConversationToJson(const CodexConversation& conversation)
+{
+    return QJsonObject{{QStringLiteral("threadId"), conversation.threadId},
+                       {QStringLiteral("title"), conversation.title},
+                       {QStringLiteral("preview"), conversation.preview},
+                       {QStringLiteral("createdAt"), conversation.createdAt},
+                       {QStringLiteral("updatedAt"), conversation.updatedAt}};
+}
+
+CodexConversation CodexConversationFromJson(const QJsonObject& object)
+{
+    CodexConversation conversation;
+    conversation.threadId = object.value(QStringLiteral("threadId")).toString();
+    conversation.title = object.value(QStringLiteral("title")).toString();
+    conversation.preview = object.value(QStringLiteral("preview")).toString();
+    conversation.createdAt = object.value(QStringLiteral("createdAt")).toInteger();
+    conversation.updatedAt = object.value(QStringLiteral("updatedAt")).toInteger();
+    return conversation;
 }
 
 QJsonObject PresetToJson(const PresetDefinition& preset)
@@ -355,6 +488,7 @@ std::optional<PersistentSettings> Load(const QString& path)
         settings.virtualJoystick = root.value(QStringLiteral("virtualJoystick")).toBool(settings.virtualJoystick);
         settings.controlsCollapsed = root.value(QStringLiteral("controlsCollapsed")).toBool(settings.controlsCollapsed);
         settings.currentConfig = LegacyConfigFromRoot(root);
+        settings.rotationQuarterTurns = settings.currentConfig.rotationQuarterTurns;
         settings.selectedPresetId.clear();
         return settings;
     }
@@ -362,10 +496,27 @@ std::optional<PersistentSettings> Load(const QString& path)
     const QJsonObject ui = root.value(QStringLiteral("ui")).toObject();
     settings.virtualJoystick = ui.value(QStringLiteral("virtualJoystick")).toBool(settings.virtualJoystick);
     settings.controlsCollapsed = ui.value(QStringLiteral("controlsCollapsed")).toBool(settings.controlsCollapsed);
+    settings.simpleUiMode = ui.value(QStringLiteral("simpleUiMode")).toBool(settings.simpleUiMode);
     settings.selectedPresetId = ui.value(QStringLiteral("selectedPresetId")).toString();
+
+    settings.assistive = AssistiveFromJson(root.value(QStringLiteral("assistive")).toObject());
+
+    const QJsonArray conversationArray = root.value(QStringLiteral("codexConversations")).toArray();
+    settings.codexConversations.reserve(static_cast<std::size_t>(conversationArray.size()));
+    for (const QJsonValue& value : conversationArray) {
+        if (!value.isObject()) {
+            continue;
+        }
+        CodexConversation conversation = CodexConversationFromJson(value.toObject());
+        if (!conversation.threadId.isEmpty()) {
+            settings.codexConversations.push_back(std::move(conversation));
+        }
+    }
 
     const AdvancedConfig defaultConfig = BuiltInConfigsStorage().front();
     settings.currentConfig = ConfigFromJson(root.value(QStringLiteral("currentConfig")).toObject(), defaultConfig);
+    settings.rotationQuarterTurns = SnapRotation(
+        root.value(QStringLiteral("rotationQuarterTurns")).toInt(settings.currentConfig.rotationQuarterTurns));
     if (settings.currentConfig.id.isEmpty()) {
         settings.currentConfig.id = QStringLiteral("current-live");
     }
@@ -405,14 +556,24 @@ bool Save(const QString& path, const PersistentSettings& settings)
     EnsureSettingsDirectory(path);
 
     QJsonObject root;
-    root.insert(QStringLiteral("version"), 2);
+    root.insert(QStringLiteral("version"), 5);
     root.insert(QStringLiteral("cameraIndex"), settings.cameraIndex);
+    root.insert(QStringLiteral("rotationQuarterTurns"), SnapRotation(settings.rotationQuarterTurns));
 
     QJsonObject ui;
     ui.insert(QStringLiteral("virtualJoystick"), settings.virtualJoystick);
     ui.insert(QStringLiteral("controlsCollapsed"), settings.controlsCollapsed);
+    ui.insert(QStringLiteral("simpleUiMode"), settings.simpleUiMode);
     ui.insert(QStringLiteral("selectedPresetId"), settings.selectedPresetId);
     root.insert(QStringLiteral("ui"), ui);
+
+    root.insert(QStringLiteral("assistive"), AssistiveToJson(settings.assistive));
+
+    QJsonArray conversationArray;
+    for (const CodexConversation& conversation : settings.codexConversations) {
+        conversationArray.append(CodexConversationToJson(conversation));
+    }
+    root.insert(QStringLiteral("codexConversations"), conversationArray);
 
     root.insert(QStringLiteral("currentConfig"), ConfigToJson(settings.currentConfig));
 
@@ -505,30 +666,38 @@ std::optional<AdvancedConfig> ResolveConfigForPreset(const QString& presetId,
 
 bool AreConfigsEquivalent(const AdvancedConfig& lhs, const AdvancedConfig& rhs)
 {
-    auto almostEqual = [](float a, float b) {
-        return std::abs(a - b) < 0.0005f;
+    auto withinUiStep = [](float a, float b, float halfStep) {
+        return std::abs(a - b) <= halfStep + 0.0001f;
     };
 
     return lhs.blackWhiteEnabled == rhs.blackWhiteEnabled &&
-           almostEqual(lhs.blackWhiteThreshold, rhs.blackWhiteThreshold) &&
+           withinUiStep(lhs.blackWhiteThreshold, rhs.blackWhiteThreshold, 0.5f / 255.0f) &&
            lhs.zoomEnabled == rhs.zoomEnabled &&
-           almostEqual(lhs.zoomAmount, rhs.zoomAmount) &&
-           almostEqual(lhs.zoomCenterX, rhs.zoomCenterX) &&
-           almostEqual(lhs.zoomCenterY, rhs.zoomCenterY) &&
+           withinUiStep(lhs.zoomAmount, rhs.zoomAmount, 0.005f) &&
+           withinUiStep(lhs.zoomCenterX, rhs.zoomCenterX, 0.005f) &&
+           withinUiStep(lhs.zoomCenterY, rhs.zoomCenterY, 0.005f) &&
            lhs.blurEnabled == rhs.blurEnabled &&
-           almostEqual(lhs.blurSigma, rhs.blurSigma) &&
+           withinUiStep(lhs.blurSigma, rhs.blurSigma, 0.05f) &&
            lhs.blurRadius == rhs.blurRadius &&
            lhs.temporalSmoothEnabled == rhs.temporalSmoothEnabled &&
-           almostEqual(lhs.temporalSmoothAlpha, rhs.temporalSmoothAlpha) &&
+           withinUiStep(lhs.temporalSmoothAlpha, rhs.temporalSmoothAlpha, 0.005f) &&
            lhs.spatialSharpenEnabled == rhs.spatialSharpenEnabled &&
            lhs.spatialUpscaler == rhs.spatialUpscaler &&
-           almostEqual(lhs.spatialSharpness, rhs.spatialSharpness) &&
+           withinUiStep(lhs.spatialSharpness, rhs.spatialSharpness, 0.005f) &&
            lhs.debugView == rhs.debugView &&
            lhs.focusMarker == rhs.focusMarker &&
            SnapRotation(lhs.rotationQuarterTurns) == SnapRotation(rhs.rotationQuarterTurns) &&
            lhs.ocrAssistEnabled == rhs.ocrAssistEnabled &&
            lhs.vlmAssistEnabled == rhs.vlmAssistEnabled &&
-           lhs.assistiveOverlayEnabled == rhs.assistiveOverlayEnabled;
+           lhs.assistiveOverlayEnabled == rhs.assistiveOverlayEnabled &&
+           lhs.stabilizationEnabled == rhs.stabilizationEnabled &&
+           withinUiStep(lhs.stabilizationStrength, rhs.stabilizationStrength, 0.005f) &&
+           lhs.displayColorMode == rhs.displayColorMode &&
+           withinUiStep(lhs.contrast, rhs.contrast, 0.005f) &&
+           withinUiStep(lhs.brightness, rhs.brightness, 0.005f) &&
+           lhs.keystoneEnabled == rhs.keystoneEnabled &&
+           lhs.autoContrastEnabled == rhs.autoContrastEnabled &&
+           withinUiStep(lhs.autoContrastStrength, rhs.autoContrastStrength, 0.005f);
 }
 
 } // namespace openzoom::settings

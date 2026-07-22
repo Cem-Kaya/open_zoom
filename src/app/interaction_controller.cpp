@@ -95,6 +95,7 @@ bool InteractionController::HandlePanScroll(const QWheelEvent* wheelEvent)
 
     app_.SetZoomCenter(app_.zoomCenterX_ + moveX,
                        app_.zoomCenterY_ + moveY,
+                       true,
                        true);
     return true;
 }
@@ -139,14 +140,19 @@ void InteractionController::HandleZoomWheel(int delta, const QPointF& localPos)
     QSignalBlocker blockSlider(app_.zoomSlider_);
     app_.zoomSlider_->setValue(newValue);
     blockSlider.unblock();
-    app_.OnZoomAmountChanged(newValue);
+    app_.zoomAmount_ = std::max(
+        1.0f,
+        static_cast<float>(newValue) / static_cast<float>(app_constants::kZoomSliderScale));
+    app_.UpdateProcessingStatusLabel();
     const float newZoom = app_.zoomAmount_;
 
     if (hasFocus) {
         const float factor = (prevZoom <= 0.0f || newZoom <= 0.0f) ? 1.0f : (prevZoom / newZoom);
         const float newCenterX = focusU - (focusU - app_.zoomCenterX_) * factor;
         const float newCenterY = focusV - (focusV - app_.zoomCenterY_) * factor;
-        app_.SetZoomCenter(newCenterX, newCenterY, true);
+        app_.SetZoomCenter(newCenterX, newCenterY, true, true);
+    } else {
+        app_.SyncCurrentConfigToPersistence(true);
     }
 }
 
@@ -201,6 +207,7 @@ void InteractionController::ApplyInputForces()
 
     app_.SetZoomCenter(app_.zoomCenterX_ + normalizedX * step,
                        app_.zoomCenterY_ + normalizedY * step,
+                       true,
                        true);
 }
 
@@ -243,6 +250,7 @@ bool InteractionController::UpdateMousePan(const QPointF& pos)
 
     app_.SetZoomCenter(app_.zoomCenterX_ + deltaX,
                        app_.zoomCenterY_ + deltaY,
+                       true,
                        true);
     middlePanLastPos_ = pos;
     return true;

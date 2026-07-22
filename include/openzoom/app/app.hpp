@@ -42,7 +42,9 @@ class QEvent;
 class QShowEvent;
 class QPaintEvent;
 class QMouseEvent;
+class QPlainTextEdit;
 class QResizeEvent;
+class QTextBrowser;
 class QWheelEvent;
 QT_END_NAMESPACE
 
@@ -96,23 +98,47 @@ private slots:
     void OnVlmAssistToggled(bool checked);
     void OnAssistiveOverlayToggled(bool checked);
     void OnAssistiveOverlayUpdated(const QString& title, const QString& body, bool visible);
+    void OnStabilizationToggled(bool checked);
+    void OnStabilizationStrengthChanged(int value);
+    void OnKeystoneToggled(bool checked);
+    void OnAutoContrastToggled(bool checked);
+    void OnAutoContrastStrengthChanged(int value);
+    void OnDisplayColorModeChanged(int index);
+    void OnContrastChanged(int value);
+    void OnBrightnessChanged(int value);
 
 private:
     settings::AdvancedConfig CaptureCurrentAdvancedConfig() const;
     void ApplyAdvancedConfig(const settings::AdvancedConfig& config);
     void PopulatePresetList();
-    void RefreshPresetSelection();
+    void RefreshPresetSelection(bool preserveCurrentSelection = false);
     void UpdatePresetDescription();
-    void SyncCurrentConfigToPersistence();
+    void SyncCurrentConfigToPersistence(bool preservePresetSelection = false);
     void PromoteCurrentConfigToPreset();
     void UpdateAssistiveRuntimeState();
     void MaybeRequestAssistiveAnalysis(const uint8_t* data, UINT width, UINT height);
+    AssistiveRuntimeConfig BuildAssistiveRuntimeConfig() const;
+    void ApplyAssistiveSettingsToRuntime();
+    void OpenAiSettingsDialog();
+    void OpenNotesFile();
+    void SubmitOnDemandAnalysis(bool runOcr, bool runVlm);
+    void SubmitAssistantPrompt();
+    void SubmitAssistantPromptText(const QString& prompt,
+                                   bool clearAdvancedEditor,
+                                   bool forceAttachFrame);
+    void SubmitFloatingAssistantPrompt(const QString& prompt);
+    void PopulateAssistantHistory();
+    void LoadSelectedAssistantConversation();
+    void SetAssistantBusy(bool busy);
+    void AppendAssistantMessage(const QString& speaker, const QString& text);
     void InitializePlatform();
     void EnumerateCameras();
     void PopulateCameraCombo();
     void RefreshCameraModesList(size_t index);
-    void StartCameraCapture(size_t index);
+    bool StartCameraCapture(size_t index, bool interactive = true);
     void StopCameraCapture();
+    void BeginCameraReconnect();
+    void DriveCameraReconnect();
     void BuildCompositeAndPresent(UINT width, UINT height);
     void PresentFitted(const uint8_t* data,
                        UINT srcWidth,
@@ -120,7 +146,8 @@ private:
                        bool cropToFill,
                        float centerXNorm,
                        float centerYNorm);
-    void SetZoomCenter(float normX, float normY, bool syncUi);
+    void SetZoomCenter(float normX, float normY, bool syncUi,
+                       bool preservePresetSelection = false);
     void ApplyInputForces();
     void UpdateJoystickVisibility();
     bool HandlePanKey(int key, bool pressed);
@@ -137,12 +164,19 @@ private:
     bool MapViewToSource(const QPointF& pos, float& outX, float& outY) const;
     bool EnsureCudaSurface(UINT width, UINT height);
     bool ProcessFrameWithCuda(UINT width, UINT height);
+    bool TryProcessRawFrameWithCuda(const MediaFrame& frame);
+    bool RunCudaPipeline(const ProcessingInput& input, UINT presentWidth, UINT presentHeight);
+    void HandleGpuFramePresented(UINT width, UINT height);
+    bool AssistiveAnalysisDue() const;
     void CaptureSnapshot(const uint8_t* data, UINT width, UINT height);
-    void MaybeRecordFrame(const uint8_t* data, UINT width, UINT height, ID3D12Resource* texture = nullptr);
+    void MaybeRecordFrame(const uint8_t* data, UINT width, UINT height);
+    void StopRecordingUi();
+    void ShowStatusMessage(const QString& message, int durationMs = 10000);
     QString EnsureOutputSubdir(const QString& subdir);
     void ResetCudaFenceState();
     void ResolveCudaBufferFormatFromOptions();
     void HandleCameraStartFailure(const QString& message);
+    void HandleCameraRuntimeFailure(uint64_t captureSession, const QString& message);
     void UpdateRotationUi();
     static void RotateNormalizedPoint(float inX, float inY, int quarterTurns, float& outX, float& outY);
     void ApplyPersistentSettings(const settings::PersistentSettings& settings);
@@ -187,6 +221,37 @@ private:
     QSlider* spatialSharpnessSlider_{};
     QLabel* spatialSharpnessValueLabel_{};
     QLabel* processingStatusLabel_{};
+    QCheckBox* stabilizationCheckbox_{};
+    QSlider* stabilizationStrengthSlider_{};
+    QCheckBox* keystoneCheckbox_{};
+    QCheckBox* autoContrastCheckbox_{};
+    QSlider* autoContrastStrengthSlider_{};
+    QComboBox* displayColorCombo_{};
+    QSlider* contrastSlider_{};
+    QSlider* brightnessSlider_{};
+    QPushButton* explainNowButton_{};
+    QPushButton* readTextButton_{};
+    QPushButton* aiSettingsButton_{};
+    QPushButton* openNotesButton_{};
+    QLabel* assistantConnectionLabel_{};
+    QLabel* assistantUsageLabel_{};
+    QPushButton* assistantConnectButton_{};
+    QTextBrowser* assistantTranscript_{};
+    QPlainTextEdit* assistantPromptEdit_{};
+    QCheckBox* assistantAttachFrameCheckbox_{};
+    QPushButton* assistantSendButton_{};
+    QPushButton* assistantStopButton_{};
+    QPushButton* assistantNewButton_{};
+    QListWidget* assistantHistoryList_{};
+    QPushButton* assistantRenameButton_{};
+    QPushButton* assistantExportButton_{};
+    QPushButton* assistantDeleteButton_{};
+    QString currentAssistantThreadId_;
+    QString pendingAssistantPrompt_;
+    bool assistantResponseOpen_{false};
+    bool assistantResponseReceivedText_{false};
+    bool codexReady_{false};
+    bool codexSignedIn_{false};
 
     std::unique_ptr<D3D12Presenter> presenter_;
 
@@ -195,6 +260,7 @@ private:
     std::mutex cameraMutex_;
     MediaFrame latestFrame_;
     bool cameraActive_{};
+    uint64_t cameraSessionId_{};
     int selectedCameraIndex_{-1};
     UINT processedFrameWidth_{};
     UINT processedFrameHeight_{};
@@ -225,14 +291,26 @@ private:
     SpatialUpscaler spatialUpscaler_{SpatialUpscaler::kNis};
     float spatialSharpness_{0.25f};
     int rotationQuarterTurns_{0};
+    bool stabilizationEnabled_{};
+    float stabilizationStrength_{0.85f};
+    int displayColorMode_{0};
+    float contrast_{1.0f};
+    float brightness_{0.0f};
+    bool keystoneEnabled_{};
+    bool autoContrastEnabled_{};
+    float autoContrastStrength_{0.7f};
+    bool simpleUiMode_{true};
     std::vector<uint8_t> presentationBuffer_;
     std::vector<uint8_t> recordingBuffer_;
     std::vector<uint8_t> assistiveBuffer_;
+    std::vector<uint8_t> asyncReadbackBuffer_;
     processing::CpuFramePipeline cpuPipeline_;
     VideoRecorder videoRecorder_;
     bool recording_{false};
     QElapsedTimer recordingTimer_;
     uint64_t recordingFrameCount_{0};
+    UINT recordingWidth_{0};
+    UINT recordingHeight_{0};
 
     AssistiveOverlay* assistiveOverlay_{};
     JoystickOverlay* joystickOverlay_{};
@@ -249,8 +327,16 @@ private:
     uint64_t sharedFenceCounter_{1};
     uint64_t lastCudaSignalValue_{};
     uint64_t lastGraphicsSignalValue_{};
+    uint64_t lastReadbackSignalValue_{};
     bool cudaFenceInteropEnabled_{};
     CudaBufferFormat cudaBufferFormat_{CudaBufferFormat::kRgba8};
+    bool rawCudaPathWarned_{false};
+    bool cameraReconnectPending_{false};
+    int cameraReconnectAttempt_{0};
+    qint64 cameraReconnectStartedMs_{0};
+    qint64 cameraReconnectNextAttemptMs_{0};
+    QString transientStatusMessage_;
+    qint64 transientStatusUntilMs_{0};
     QString lastCameraError_;
     QString settingsPath_;
     settings::PersistentSettings persistentSettings_{};

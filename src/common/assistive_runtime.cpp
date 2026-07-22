@@ -1,11 +1,15 @@
 #ifdef _WIN32
 
 #include "openzoom/common/assistive_runtime.hpp"
+#include "openzoom/common/codex_app_server_client.hpp"
 
 #include <QBuffer>
 #include <QByteArray>
+#include <QCoreApplication>
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
+#include <QFileInfo>
 #include <QImage>
 #include <QJsonArray>
 #include <QJsonDocument>
@@ -14,14 +18,29 @@
 #include <QNetworkReply>
 #include <QNetworkRequest>
 #include <QProcess>
+#include <QProcessEnvironment>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTemporaryFile>
+#include <QTimer>
 #include <QUrl>
+#include <QVariant>
+
+#include <algorithm>
+#include <limits>
+
+#if OPENZOOM_HAS_TTS
+#include <QTextToSpeech>
+#endif
 
 namespace openzoom {
 
 namespace {
+
+constexpr int kMinFrameEdge = 64;
+constexpr int kMaxVlmFrameEdge = 2048;
+constexpr int kOcrWatchdogMs = 10000;
+constexpr int kVlmTransferTimeoutMs = 30000;
 
 QString SanitizeText(QString text)
 {
@@ -36,6 +55,28 @@ QString TruncateText(const QString& text, int maxChars)
         return text;
     }
     return text.left(maxChars).trimmed() + QStringLiteral("...");
+}
+
+// Non-empty configured values take precedence over the environment variable.
+QString ResolvedSetting(const QString& configured, const char* envName)
+{
+    const QString fromConfig = configured.trimmed();
+    if (!fromConfig.isEmpty()) {
+        return fromConfig;
+    }
+    return qEnvironmentVariable(envName).trimmed();
+}
+
+QString VlmNotConfiguredMessage()
+{
+    return QStringLiteral("VLM not configured. Set the server URL and model in AI Settings "
+                          "or via OPENZOOM_VLM_API_URL and OPENZOOM_VLM_MODEL. An API key is optional for local servers.");
+}
+
+QString CodexNotAvailableMessage()
+{
+    return QStringLiteral("Codex is not ready. Open Advanced > Assistant to connect a ChatGPT account, "
+                          "or choose an OpenAI-compatible provider in AI Settings.");
 }
 
 QString ParseVlmResponseText(const QByteArray& payload)
@@ -90,21 +131,92 @@ AssistiveRuntime::AssistiveRuntime(QObject* parent)
 {
     networkManager_ = new QNetworkAccessManager(this);
     ocrProcess_ = std::make_unique<QProcess>(this);
+    codexClient_ = std::make_unique<CodexAppServerClient>(this);
+
+    connect(codexClient_.get(), &CodexAppServerClient::ServerStateChanged,
+            this, &AssistiveRuntime::CodexServerStateChanged);
+    connect(codexClient_.get(), &CodexAppServerClient::AccountChanged,
+            this, &AssistiveRuntime::CodexAccountChanged);
+    connect(codexClient_.get(), &CodexAppServerClient::ModelsChanged,
+            this, &AssistiveRuntime::CodexModelsChanged);
+    connect(codexClient_.get(), &CodexAppServerClient::RateLimitChanged,
+            this, &AssistiveRuntime::CodexRateLimitChanged);
+    connect(codexClient_.get(), &CodexAppServerClient::LoginUrlReady,
+            this, &AssistiveRuntime::CodexLoginUrlReady);
+    connect(codexClient_.get(), &CodexAppServerClient::ConversationCreated,
+            this, &AssistiveRuntime::AssistantConversationCreated);
+    connect(codexClient_.get(), &CodexAppServerClient::ConversationTranscriptLoaded,
+            this, &AssistiveRuntime::AssistantTranscriptLoaded);
+    connect(codexClient_.get(), &CodexAppServerClient::ConversationRenamed,
+            this, &AssistiveRuntime::AssistantConversationRenamed);
+    connect(codexClient_.get(), &CodexAppServerClient::ConversationDeleted,
+            this, &AssistiveRuntime::AssistantConversationDeleted);
+    connect(codexClient_.get(), &CodexAppServerClient::TurnStarted,
+            this, &AssistiveRuntime::AssistantTurnStarted);
+    connect(codexClient_.get(), &CodexAppServerClient::TurnTextDelta,
+            this,
+            [this](const QString& threadId, const QString& turnId, const QString& delta) {
+                vlmText_ += delta;
+                vlmStatus_.clear();
+                RefreshOverlay();
+                emit AssistantTextDelta(threadId, turnId, delta);
+            });
+    connect(codexClient_.get(), &CodexAppServerClient::TurnFinished,
+            this,
+            [this](const QString& threadId,
+                   const QString& turnId,
+                   const QString& text,
+                   const QString& error,
+                   bool interrupted,
+                   bool persistent) {
+                if (interrupted) {
+                    vlmText_.clear();
+                    vlmStatus_ = QStringLiteral("Assistant stopped.");
+                    RefreshOverlay();
+                } else if (!error.isEmpty()) {
+                    FinishVlmError(error);
+                } else {
+                    FinishVlmSuccess(text);
+                }
+                emit AssistantTurnFinished(threadId, turnId, text, error, interrupted, persistent);
+            });
+
+    ocrWatchdogTimer_ = new QTimer(this);
+    ocrWatchdogTimer_->setSingleShot(true);
+    ocrWatchdogTimer_->setInterval(kOcrWatchdogMs);
+    connect(ocrWatchdogTimer_, &QTimer::timeout, this, [this]() {
+        if (!ocrProcess_ || ocrProcess_->state() == QProcess::NotRunning) {
+            return;
+        }
+        ocrTimedOut_ = true;
+        FinishOcrError(QStringLiteral("OCR timed out."));
+        // The finished/errorOccurred handlers remove the temp image once the
+        // process is gone and the file is no longer locked.
+        ocrProcess_->kill();
+    });
 
     connect(ocrProcess_.get(),
             qOverload<int, QProcess::ExitStatus>(&QProcess::finished),
             this,
             [this](int exitCode, QProcess::ExitStatus exitStatus) {
+                ocrWatchdogTimer_->stop();
                 const QString stdoutText = SanitizeText(QString::fromUtf8(ocrProcess_->readAllStandardOutput()));
                 const QString stderrText = SanitizeText(QString::fromUtf8(ocrProcess_->readAllStandardError()));
                 if (!pendingOcrImagePath_.isEmpty()) {
                     QFile::remove(pendingOcrImagePath_);
                     pendingOcrImagePath_.clear();
                 }
+                if (ocrTimedOut_) {
+                    // The watchdog already reported the timeout.
+                    ocrTimedOut_ = false;
+                    ocrRunForced_ = false;
+                    return;
+                }
                 if (exitStatus == QProcess::NormalExit && exitCode == 0) {
                     FinishOcrSuccess(stdoutText);
                     return;
                 }
+                ocrRunForced_ = false;
                 QString errorText = stderrText;
                 if (errorText.isEmpty()) {
                     errorText = QStringLiteral("tesseract exited with code %1").arg(exitCode);
@@ -116,14 +228,21 @@ AssistiveRuntime::AssistiveRuntime(QObject* parent)
             &QProcess::errorOccurred,
             this,
             [this](QProcess::ProcessError error) {
+                ocrWatchdogTimer_->stop();
                 if (!pendingOcrImagePath_.isEmpty()) {
                     QFile::remove(pendingOcrImagePath_);
                     pendingOcrImagePath_.clear();
                 }
+                if (ocrTimedOut_) {
+                    // Kill after timeout surfaces as Crashed; already reported.
+                    return;
+                }
+                ocrRunForced_ = false;
                 QString errorText;
                 switch (error) {
                 case QProcess::FailedToStart:
-                    errorText = QStringLiteral("tesseract not found. Install it or set OPENZOOM_TESSERACT_PATH.");
+                    errorText = QStringLiteral("tesseract not found. Install it or set its path in the "
+                                               "assistive settings or via OPENZOOM_TESSERACT_PATH.");
                     break;
                 case QProcess::Crashed:
                     errorText = QStringLiteral("tesseract crashed during OCR.");
@@ -152,13 +271,61 @@ AssistiveRuntime::~AssistiveRuntime()
     }
 }
 
+void AssistiveRuntime::SetConfig(const AssistiveRuntimeConfig& config)
+{
+    const bool notesTargetChanged = config.notesDirectory.trimmed() != config_.notesDirectory.trimmed();
+    const bool speechConfigChanged =
+        config.ttsEngine != config_.ttsEngine ||
+        config.ttsVoiceName != config_.ttsVoiceName ||
+        config.ttsVoiceLocale != config_.ttsVoiceLocale ||
+        config.ttsRate != config_.ttsRate;
+    if (speechConfigChanged) {
+        StopSpeech();
+#if OPENZOOM_HAS_TTS
+        delete tts_;
+        tts_ = nullptr;
+#endif
+    }
+    config_ = config;
+    if (codexClient_) {
+        codexClient_->Configure(config_.codexExecutablePath,
+                                config_.codexModel,
+                                config_.codexReasoningEffort,
+                                config_.assistantInstructions,
+                                config_.codexInternetEnabled,
+                                config_.codexCodingEnabled,
+                                config_.codexWorkspaceDirectory);
+        if (UsesCodexProvider()) {
+            codexClient_->Start();
+        }
+    }
+
+    // New credentials or a new tesseract path may fix a previous hard failure.
+    ocrHardUnavailable_ = false;
+    vlmHardUnavailable_ = false;
+
+    if (notesTargetChanged) {
+        notesFilePath_.clear();
+        lastNotedOcrText_.clear();
+    }
+
+    if (vlmEnabled_ && vlmText_.isEmpty()) {
+        vlmStatus_ = VlmConfigured() ? QStringLiteral("VLM ready.") : VlmNotConfiguredMessage();
+        RefreshOverlay();
+    }
+}
+
 void AssistiveRuntime::SetModes(bool ocrEnabled, bool vlmEnabled)
 {
-    if (!ocrEnabled && ocrProcess_ && ocrProcess_->state() != QProcess::NotRunning) {
+    const bool ocrTurningOff = ocrEnabled_ && !ocrEnabled;
+    const bool vlmTurningOff = vlmEnabled_ && !vlmEnabled;
+
+    if (ocrTurningOff && ocrProcess_ && ocrProcess_->state() != QProcess::NotRunning) {
+        ocrWatchdogTimer_->stop();
         ocrProcess_->kill();
         ocrProcess_->waitForFinished(250);
     }
-    if (!vlmEnabled && activeReply_) {
+    if (vlmTurningOff && activeReply_) {
         activeReply_->abort();
     }
 
@@ -170,62 +337,222 @@ void AssistiveRuntime::SetModes(bool ocrEnabled, bool vlmEnabled)
     if (vlmEnabled_) {
         vlmHardUnavailable_ = false;
     }
-    if (!ocrEnabled_) {
+    if (ocrTurningOff) {
+        ocrForcedVisible_ = false;
         ocrText_.clear();
         ocrStatus_.clear();
-    } else if (ocrText_.isEmpty() && ocrStatus_.isEmpty()) {
-        ocrStatus_ = QStringLiteral("OCR ready. Install tesseract or set OPENZOOM_TESSERACT_PATH if detection fails.");
+    } else if (ocrEnabled_ && ocrText_.isEmpty() && ocrStatus_.isEmpty()) {
+        ocrStatus_ = QStringLiteral("OCR ready. Install tesseract or set its path in the assistive "
+                                    "settings or via OPENZOOM_TESSERACT_PATH if detection fails.");
     }
 
-    if (!vlmEnabled_) {
+    if (vlmTurningOff) {
+        vlmForcedVisible_ = false;
         vlmText_.clear();
         vlmStatus_.clear();
-    } else if (vlmText_.isEmpty() && vlmStatus_.isEmpty()) {
+    } else if (vlmEnabled_ && vlmText_.isEmpty() && vlmStatus_.isEmpty()) {
         if (VlmConfigured()) {
             vlmStatus_ = QStringLiteral("VLM ready.");
         } else {
-            vlmStatus_ = QStringLiteral("VLM not configured. Set OPENZOOM_VLM_API_URL, OPENZOOM_VLM_API_KEY, and OPENZOOM_VLM_MODEL.");
+            vlmStatus_ = VlmNotConfiguredMessage();
         }
     }
 
     RefreshOverlay();
 }
 
+void AssistiveRuntime::ReadAloud(const QString& text)
+{
+    SpeakText(text);
+}
+
+void AssistiveRuntime::DismissOverlay()
+{
+    overlayDismissed_ = true;
+    RefreshOverlay();
+}
+
 bool AssistiveRuntime::WantsAnalysis() const
 {
-    return (ocrEnabled_ && !ocrHardUnavailable_) || (vlmEnabled_ && !vlmHardUnavailable_);
+    // Subscription-backed Codex explanations are user initiated. This avoids
+    // spending a user's Codex allowance every 1.6 seconds in an assistive mode.
+    const bool automaticVlm = !UsesCodexProvider() && vlmEnabled_ && !vlmHardUnavailable_;
+    return (ocrEnabled_ && !ocrHardUnavailable_) || automaticVlm;
 }
 
 bool AssistiveRuntime::IsBusy() const
 {
     const bool ocrBusy = ocrProcess_ && ocrProcess_->state() != QProcess::NotRunning;
-    return ocrBusy || activeReply_ != nullptr;
+    return ocrBusy || activeReply_ != nullptr ||
+           (codexClient_ && codexClient_->IsTurnActive());
+}
+
+bool AssistiveRuntime::IsCodexTurnActive() const
+{
+    return codexClient_ && codexClient_->IsTurnActive();
 }
 
 void AssistiveRuntime::SubmitFrame(const uint8_t* bgraData, int width, int height)
 {
-    if (!WantsAnalysis() || !bgraData || width <= 0 || height <= 0) {
+    if (!WantsAnalysis() || !ValidateFrame(bgraData, width, height)) {
         return;
     }
 
     if (ocrEnabled_ && ocrProcess_ && ocrProcess_->state() == QProcess::NotRunning) {
-        StartOcr(bgraData, width, height);
+        StartOcr(bgraData, width, height, false);
     }
-    if (vlmEnabled_ && activeReply_ == nullptr) {
+    if (vlmEnabled_ && !UsesCodexProvider() && activeReply_ == nullptr) {
         StartVlm(bgraData, width, height);
     }
+}
+
+void AssistiveRuntime::SubmitFrameForced(const uint8_t* bgraData, int width, int height, bool runOcr, bool runVlm)
+{
+    if ((!runOcr && !runVlm) || !ValidateFrame(bgraData, width, height)) {
+        return;
+    }
+    overlayDismissed_ = false;
+
+    if (runOcr && !runVlm && !vlmEnabled_) {
+        vlmForcedVisible_ = false;
+        vlmText_.clear();
+        vlmStatus_.clear();
+    } else if (runVlm && !runOcr && !ocrEnabled_) {
+        ocrForcedVisible_ = false;
+        ocrText_.clear();
+        ocrStatus_.clear();
+    }
+
+    if (runOcr) {
+        ocrForcedVisible_ = true;
+        if (ocrProcess_ && ocrProcess_->state() != QProcess::NotRunning) {
+            FinishOcrError(QStringLiteral("OCR is busy with a previous capture. Try again in a moment."));
+        } else {
+            StartOcr(bgraData, width, height, true);
+        }
+    }
+
+    if (runVlm) {
+        vlmForcedVisible_ = true;
+        if (activeReply_ != nullptr || (codexClient_ && codexClient_->IsTurnActive())) {
+            FinishVlmError(QStringLiteral("Scene explanation is busy with a previous request. Try again in a moment."));
+        } else if (!VlmConfigured()) {
+            FinishVlmError(VlmNotConfiguredMessage());
+        } else {
+            vlmHardUnavailable_ = false;
+            StartVlm(bgraData, width, height);
+        }
+    }
+}
+
+void AssistiveRuntime::NoteCapturedPhoto(const QString& filePath)
+{
+    if (filePath.trimmed().isEmpty()) {
+        return;
+    }
+    AppendNoteSection(QStringLiteral("Photo captured"),
+                      QStringLiteral("![capture](%1)").arg(filePath));
+}
+
+void AssistiveRuntime::StartCodexLogin()
+{
+    if (codexClient_) {
+        codexClient_->Start();
+        codexClient_->StartChatGptLogin();
+    }
+}
+
+void AssistiveRuntime::StopAssistant()
+{
+    if (activeReply_) {
+        activeReply_->abort();
+        return;
+    }
+    if (codexClient_) {
+        codexClient_->InterruptTurn();
+    }
+}
+
+void AssistiveRuntime::SubmitAssistantPrompt(const QString& prompt,
+                                             const QString& threadId,
+                                             const uint8_t* bgraData,
+                                             int width,
+                                             int height,
+                                             bool attachFrame)
+{
+    if (!UsesCodexProvider()) {
+        emit AssistantTurnFinished(threadId, {}, {},
+                                   QStringLiteral("Persistent Assistant conversations require the Codex subscription provider."),
+                                   false, true);
+        return;
+    }
+    if (!codexClient_ || codexClient_->IsTurnActive()) {
+        emit AssistantTurnFinished(threadId, {}, {},
+                                   QStringLiteral("Another assistant request is already running."),
+                                   false, true);
+        return;
+    }
+
+    QString imagePath;
+    if (attachFrame) {
+        if (!ValidateFrame(bgraData, width, height)) {
+            emit AssistantTurnFinished(threadId, {}, {},
+                                       QStringLiteral("No camera frame is available to attach."),
+                                       false, true);
+            return;
+        }
+        imagePath = SaveCodexFrame(bgraData, width, height);
+        if (imagePath.isEmpty()) {
+            emit AssistantTurnFinished(threadId, {}, {},
+                                       QStringLiteral("Could not prepare the current camera view."),
+                                       false, true);
+            return;
+        }
+    }
+    overlayDismissed_ = false;
+    vlmForcedVisible_ = true;
+    vlmText_.clear();
+    vlmStatus_ = QStringLiteral("Thinking...");
+    RefreshOverlay();
+    codexClient_->RequestVisionTurn(prompt, imagePath, threadId, true);
+}
+
+void AssistiveRuntime::LoadAssistantConversation(const QString& threadId)
+{
+    if (codexClient_) {
+        codexClient_->LoadConversation(threadId);
+    }
+}
+
+void AssistiveRuntime::RenameAssistantConversation(const QString& threadId, const QString& name)
+{
+    if (codexClient_) {
+        codexClient_->RenameConversation(threadId, name);
+    }
+}
+
+void AssistiveRuntime::DeleteAssistantConversation(const QString& threadId)
+{
+    if (codexClient_) {
+        codexClient_->DeleteConversation(threadId);
+    }
+}
+
+QString AssistiveRuntime::notesFilePath() const
+{
+    return notesFilePath_;
 }
 
 void AssistiveRuntime::RefreshOverlay()
 {
     QStringList sections;
-    if (ocrEnabled_) {
+    if (ocrEnabled_ || ocrForcedVisible_) {
         QString text = ocrText_.isEmpty() ? ocrStatus_ : ocrText_;
         if (!text.isEmpty()) {
             sections.push_back(QStringLiteral("OCR\n%1").arg(text));
         }
     }
-    if (vlmEnabled_) {
+    if (vlmEnabled_ || vlmForcedVisible_) {
         QString text = vlmText_.isEmpty() ? vlmStatus_ : vlmText_;
         if (!text.isEmpty()) {
             sections.push_back(QStringLiteral("Scene Explain\n%1").arg(text));
@@ -233,28 +560,92 @@ void AssistiveRuntime::RefreshOverlay()
     }
 
     const QString body = sections.join(QStringLiteral("\n\n"));
-    emit OverlayUpdated(QStringLiteral("Assistive View"), body, !body.isEmpty());
+    emit OverlayUpdated(QStringLiteral("Assistive View"),
+                        body,
+                        !overlayDismissed_ && !body.isEmpty());
 }
 
 QString AssistiveRuntime::TesseractProgram() const
 {
-    const QString configured = qEnvironmentVariable("OPENZOOM_TESSERACT_PATH");
-    if (!configured.trimmed().isEmpty()) {
-        return configured.trimmed();
+    const QString resolved = ResolvedSetting(config_.tesseractPath, "OPENZOOM_TESSERACT_PATH");
+    if (!resolved.isEmpty()) {
+        const QFileInfo configured(resolved);
+        if (configured.isDir()) {
+            return QDir(configured.absoluteFilePath()).filePath(QStringLiteral("tesseract.exe"));
+        }
+        return resolved;
+    }
+
+    const QString appDirectory = QCoreApplication::applicationDirPath();
+    QStringList candidates{
+        QDir(appDirectory).filePath(QStringLiteral("tools/tesseract/tesseract.exe")),
+        QDir(appDirectory).filePath(QStringLiteral("tesseract/tesseract.exe")),
+        QDir(appDirectory).filePath(QStringLiteral("tesseract.exe"))};
+
+    const QString pathExecutable = QStandardPaths::findExecutable(QStringLiteral("tesseract.exe"));
+    if (!pathExecutable.isEmpty()) {
+        candidates.push_back(pathExecutable);
+    }
+
+    const QString programFiles = qEnvironmentVariable("ProgramFiles").trimmed();
+    if (!programFiles.isEmpty()) {
+        candidates.push_back(QDir(programFiles).filePath(QStringLiteral("Tesseract-OCR/tesseract.exe")));
+    }
+    const QString localAppData = qEnvironmentVariable("LOCALAPPDATA").trimmed();
+    if (!localAppData.isEmpty()) {
+        candidates.push_back(QDir(localAppData).filePath(
+            QStringLiteral("Programs/Tesseract-OCR/tesseract.exe")));
+    }
+
+    for (const QString& candidate : candidates) {
+        const QFileInfo info(candidate);
+        if (info.isFile()) {
+            return info.absoluteFilePath();
+        }
     }
     return QStringLiteral("tesseract");
 }
 
 bool AssistiveRuntime::VlmConfigured() const
 {
-    return !qEnvironmentVariable("OPENZOOM_VLM_API_URL").trimmed().isEmpty() &&
-           !qEnvironmentVariable("OPENZOOM_VLM_API_KEY").trimmed().isEmpty() &&
-           !qEnvironmentVariable("OPENZOOM_VLM_MODEL").trimmed().isEmpty();
+    if (UsesCodexProvider()) {
+        return codexClient_ != nullptr;
+    }
+    return !ResolvedSetting(config_.vlmApiUrl, "OPENZOOM_VLM_API_URL").isEmpty() &&
+           !ResolvedSetting(config_.vlmModel, "OPENZOOM_VLM_MODEL").isEmpty();
 }
 
-void AssistiveRuntime::StartOcr(const uint8_t* bgraData, int width, int height)
+bool AssistiveRuntime::UsesCodexProvider() const
 {
-    if (ocrHardUnavailable_) {
+    return config_.aiProvider.trimmed().compare(QStringLiteral("codex"), Qt::CaseInsensitive) == 0;
+}
+
+bool AssistiveRuntime::ValidateFrame(const uint8_t* bgraData, int width, int height)
+{
+    if (!bgraData) {
+        return false;
+    }
+    if (width < kMinFrameEdge || height < kMinFrameEdge) {
+        if (!warnedDegenerateFrame_) {
+            warnedDegenerateFrame_ = true;
+            qWarning("AssistiveRuntime: ignoring degenerate %dx%d frame (minimum edge is %d px).",
+                     width, height, kMinFrameEdge);
+        }
+        return false;
+    }
+    // BGRA stride math (width * 4 * height) must not overflow int; camera
+    // dimensions are untrusted driver input.
+    if (width > std::numeric_limits<int>::max() / 4 ||
+        height > std::numeric_limits<int>::max() / (width * 4)) {
+        qWarning("AssistiveRuntime: rejecting oversized %dx%d frame.", width, height);
+        return false;
+    }
+    return true;
+}
+
+void AssistiveRuntime::StartOcr(const uint8_t* bgraData, int width, int height, bool forced)
+{
+    if (ocrHardUnavailable_ && !forced) {
         return;
     }
     QImage frameImage(bgraData, width, height, width * 4, QImage::Format_ARGB32);
@@ -277,27 +668,62 @@ void AssistiveRuntime::StartOcr(const uint8_t* bgraData, int width, int height)
     }
 
     pendingOcrImagePath_ = imagePath;
+    ocrRunForced_ = forced;
+    ocrTimedOut_ = false;
     ocrStatus_ = QStringLiteral("Running OCR...");
     RefreshOverlay();
 
-    ocrProcess_->setProgram(TesseractProgram());
-    ocrProcess_->setArguments({imagePath, QStringLiteral("stdout"), QStringLiteral("--psm"), QStringLiteral("6")});
+    QStringList arguments{imagePath, QStringLiteral("stdout"), QStringLiteral("--psm"), QStringLiteral("6")};
+    const QString language = config_.ocrLanguage.trimmed();
+    if (!language.isEmpty()) {
+        arguments << QStringLiteral("-l") << language;
+    }
+
+    const QString program = TesseractProgram();
+    ocrProcess_->setProgram(program);
+    ocrProcess_->setArguments(arguments);
+    QProcessEnvironment environment = QProcessEnvironment::systemEnvironment();
+    const QFileInfo programInfo(program);
+    if (programInfo.isFile()) {
+        const QString tessdataPath = QDir(programInfo.absolutePath()).filePath(QStringLiteral("tessdata"));
+        if (QDir(tessdataPath).exists()) {
+            environment.insert(QStringLiteral("TESSDATA_PREFIX"), QDir::toNativeSeparators(tessdataPath));
+        }
+        ocrProcess_->setWorkingDirectory(programInfo.absolutePath());
+    } else {
+        ocrProcess_->setWorkingDirectory(QString());
+    }
+    ocrProcess_->setProcessEnvironment(environment);
     ocrProcess_->start();
+    ocrWatchdogTimer_->start();
 }
 
 void AssistiveRuntime::StartVlm(const uint8_t* bgraData, int width, int height)
 {
+    if (UsesCodexProvider()) {
+        QString prompt = config_.vlmPrompt.trimmed();
+        if (prompt.isEmpty()) {
+            prompt = QStringLiteral("Describe the visible scene briefly for a low-vision user. "
+                                    "Focus on readable text, controls, and major objects.");
+        }
+        StartCodexVlm(bgraData, width, height, prompt, {}, false);
+        return;
+    }
     if (vlmHardUnavailable_) {
         return;
     }
     if (!VlmConfigured()) {
         vlmHardUnavailable_ = true;
-        FinishVlmError(QStringLiteral("VLM not configured. Set OPENZOOM_VLM_API_URL, OPENZOOM_VLM_API_KEY, and OPENZOOM_VLM_MODEL."));
+        FinishVlmError(VlmNotConfiguredMessage());
         return;
     }
 
     QImage frameImage(bgraData, width, height, width * 4, QImage::Format_ARGB32);
     QImage copy = frameImage.copy();
+    if (copy.width() > kMaxVlmFrameEdge || copy.height() > kMaxVlmFrameEdge) {
+        copy = copy.scaled(kMaxVlmFrameEdge, kMaxVlmFrameEdge,
+                           Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
     QByteArray jpegBytes;
     QBuffer buffer(&jpegBytes);
     buffer.open(QIODevice::WriteOnly);
@@ -306,10 +732,10 @@ void AssistiveRuntime::StartVlm(const uint8_t* bgraData, int width, int height)
         return;
     }
 
-    const QString apiUrl = qEnvironmentVariable("OPENZOOM_VLM_API_URL").trimmed();
-    const QString apiKey = qEnvironmentVariable("OPENZOOM_VLM_API_KEY").trimmed();
-    const QString model = qEnvironmentVariable("OPENZOOM_VLM_MODEL").trimmed();
-    QString prompt = qEnvironmentVariable("OPENZOOM_VLM_PROMPT").trimmed();
+    const QString apiUrl = ResolvedSetting(config_.vlmApiUrl, "OPENZOOM_VLM_API_URL");
+    const QString apiKey = ResolvedSetting(config_.vlmApiKey, "OPENZOOM_VLM_API_KEY");
+    const QString model = ResolvedSetting(config_.vlmModel, "OPENZOOM_VLM_MODEL");
+    QString prompt = ResolvedSetting(config_.vlmPrompt, "OPENZOOM_VLM_PROMPT");
     if (prompt.isEmpty()) {
         prompt = QStringLiteral("Describe the visible scene briefly for a low-vision user. Focus on readable text, UI elements, and major objects.");
     }
@@ -329,14 +755,25 @@ void AssistiveRuntime::StartVlm(const uint8_t* bgraData, int width, int height)
     message.insert(QStringLiteral("role"), QStringLiteral("user"));
     message.insert(QStringLiteral("content"), QJsonArray{textPart, imagePart});
 
+    QJsonArray messages;
+    const QString assistantInstructions = config_.assistantInstructions.trimmed();
+    if (!assistantInstructions.isEmpty()) {
+        messages.append(QJsonObject{{QStringLiteral("role"), QStringLiteral("system")},
+                                    {QStringLiteral("content"), assistantInstructions}});
+    }
+    messages.append(message);
+
     QJsonObject requestBody;
     requestBody.insert(QStringLiteral("model"), model);
-    requestBody.insert(QStringLiteral("messages"), QJsonArray{message});
+    requestBody.insert(QStringLiteral("messages"), messages);
     requestBody.insert(QStringLiteral("max_tokens"), 180);
 
     QNetworkRequest request{QUrl(apiUrl)};
     request.setHeader(QNetworkRequest::ContentTypeHeader, QStringLiteral("application/json"));
-    request.setRawHeader("Authorization", QStringLiteral("Bearer %1").arg(apiKey).toUtf8());
+    if (!apiKey.isEmpty()) {
+        request.setRawHeader("Authorization", QStringLiteral("Bearer %1").arg(apiKey).toUtf8());
+    }
+    request.setTransferTimeout(kVlmTransferTimeoutMs);
 
     vlmStatus_ = QStringLiteral("Querying VLM...");
     RefreshOverlay();
@@ -351,7 +788,16 @@ void AssistiveRuntime::StartVlm(const uint8_t* bgraData, int width, int height)
 
         const QByteArray payload = reply->readAll();
         if (reply->error() != QNetworkReply::NoError) {
-            FinishVlmError(QStringLiteral("VLM request failed: %1").arg(reply->errorString()));
+            QString detail = reply->errorString();
+            const QVariant statusAttr = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute);
+            if (statusAttr.isValid()) {
+                detail += QStringLiteral(" (HTTP %1)").arg(statusAttr.toInt());
+            }
+            const QString excerpt = TruncateText(SanitizeText(QString::fromUtf8(payload)), 160);
+            if (!excerpt.isEmpty()) {
+                detail += QStringLiteral(" - %1").arg(excerpt);
+            }
+            FinishVlmError(QStringLiteral("VLM request failed: %1").arg(detail));
             reply->deleteLater();
             return;
         }
@@ -366,13 +812,64 @@ void AssistiveRuntime::StartVlm(const uint8_t* bgraData, int width, int height)
     });
 }
 
+void AssistiveRuntime::StartCodexVlm(const uint8_t* bgraData,
+                                     int width,
+                                     int height,
+                                     const QString& prompt,
+                                     const QString& threadId,
+                                     bool persistent)
+{
+    if (!codexClient_) {
+        FinishVlmError(CodexNotAvailableMessage());
+        return;
+    }
+    const QString imagePath = SaveCodexFrame(bgraData, width, height);
+    if (imagePath.isEmpty()) {
+        FinishVlmError(QStringLiteral("Failed to prepare the current view for Codex."));
+        return;
+    }
+    vlmText_.clear();
+    vlmStatus_ = QStringLiteral("Thinking...");
+    RefreshOverlay();
+    codexClient_->RequestVisionTurn(prompt, imagePath, threadId, persistent);
+}
+
+QString AssistiveRuntime::SaveCodexFrame(const uint8_t* bgraData, int width, int height)
+{
+    QImage frameImage(bgraData, width, height, width * 4, QImage::Format_ARGB32);
+    QImage copy = frameImage.copy();
+    if (copy.width() > kMaxVlmFrameEdge || copy.height() > kMaxVlmFrameEdge) {
+        copy = copy.scaled(kMaxVlmFrameEdge, kMaxVlmFrameEdge,
+                           Qt::KeepAspectRatio, Qt::SmoothTransformation);
+    }
+    QTemporaryFile tempFile(QDir(QStandardPaths::writableLocation(QStandardPaths::TempLocation))
+                                .filePath(QStringLiteral("openzoom_codex_XXXXXX.jpg")));
+    tempFile.setAutoRemove(false);
+    if (!tempFile.open()) {
+        return {};
+    }
+    const QString path = tempFile.fileName();
+    tempFile.close();
+    if (!copy.save(path, "JPG", 85)) {
+        QFile::remove(path);
+        return {};
+    }
+    return path;
+}
+
 void AssistiveRuntime::FinishOcrSuccess(const QString& text)
 {
-    ocrText_ = TruncateText(SanitizeText(text), 700);
+    ocrRunForced_ = false;
+    const QString fullText = SanitizeText(text);
+    ocrText_ = TruncateText(fullText, 700);
     if (ocrText_.isEmpty()) {
         ocrStatus_ = QStringLiteral("OCR found no readable text.");
     } else {
         ocrStatus_.clear();
+        if (fullText != lastNotedOcrText_) {
+            lastNotedOcrText_ = fullText;
+            AppendNoteSection(QStringLiteral("Text on screen"), fullText);
+        }
     }
     RefreshOverlay();
 }
@@ -389,11 +886,13 @@ void AssistiveRuntime::FinishOcrError(const QString& errorText)
 
 void AssistiveRuntime::FinishVlmSuccess(const QString& text)
 {
-    vlmText_ = TruncateText(SanitizeText(text), 700);
+    const QString fullText = SanitizeText(text);
+    vlmText_ = TruncateText(fullText, 700);
     if (vlmText_.isEmpty()) {
         vlmStatus_ = QStringLiteral("VLM returned an empty description.");
     } else {
         vlmStatus_.clear();
+        AppendNoteSection(QStringLiteral("Scene explanation"), fullText);
     }
     RefreshOverlay();
 }
@@ -403,6 +902,124 @@ void AssistiveRuntime::FinishVlmError(const QString& errorText)
     vlmText_.clear();
     vlmStatus_ = SanitizeText(errorText);
     RefreshOverlay();
+}
+
+bool AssistiveRuntime::EnsureNotesFile()
+{
+    if (!notesFilePath_.isEmpty()) {
+        return true;
+    }
+    const QString directory = config_.notesDirectory.trimmed();
+    if (directory.isEmpty()) {
+        return false;
+    }
+    if (!QDir().mkpath(directory)) {
+        qWarning("AssistiveRuntime: failed to create notes directory %s", qPrintable(directory));
+        return false;
+    }
+
+    const QDateTime now = QDateTime::currentDateTime();
+    const QString fileName = QStringLiteral("NOTES_%1.md")
+                                 .arg(now.toString(QStringLiteral("yyyyMMdd_HHmmss")));
+    const QString path = QDir(directory).filePath(fileName);
+
+    QFile file(path);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append)) {
+        qWarning("AssistiveRuntime: failed to create notes file %s", qPrintable(path));
+        return false;
+    }
+    // \u2014 is an em dash; escaped so MSVC builds without /utf-8 stay correct.
+    const QString header = QStringLiteral("# OpenZoom Lecture Notes \u2014 %1\n")
+                               .arg(now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+    file.write(header.toUtf8());
+    file.close();
+
+    notesFilePath_ = path;
+    return true;
+}
+
+void AssistiveRuntime::AppendNoteSection(const QString& heading, const QString& bodyText)
+{
+    if (!config_.lectureNotesEnabled || config_.notesDirectory.trimmed().isEmpty()) {
+        return;
+    }
+    if (bodyText.trimmed().isEmpty()) {
+        return;
+    }
+    if (!EnsureNotesFile()) {
+        return;
+    }
+
+    QFile file(notesFilePath_);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Append)) {
+        qWarning("AssistiveRuntime: failed to append to notes file %s", qPrintable(notesFilePath_));
+        return;
+    }
+    const QString timestamp = QTime::currentTime().toString(QStringLiteral("HH:mm:ss"));
+    const QString section = QStringLiteral("\n## [%1] %2\n\n%3\n").arg(timestamp, heading, bodyText);
+    file.write(section.toUtf8());
+    file.close();
+}
+
+void AssistiveRuntime::SpeakText(const QString& text)
+{
+#if OPENZOOM_HAS_TTS
+    if (text.trimmed().isEmpty()) {
+        return;
+    }
+    if (!tts_) {
+        const QStringList engines = QTextToSpeech::availableEngines();
+        auto availableEngine = [&engines](const QString& requested) {
+            for (const QString& engine : engines) {
+                if (engine.compare(requested, Qt::CaseInsensitive) == 0) {
+                    return engine;
+                }
+            }
+            return QString();
+        };
+
+        QString engine = availableEngine(config_.ttsEngine.trimmed());
+        if (engine.isEmpty()) {
+            engine = availableEngine(QStringLiteral("winrt"));
+        }
+        tts_ = engine.isEmpty() ? new QTextToSpeech(this)
+                                : new QTextToSpeech(engine, this);
+        if (tts_->state() == QTextToSpeech::Error &&
+            tts_->engine().compare(QStringLiteral("winrt"), Qt::CaseInsensitive) == 0) {
+            const QString fallbackEngine = availableEngine(QStringLiteral("sapi"));
+            if (!fallbackEngine.isEmpty()) {
+                tts_->setEngine(fallbackEngine);
+            }
+        }
+    }
+
+    tts_->setRate(std::clamp(config_.ttsRate, -1.0, 1.0));
+    if (!config_.ttsVoiceName.trimmed().isEmpty()) {
+        const QList<QVoice> voices = tts_->findVoices();
+        for (const QVoice& voice : voices) {
+            const bool nameMatches = voice.name() == config_.ttsVoiceName;
+            const bool localeMatches = config_.ttsVoiceLocale.trimmed().isEmpty() ||
+                                       voice.locale().name() == config_.ttsVoiceLocale;
+            if (nameMatches && localeMatches) {
+                tts_->setVoice(voice);
+                break;
+            }
+        }
+    }
+    tts_->stop();
+    tts_->say(text);
+#else
+    Q_UNUSED(text);
+#endif
+}
+
+void AssistiveRuntime::StopSpeech()
+{
+#if OPENZOOM_HAS_TTS
+    if (tts_) {
+        tts_->stop();
+    }
+#endif
 }
 
 } // namespace openzoom

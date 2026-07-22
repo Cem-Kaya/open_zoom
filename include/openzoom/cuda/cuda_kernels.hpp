@@ -53,6 +53,97 @@ void LaunchTemporalSmoothLinear(uchar4* dst, size_t dstPitchBytes,
                                 bool historyValid,
                                 cudaStream_t stream);
 
+// Device-resident motion state for video stabilization. It is never read back
+// to the host: the estimate kernel updates it and the warp kernel consumes it.
+struct StabilizationState {
+    float2 actualPath;   // accumulated camera translation, full-res pixels
+    float2 smoothPath;   // low-pass filtered path, full-res pixels
+    float2 correction;   // smoothPath - actualPath, clamped to the warp margin
+};
+
+void LaunchStabilizationLumaDownsample(float* dstLuma,
+                                       int smallWidth, int smallHeight,
+                                       const uchar4* src, size_t srcPitchBytes,
+                                       int width, int height,
+                                       int factorX, int factorY,
+                                       cudaStream_t stream);
+
+void LaunchStabilizationProjections(const float* luma,
+                                    int smallWidth, int smallHeight,
+                                    float* colProj, float* rowProj,
+                                    cudaStream_t stream);
+
+void LaunchStabilizationEstimate(const float* currColProj, const float* currRowProj,
+                                 float* prevColProj, float* prevRowProj,
+                                 int smallWidth, int smallHeight,
+                                 float factorX, float factorY,
+                                 int fullWidth, int fullHeight,
+                                 float strength,
+                                 bool previousValid,
+                                 StabilizationState* state,
+                                 cudaStream_t stream);
+
+void LaunchStabilizationWarp(uchar4* dst, size_t dstPitchBytes,
+                             const uchar4* src, size_t srcPitchBytes,
+                             int width, int height,
+                             const StabilizationState* state,
+                             cudaStream_t stream);
+
+// autoContrastLevels: device float2 (x=lo, y=hi, normalized 0..1) written by
+// LaunchAutoContrastAnalysis; pass nullptr to disable the auto-contrast remap.
+void LaunchDisplayColorGradeLinear(uchar4* buffer, size_t pitchBytes,
+                                   int width, int height,
+                                   int colorMode, float contrast, float brightness,
+                                   const float2* autoContrastLevels,
+                                   float autoContrastStrength,
+                                   cudaStream_t stream);
+
+// BT.601 limited-range YUV -> BGRA, integer math identical to the CPU
+// converters in src/common/image_processing.cpp.
+void LaunchNv12ToBgraLinear(uchar4* dst, size_t dstPitchBytes,
+                            const unsigned char* yPlane, size_t yPitchBytes,
+                            const unsigned char* uvPlane, size_t uvPitchBytes,
+                            int width, int height,
+                            cudaStream_t stream);
+
+void LaunchYuy2ToBgraLinear(uchar4* dst, size_t dstPitchBytes,
+                            const unsigned char* src, size_t srcPitchBytes,
+                            int width, int height,
+                            cudaStream_t stream);
+
+// Rotate by quarterTurnsClockwise in {1,2,3}. For 1 and 3 the destination is
+// srcHeight x srcWidth; for 2 it matches the source extent.
+void LaunchRotateQuarterLinear(uchar4* dst, size_t dstPitchBytes,
+                               const uchar4* src, size_t srcPitchBytes,
+                               int srcWidth, int srcHeight,
+                               int quarterTurnsClockwise,
+                               cudaStream_t stream);
+
+// homography maps OUTPUT pixel coordinates to SOURCE pixel coordinates
+// (row-major 3x3, uploaded per launch as kernel arguments). Samples bilinearly,
+// black outside the source rect.
+void LaunchKeystoneWarp(uchar4* dst, size_t dstPitchBytes,
+                        const uchar4* src, size_t srcPitchBytes,
+                        int width, int height,
+                        const float homography[9],
+                        cudaStream_t stream);
+
+// Zeroes histogram256 (async) then accumulates a 256-bin luma histogram using
+// shared-memory per-block histograms merged with global atomics.
+void LaunchAutoContrastHistogram(unsigned int* histogram256,
+                                 const uchar4* src, size_t srcPitchBytes,
+                                 int width, int height,
+                                 cudaStream_t stream);
+
+// Single tiny block: derives the 2nd/98th percentile levels from the histogram
+// and low-passes them into `levels` (device float2, normalized 0..1). With
+// levelsValid false the new measurement seeds the state directly.
+void LaunchAutoContrastAnalysis(const unsigned int* histogram256,
+                                int pixelCount,
+                                float2* levels,
+                                bool levelsValid,
+                                cudaStream_t stream);
+
 bool UploadGaussianKernel(int radius, float sigma, cudaStream_t stream);
 
 } // namespace openzoom

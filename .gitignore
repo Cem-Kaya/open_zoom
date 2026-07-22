@@ -36,3 +36,6 @@ Makefile
 /.DS_Store
 Thumbs.db
 /dist/
+/ui ideas/
+/design-qa.md
+/output/

@@ -70,17 +70,40 @@ struct ProcessingSettings {
     CudaBufferFormat stagingFormat{CudaBufferFormat::kRgba8};
     bool enableTemporalSmoothing{false};
     float temporalSmoothingAlpha{0.25f};
+    bool enableStabilization{false};
+    float stabilizationStrength{0.85f};  // 0..1, higher = stronger smoothing
+    int displayColorMode{0};             // 0=Normal,1=Inverted,2=WhiteOnBlack,3=YellowOnBlack,4=BlackOnYellow
+    float contrast{1.0f};                // 0.25..4.0, 1 = neutral
+    float brightness{0.0f};              // -1..1, 0 = neutral
+    bool enableKeystone{false};          // auto-detect projected slide quad, warp fronto-parallel
+    bool enableAutoContrast{false};      // percentile-based level stretch before contrast/brightness
+    float autoContrastStrength{0.7f};    // 0..1, blend toward full stretch
 };
 
+// Input frame description.
+//
+// width/height are ALWAYS the dimensions of the host pixel data as laid out in
+// memory (i.e. pre-rotation). When inputFormat != 0 and rotationQuarterTurns is
+// odd (90/270), the GPU rotates after conversion, so the interop surface (and
+// every processing stage) runs at the POST-rotation dimensions
+// (height x width). The caller must create the surface at the post-rotation
+// size; ProcessFrame validates that.
 struct ProcessingInput {
     const void* hostPixels{nullptr};
     unsigned int hostStrideBytes{0};
     unsigned int pixelSizeBytes{0};
     unsigned int width{0};
     unsigned int height{0};
+    int inputFormat{0};                   // 0=BGRA8 (existing), 1=NV12, 2=YUY2
+    const void* hostPlane2{nullptr};      // NV12 UV plane (nullptr otherwise)
+    unsigned int hostPlane2StrideBytes{0};
+    int rotationQuarterTurns{0};          // 0..3 clockwise, applied on GPU after conversion.
+                                          // Ignored for inputFormat 0 (CPU already rotated BGRA).
 };
 
 #if OPENZOOM_HAS_CUDA_EXT_MEMORY
+struct StabilizationState;
+
 class CudaInteropSurface {
 public:
     explicit CudaInteropSurface(ID3D12Resource* texture, ID3D12Fence* sharedFence = nullptr);
@@ -96,6 +119,8 @@ public:
                       const FenceSyncParams& fenceSync);
     const std::string& LastError() const { return lastError_; }
     void ResetTemporalHistory();
+    void ResetStabilization();
+    void ResetKeystone();
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;
@@ -108,9 +133,23 @@ private:
     void ImportFenceSemaphore(ID3D12Device* device, ID3D12Fence* fence);
     bool EnsureDeviceBuffers(unsigned int width, unsigned int height, CudaBufferFormat format);
     bool EnsureTemporalHistory(unsigned int width, unsigned int height);
+    bool EnsureStabilizationBuffers(unsigned int width, unsigned int height);
+    bool EnsureRawInputBuffers(unsigned int width, unsigned int height, int format);
+    bool EnsurePreRotateBuffer(unsigned int width, unsigned int height);
+    bool EnsureKeystoneResources(unsigned int width, unsigned int height);
+    bool EnsureAutoContrastBuffers();
     void ReleaseDeviceBuffers();
     void ReleaseTemporalHistory();
+    void ReleaseStabilization();
+    void ReleaseRawInput();
+    void ReleaseKeystone();
+    void ReleaseAutoContrast();
     bool EnsureGaussianKernel(int radius, float sigma);
+    void RunKeystoneStage(uchar4*& current, uchar4*& alternate,
+                          size_t& currentPitch, size_t& alternatePitch);
+    void ConsumeKeystoneDetection();
+    void ResetKeystoneCornersToIdentity();
+    void SynchronizeStream() noexcept;
 
     cudaExternalMemory_t externalMemory_{};
     cudaMipmappedArray_t mipArray_{};
@@ -139,6 +178,55 @@ private:
     unsigned int historyWidth_{};
     unsigned int historyHeight_{};
     bool temporalHistoryValid_{};
+    float* deviceStabLuma_{};
+    float* deviceStabColProjCurr_{};
+    float* deviceStabRowProjCurr_{};
+    float* deviceStabColProjPrev_{};
+    float* deviceStabRowProjPrev_{};
+    StabilizationState* deviceStabState_{};
+    unsigned int stabSmallWidth_{};
+    unsigned int stabSmallHeight_{};
+    unsigned int stabFactorX_{};
+    unsigned int stabFactorY_{};
+    unsigned int stabFullWidth_{};
+    unsigned int stabFullHeight_{};
+    bool stabPrevValid_{};
+
+    // Raw camera input (NV12/YUY2) + GPU rotation staging.
+    unsigned char* deviceRawPlane1_{};
+    unsigned char* deviceRawPlane2_{};
+    size_t rawPlane1Pitch_{};
+    size_t rawPlane2Pitch_{};
+    unsigned int rawWidth_{};
+    unsigned int rawHeight_{};
+    int rawFormat_{-1};
+    uchar4* devicePreRotate_{};
+    size_t devicePitchPreRotate_{};
+    unsigned int preRotateWidth_{};
+    unsigned int preRotateHeight_{};
+
+    // Keystone: async small-luma snapshot (device -> pinned host) + CPU quad
+    // detection. Corners are the temporally smoothed source-quad corners in
+    // full-resolution pixels, order TL, TR, BR, BL.
+    float* deviceKeystoneLuma_{};
+    float* hostKeystoneLuma_{};        // pinned (cudaMallocHost)
+    cudaEvent_t keystoneCopyEvent_{};
+    bool keystoneCopyPending_{};
+    unsigned int keystoneSmallWidth_{};
+    unsigned int keystoneSmallHeight_{};
+    unsigned int keystoneFactorX_{};
+    unsigned int keystoneFactorY_{};
+    unsigned int keystoneFullWidth_{};
+    unsigned int keystoneFullHeight_{};
+    float2 keystoneCorners_[4]{};
+    unsigned int keystoneFrameCounter_{};
+    unsigned int keystoneFramesSinceDetection_{};
+
+    // Auto contrast: 256-bin histogram + smoothed lo/hi levels, all device-resident.
+    unsigned int* deviceHistogram_{};
+    float2* deviceAutoLevels_{};
+    bool autoLevelsValid_{};
+
     int cachedKernelRadius_{-1};
     float cachedKernelSigma_{0.0f};
     bool kernelUploaded_{};
@@ -161,6 +249,8 @@ public:
 
     const std::string& LastError() const { static std::string dummy; return dummy; }
     void ResetTemporalHistory() {}
+    void ResetStabilization() {}
+    void ResetKeystone() {}
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;

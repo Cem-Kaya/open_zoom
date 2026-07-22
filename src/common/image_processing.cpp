@@ -5,11 +5,34 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace openzoom {
 namespace processing {
 
 namespace {
+
+constexpr UINT kMaxFrameExtent = 16384;
+constexpr size_t kMaxBgraFrameBytes = 1024ull * 1024ull * 1024ull;
+
+bool CheckedMultiply(size_t left, size_t right, size_t& result)
+{
+    if (left != 0 && right > std::numeric_limits<size_t>::max() / left) {
+        return false;
+    }
+    result = left * right;
+    return true;
+}
+
+bool ValidateDimensions(UINT width, UINT height, size_t& bgraBytes)
+{
+    size_t pixelCount = 0;
+    return width > 0 && height > 0 &&
+           width <= kMaxFrameExtent && height <= kMaxFrameExtent &&
+           CheckedMultiply(static_cast<size_t>(width), height, pixelCount) &&
+           CheckedMultiply(pixelCount, 4u, bgraBytes) &&
+           bgraBytes <= kMaxBgraFrameBytes;
+}
 
 inline int ClampToByte(int value)
 {
@@ -66,7 +89,8 @@ bool ConvertNv12ToBgra(const uint8_t* src,
                        UINT height,
                        std::vector<uint8_t>& dst)
 {
-    if (!src || width == 0 || height == 0) {
+    size_t bgraBytes = 0;
+    if (!src || !ValidateDimensions(width, height, bgraBytes)) {
         return false;
     }
 
@@ -74,15 +98,28 @@ bool ConvertNv12ToBgra(const uint8_t* src,
         strideY = width;
     }
 
-    const size_t yPlaneSize = static_cast<size_t>(strideY) * height;
+    const size_t minimumUvStride = (static_cast<size_t>(width) + 1u) / 2u * 2u;
+    if (static_cast<size_t>(strideY) < std::max(static_cast<size_t>(width), minimumUvStride)) {
+        return false;
+    }
+
+    size_t yPlaneSize = 0;
+    if (!CheckedMultiply(strideY, height, yPlaneSize)) {
+        return false;
+    }
     const size_t uvStride = strideY;
-    const size_t uvPlaneSize = uvStride * ((height + 1) / 2);
+    size_t uvPlaneSize = 0;
+    if (!CheckedMultiply(uvStride, (static_cast<size_t>(height) + 1u) / 2u,
+                         uvPlaneSize) ||
+        yPlaneSize > std::numeric_limits<size_t>::max() - uvPlaneSize) {
+        return false;
+    }
 
     if (srcSize < yPlaneSize + uvPlaneSize) {
         return false;
     }
 
-    dst.resize(static_cast<size_t>(width) * height * 4);
+    dst.resize(bgraBytes);
 
     const uint8_t* yPlane = src;
     const uint8_t* uvPlane = src + yPlaneSize;
@@ -128,20 +165,29 @@ bool ConvertYuy2ToBgra(const uint8_t* src,
                        UINT height,
                        std::vector<uint8_t>& dst)
 {
-    if (!src || width == 0 || height == 0) {
+    size_t bgraBytes = 0;
+    if (!src || !ValidateDimensions(width, height, bgraBytes)) {
         return false;
     }
 
     if (stride == 0) {
-        stride = width * 2;
+        stride = static_cast<UINT>((static_cast<size_t>(width) + 1u) / 2u * 4u);
     }
 
-    const size_t required = static_cast<size_t>(stride) * height;
+    const size_t minimumStride = (static_cast<size_t>(width) + 1u) / 2u * 4u;
+    if (static_cast<size_t>(stride) < minimumStride) {
+        return false;
+    }
+
+    size_t required = 0;
+    if (!CheckedMultiply(stride, height, required)) {
+        return false;
+    }
     if (srcSize < required) {
         return false;
     }
 
-    dst.resize(static_cast<size_t>(width) * height * 4);
+    dst.resize(bgraBytes);
 
     for (UINT y = 0; y < height; ++y) {
         const uint8_t* srcRow = src + static_cast<size_t>(y) * stride;
@@ -175,6 +221,9 @@ bool ConvertYuy2ToBgra(const uint8_t* src,
             dstRow[dstIndex0 + 2] = static_cast<uint8_t>(ClampToByte(r0));
             dstRow[dstIndex0 + 3] = 255;
 
+            if (x + 1 >= width) {
+                continue;
+            }
             dstRow[dstIndex0 + 4] = static_cast<uint8_t>(ClampToByte(b1));
             dstRow[dstIndex0 + 5] = static_cast<uint8_t>(ClampToByte(g1));
             dstRow[dstIndex0 + 6] = static_cast<uint8_t>(ClampToByte(r1));

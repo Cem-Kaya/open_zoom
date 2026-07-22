@@ -25,6 +25,14 @@ if not exist "%BUILD_DIR%" (
 set CONFIG=Release
 set TARGET=dx12_cuda_minimal
 
+rem The sandbox is optional and is not present in every checkout. A missing
+rem harness is a clean skip; a configured harness must still build and pass.
+if not exist "%ROOT_DIR%\sandbox\%TARGET%\CMakeLists.txt" (
+    echo Optional %TARGET% harness is not available; main application build passed.
+    endlocal
+    exit /b 0
+)
+
 rem Build the DX12/CUDA minimal validation target.
 cmake --build "%BUILD_DIR%" --config %CONFIG% --target %TARGET%
 if errorlevel 1 goto :fail

@@ -6,7 +6,11 @@
 #include "openzoom/app/constants.hpp"
 #include "openzoom/app/interaction_controller.hpp"
 #include "openzoom/ui/main_window.hpp"
+#include "openzoom/ui/ai_settings_dialog.hpp"
+#include <QAbstractButton>
 #include <QApplication>
+#include <QDesktopServices>
+#include <QUrl>
 #include <QByteArray>
 #include <QCoreApplication>
 #include <QCheckBox>
@@ -26,6 +30,8 @@
 #include <QToolButton>
 #include <QListWidget>
 #include <QElapsedTimer>
+#include <QFile>
+#include <QFileDialog>
 #include <QDir>
 #include <QDateTime>
 #include <QImage>
@@ -37,7 +43,13 @@
 #include <QShowEvent>
 #include <QDebug>
 #include <QInputDialog>
+#include <QJsonArray>
+#include <QJsonObject>
 #include <QMessageBox>
+#include <QMetaObject>
+#include <QPlainTextEdit>
+#include <QTextBrowser>
+#include <QTextCursor>
 
 #include <windows.h>
 #include <combaseapi.h>
@@ -260,6 +272,12 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     assistiveRuntime_ = std::make_unique<AssistiveRuntime>(this);
     connect(assistiveRuntime_.get(), &AssistiveRuntime::OverlayUpdated,
             this, &OpenZoomApp::OnAssistiveOverlayUpdated);
+    connect(assistiveOverlay_, &AssistiveOverlay::Dismissed,
+            assistiveRuntime_.get(), &AssistiveRuntime::DismissOverlay);
+    connect(assistiveOverlay_, &AssistiveOverlay::ReadAloudRequested,
+            assistiveRuntime_.get(), &AssistiveRuntime::ReadAloud);
+    connect(assistiveOverlay_, &AssistiveOverlay::QuestionSubmitted,
+            this, &OpenZoomApp::SubmitFloatingAssistantPrompt);
     interactionController_ = std::make_unique<InteractionController>(*this);
     settingsPath_ = settings::ResolveSettingsPath();
     if (auto loadedSettings = settings::Load(settingsPath_)) {
@@ -316,6 +334,31 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     spatialSharpnessSlider_ = mainWindow_->spatialSharpnessSlider();
     spatialSharpnessValueLabel_ = mainWindow_->spatialSharpnessValueLabel();
     processingStatusLabel_ = mainWindow_->processingStatusLabel();
+    stabilizationCheckbox_ = mainWindow_->stabilizationCheckbox();
+    stabilizationStrengthSlider_ = mainWindow_->stabilizationStrengthSlider();
+    keystoneCheckbox_ = mainWindow_->keystoneCheckbox();
+    autoContrastCheckbox_ = mainWindow_->autoContrastCheckbox();
+    autoContrastStrengthSlider_ = mainWindow_->autoContrastStrengthSlider();
+    displayColorCombo_ = mainWindow_->displayColorCombo();
+    contrastSlider_ = mainWindow_->contrastSlider();
+    brightnessSlider_ = mainWindow_->brightnessSlider();
+    explainNowButton_ = mainWindow_->explainNowButton();
+    readTextButton_ = mainWindow_->readTextButton();
+    aiSettingsButton_ = mainWindow_->aiSettingsButton();
+    openNotesButton_ = mainWindow_->openNotesButton();
+    assistantConnectionLabel_ = mainWindow_->assistantConnectionLabel();
+    assistantUsageLabel_ = mainWindow_->assistantUsageLabel();
+    assistantConnectButton_ = mainWindow_->assistantConnectButton();
+    assistantTranscript_ = mainWindow_->assistantTranscript();
+    assistantPromptEdit_ = mainWindow_->assistantPromptEdit();
+    assistantAttachFrameCheckbox_ = mainWindow_->assistantAttachFrameCheckbox();
+    assistantSendButton_ = mainWindow_->assistantSendButton();
+    assistantStopButton_ = mainWindow_->assistantStopButton();
+    assistantNewButton_ = mainWindow_->assistantNewButton();
+    assistantHistoryList_ = mainWindow_->assistantHistoryList();
+    assistantRenameButton_ = mainWindow_->assistantRenameButton();
+    assistantExportButton_ = mainWindow_->assistantExportButton();
+    assistantDeleteButton_ = mainWindow_->assistantDeleteButton();
 
     joystickOverlay_ = new JoystickOverlay(renderWidget_);
     connect(joystickOverlay_, &JoystickOverlay::JoystickChanged,
@@ -367,6 +410,24 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
     }
     if (focusMarkerCheckbox_) {
         focusMarkerEnabled_ = focusMarkerCheckbox_->isChecked();
+    }
+    stabilizationEnabled_ = stabilizationCheckbox_ ? stabilizationCheckbox_->isChecked() : false;
+    if (stabilizationStrengthSlider_) {
+        stabilizationStrength_ = std::clamp(static_cast<float>(stabilizationStrengthSlider_->value()) / 100.0f, 0.0f, 0.98f);
+    }
+    keystoneEnabled_ = keystoneCheckbox_ ? keystoneCheckbox_->isChecked() : false;
+    autoContrastEnabled_ = autoContrastCheckbox_ ? autoContrastCheckbox_->isChecked() : false;
+    if (autoContrastStrengthSlider_) {
+        autoContrastStrength_ = std::clamp(static_cast<float>(autoContrastStrengthSlider_->value()) / 100.0f, 0.0f, 1.0f);
+    }
+    if (displayColorCombo_) {
+        displayColorMode_ = std::clamp(displayColorCombo_->currentIndex(), 0, 4);
+    }
+    if (contrastSlider_) {
+        contrast_ = std::clamp(static_cast<float>(contrastSlider_->value()) / 100.0f, 0.25f, 4.0f);
+    }
+    if (brightnessSlider_) {
+        brightness_ = std::clamp(static_cast<float>(brightnessSlider_->value()) / 100.0f, -1.0f, 1.0f);
     }
 
     PopulateCameraCombo();
@@ -420,11 +481,11 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
                 recordingFrameCount_ = 0;
                 recordingTimer_.restart();
                 recording_ = true;
-                recordButton_->setText(QStringLiteral("Stop Recording"));
+                recordButton_->setText(QStringLiteral("Stop"));
             } else {
                 recording_ = false;
                 videoRecorder_.Stop();
-                recordButton_->setText(QStringLiteral("Start Recording"));
+                recordButton_->setText(QStringLiteral("Record"));
             }
         });
     }
@@ -500,8 +561,328 @@ OpenZoomApp::OpenZoomApp(int& argc, char** argv)
         connect(focusMarkerCheckbox_, &QCheckBox::toggled,
                 this, &OpenZoomApp::OnFocusMarkerToggled);
     }
+    if (stabilizationCheckbox_) {
+        connect(stabilizationCheckbox_, &QCheckBox::toggled,
+                this, &OpenZoomApp::OnStabilizationToggled);
+    }
+    if (stabilizationStrengthSlider_) {
+        connect(stabilizationStrengthSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnStabilizationStrengthChanged);
+    }
+    if (keystoneCheckbox_) {
+        connect(keystoneCheckbox_, &QCheckBox::toggled,
+                this, &OpenZoomApp::OnKeystoneToggled);
+    }
+    if (autoContrastCheckbox_) {
+        connect(autoContrastCheckbox_, &QCheckBox::toggled,
+                this, &OpenZoomApp::OnAutoContrastToggled);
+    }
+    if (autoContrastStrengthSlider_) {
+        connect(autoContrastStrengthSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnAutoContrastStrengthChanged);
+    }
+    if (displayColorCombo_) {
+        connect(displayColorCombo_, &QComboBox::currentIndexChanged,
+                this, &OpenZoomApp::OnDisplayColorModeChanged);
+    }
+    if (contrastSlider_) {
+        connect(contrastSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnContrastChanged);
+    }
+    if (brightnessSlider_) {
+        connect(brightnessSlider_, &QSlider::valueChanged,
+                this, &OpenZoomApp::OnBrightnessChanged);
+    }
+    // Simple/Advanced mode buttons: the MainWindow wires the page switch
+    // internally; here we only track the state for persistence and expand the
+    // advanced tuning panel when the advanced page is entered.
+    if (QAbstractButton* simpleButton = mainWindow_->simpleModeButton()) {
+        connect(simpleButton, &QAbstractButton::toggled, this, [this](bool checked) {
+            if (checked) {
+                simpleUiMode_ = true;
+                persistentSettings_.simpleUiMode = true;
+            }
+        });
+    }
+    if (QAbstractButton* advancedButton = mainWindow_->advancedModeButton()) {
+        connect(advancedButton, &QAbstractButton::toggled, this, [this](bool checked) {
+            if (checked) {
+                simpleUiMode_ = false;
+                persistentSettings_.simpleUiMode = false;
+                if (collapseButton_ && !collapseButton_->isChecked()) {
+                    collapseButton_->setChecked(true);
+                }
+            }
+        });
+    }
+    if (explainNowButton_) {
+        connect(explainNowButton_, &QPushButton::clicked,
+                this, [this]() {
+                    if (assistiveRuntime_ && assistiveRuntime_->IsCodexTurnActive()) {
+                        assistiveRuntime_->StopAssistant();
+                    } else {
+                        SubmitOnDemandAnalysis(false, true);
+                    }
+                });
+    }
+    if (readTextButton_) {
+        connect(readTextButton_, &QPushButton::clicked,
+                this, [this]() { SubmitOnDemandAnalysis(true, false); });
+    }
+    if (aiSettingsButton_) {
+        connect(aiSettingsButton_, &QPushButton::clicked,
+                this, [this]() { OpenAiSettingsDialog(); });
+    }
+    if (openNotesButton_) {
+        connect(openNotesButton_, &QPushButton::clicked,
+                this, [this]() { OpenNotesFile(); });
+    }
+    if (assistantConnectButton_) {
+        connect(assistantConnectButton_, &QPushButton::clicked,
+                this, [this]() { assistiveRuntime_->StartCodexLogin(); });
+    }
+    if (assistantSendButton_) {
+        connect(assistantSendButton_, &QPushButton::clicked,
+                this, [this]() { SubmitAssistantPrompt(); });
+    }
+    if (assistantStopButton_) {
+        connect(assistantStopButton_, &QPushButton::clicked,
+                this, [this]() { assistiveRuntime_->StopAssistant(); });
+    }
+    if (assistantNewButton_) {
+        connect(assistantNewButton_, &QPushButton::clicked, this, [this]() {
+            if (assistiveRuntime_->IsCodexTurnActive()) {
+                return;
+            }
+            currentAssistantThreadId_.clear();
+            pendingAssistantPrompt_.clear();
+            assistantResponseOpen_ = false;
+            assistantResponseReceivedText_ = false;
+            assistantTranscript_->clear();
+            assistantHistoryList_->clearSelection();
+            assistantPromptEdit_->setFocus();
+        });
+    }
+    if (assistantHistoryList_) {
+        connect(assistantHistoryList_, &QListWidget::itemDoubleClicked,
+                this, [this](QListWidgetItem*) { LoadSelectedAssistantConversation(); });
+        connect(assistantHistoryList_, &QListWidget::itemActivated,
+                this, [this](QListWidgetItem*) { LoadSelectedAssistantConversation(); });
+    }
+    if (assistantRenameButton_) {
+        connect(assistantRenameButton_, &QPushButton::clicked, this, [this]() {
+            QListWidgetItem* item = assistantHistoryList_->currentItem();
+            if (!item) {
+                return;
+            }
+            const QString threadId = item->data(Qt::UserRole).toString();
+            const QString oldName = item->data(Qt::UserRole + 1).toString();
+            bool accepted = false;
+            const QString name = QInputDialog::getText(mainWindow_.get(),
+                                                       QStringLiteral("Rename Conversation"),
+                                                       QStringLiteral("Name:"),
+                                                       QLineEdit::Normal,
+                                                       oldName,
+                                                       &accepted).trimmed();
+            if (accepted && !name.isEmpty()) {
+                assistiveRuntime_->RenameAssistantConversation(threadId, name);
+            }
+        });
+    }
+    if (assistantExportButton_) {
+        connect(assistantExportButton_, &QPushButton::clicked, this, [this]() {
+            if (!assistantTranscript_ || assistantTranscript_->toPlainText().trimmed().isEmpty()) {
+                return;
+            }
+            const QString suggested = QDir(EnsureOutputSubdir(QStringLiteral("assistant")))
+                                          .filePath(QStringLiteral("OpenZoom_Assistant_%1.txt")
+                                                        .arg(QDateTime::currentDateTime().toString(
+                                                            QStringLiteral("yyyyMMdd_HHmmss"))));
+            const QString path = QFileDialog::getSaveFileName(mainWindow_.get(),
+                                                               QStringLiteral("Export Conversation"),
+                                                               suggested,
+                                                               QStringLiteral("Text Files (*.txt);;All Files (*)"));
+            if (path.isEmpty()) {
+                return;
+            }
+            QFile file(path);
+            if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
+                file.write(assistantTranscript_->toPlainText().toUtf8());
+            }
+        });
+    }
+    if (assistantDeleteButton_) {
+        connect(assistantDeleteButton_, &QPushButton::clicked, this, [this]() {
+            QListWidgetItem* item = assistantHistoryList_->currentItem();
+            if (!item) {
+                return;
+            }
+            const QString threadId = item->data(Qt::UserRole).toString();
+            if (QMessageBox::question(mainWindow_.get(),
+                                      QStringLiteral("Delete Conversation"),
+                                      QStringLiteral("Permanently delete this OpenZoom assistant conversation?"))
+                == QMessageBox::Yes) {
+                assistiveRuntime_->DeleteAssistantConversation(threadId);
+            }
+        });
+    }
+
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::CodexServerStateChanged,
+            this, [this](bool ready, const QString& status) {
+                codexReady_ = ready;
+                assistantConnectionLabel_->setText(status);
+                SetAssistantBusy(assistiveRuntime_->IsCodexTurnActive());
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::CodexAccountChanged,
+            this, [this](bool signedIn, const QString& label, const QString& planType) {
+                codexSignedIn_ = signedIn;
+                const QString plan = planType.trimmed();
+                assistantConnectionLabel_->setText(plan.isEmpty()
+                                                       ? label
+                                                       : QStringLiteral("%1 (%2)").arg(label, plan));
+                assistantConnectButton_->setText(signedIn ? QStringLiteral("Reconnect ChatGPT")
+                                                          : QStringLiteral("Connect ChatGPT"));
+                SetAssistantBusy(assistiveRuntime_->IsCodexTurnActive());
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::CodexModelsChanged,
+            this, [this](const QStringList&, const QString& selectedModel) {
+                if (!selectedModel.isEmpty()) {
+                    assistantConnectionLabel_->setToolTip(
+                        QStringLiteral("Vision model: %1").arg(selectedModel));
+                }
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::CodexRateLimitChanged,
+            this, [this](const QString& summary) { assistantUsageLabel_->setText(summary); });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::CodexLoginUrlReady,
+            this, [](const QUrl& url) { QDesktopServices::openUrl(url); });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::AssistantConversationCreated,
+            this, [this](const QJsonObject& thread) {
+                settings::CodexConversation conversation;
+                conversation.threadId = thread.value(QStringLiteral("id")).toString();
+                conversation.preview = pendingAssistantPrompt_.left(160);
+                conversation.title = pendingAssistantPrompt_.simplified().left(60);
+                if (conversation.title.isEmpty()) {
+                    conversation.title = QStringLiteral("OpenZoom Assistant");
+                }
+                conversation.createdAt = thread.value(QStringLiteral("createdAt")).toInteger(
+                    QDateTime::currentSecsSinceEpoch());
+                conversation.updatedAt = conversation.createdAt;
+                const auto existing = std::find_if(
+                    persistentSettings_.codexConversations.begin(),
+                    persistentSettings_.codexConversations.end(),
+                    [&conversation](const settings::CodexConversation& candidate) {
+                        return candidate.threadId == conversation.threadId;
+                    });
+                if (existing == persistentSettings_.codexConversations.end()) {
+                    persistentSettings_.codexConversations.push_back(conversation);
+                }
+                currentAssistantThreadId_ = conversation.threadId;
+                PopulateAssistantHistory();
+                SavePersistentSettings();
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::AssistantTranscriptLoaded,
+            this, [this](const QString& threadId, const QJsonArray& messages) {
+                currentAssistantThreadId_ = threadId;
+                assistantTranscript_->clear();
+                for (const QJsonValue& value : messages) {
+                    const QJsonObject message = value.toObject();
+                    const QString speaker = message.value(QStringLiteral("role")).toString()
+                                                    == QStringLiteral("user")
+                                                ? QStringLiteral("You")
+                                                : QStringLiteral("OpenZoom Assistant");
+                    AppendAssistantMessage(speaker, message.value(QStringLiteral("text")).toString());
+                }
+                assistantResponseOpen_ = false;
+                assistantResponseReceivedText_ = false;
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::AssistantConversationRenamed,
+            this, [this](const QString& threadId, const QString& name) {
+                for (settings::CodexConversation& conversation : persistentSettings_.codexConversations) {
+                    if (conversation.threadId == threadId) {
+                        conversation.title = name;
+                        conversation.updatedAt = QDateTime::currentSecsSinceEpoch();
+                        break;
+                    }
+                }
+                PopulateAssistantHistory();
+                SavePersistentSettings();
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::AssistantConversationDeleted,
+            this, [this](const QString& threadId) {
+                std::erase_if(persistentSettings_.codexConversations,
+                              [&threadId](const settings::CodexConversation& conversation) {
+                                  return conversation.threadId == threadId;
+                              });
+                if (currentAssistantThreadId_ == threadId) {
+                    currentAssistantThreadId_.clear();
+                    assistantTranscript_->clear();
+                }
+                PopulateAssistantHistory();
+                SavePersistentSettings();
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::AssistantTurnStarted,
+            this, [this](const QString&, const QString&, bool persistent) {
+                SetAssistantBusy(true);
+                if (!persistent && explainNowButton_) {
+                    explainNowButton_->setText(QStringLiteral("Stop"));
+                }
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::AssistantTextDelta,
+            this, [this](const QString& threadId, const QString&, const QString& delta) {
+                if (!assistantResponseOpen_ ||
+                    (!currentAssistantThreadId_.isEmpty() && threadId != currentAssistantThreadId_)) {
+                    return;
+                }
+                QTextCursor cursor = assistantTranscript_->textCursor();
+                cursor.movePosition(QTextCursor::End);
+                cursor.insertText(delta);
+                assistantTranscript_->setTextCursor(cursor);
+                assistantTranscript_->ensureCursorVisible();
+                assistantResponseReceivedText_ = true;
+            });
+    connect(assistiveRuntime_.get(), &AssistiveRuntime::AssistantTurnFinished,
+            this,
+            [this](const QString& threadId,
+                   const QString&,
+                   const QString& text,
+                   const QString& error,
+                   bool interrupted,
+                   bool persistent) {
+                SetAssistantBusy(false);
+                if (explainNowButton_) {
+                    explainNowButton_->setText(QStringLiteral("Explain"));
+                }
+                if (!persistent) {
+                    return;
+                }
+                if (assistantResponseOpen_) {
+                    QTextCursor cursor = assistantTranscript_->textCursor();
+                    cursor.movePosition(QTextCursor::End);
+                    if (!assistantResponseReceivedText_ && !text.trimmed().isEmpty()) {
+                        cursor.insertText(text.trimmed());
+                    }
+                    if (!error.trimmed().isEmpty()) {
+                        cursor.insertText(QStringLiteral("\n%1").arg(error.trimmed()));
+                    } else if (interrupted) {
+                        cursor.insertText(QStringLiteral("\nStopped."));
+                    }
+                    cursor.insertText(QStringLiteral("\n\n"));
+                    assistantTranscript_->setTextCursor(cursor);
+                }
+                assistantResponseOpen_ = false;
+                assistantResponseReceivedText_ = false;
+                for (settings::CodexConversation& conversation : persistentSettings_.codexConversations) {
+                    if (conversation.threadId == threadId) {
+                        conversation.updatedAt = QDateTime::currentSecsSinceEpoch();
+                        break;
+                    }
+                }
+                PopulateAssistantHistory();
+                SavePersistentSettings();
+            });
 
     ApplyPersistentSettings(persistentSettings_);
+    PopulateAssistantHistory();
 
     UpdateBlurUiLabels();
     UpdateTemporalSmoothUi();
@@ -551,6 +932,9 @@ OpenZoomApp::~OpenZoomApp() {
     renderWidget_ = nullptr;
     assistiveOverlay_ = nullptr;
     joystickOverlay_ = nullptr;
+    if (presenter_) {
+        presenter_->WaitForIdle();
+    }
     cudaSurface_.reset();
     cudaSharedTexture_.Reset();
     presenter_.reset();
@@ -597,10 +981,17 @@ settings::AdvancedConfig OpenZoomApp::CaptureCurrentAdvancedConfig() const
     config.spatialSharpness = spatialSharpness_;
     config.debugView = debugViewEnabled_;
     config.focusMarker = focusMarkerEnabled_;
-    config.rotationQuarterTurns = rotationQuarterTurns_;
     config.ocrAssistEnabled = ocrAssistEnabled_;
     config.vlmAssistEnabled = vlmAssistEnabled_;
     config.assistiveOverlayEnabled = assistiveOverlayEnabled_;
+    config.stabilizationEnabled = stabilizationEnabled_;
+    config.stabilizationStrength = stabilizationStrength_;
+    config.displayColorMode = displayColorMode_;
+    config.contrast = contrast_;
+    config.brightness = brightness_;
+    config.keystoneEnabled = keystoneEnabled_;
+    config.autoContrastEnabled = autoContrastEnabled_;
+    config.autoContrastStrength = autoContrastStrength_;
     return config;
 }
 
@@ -630,10 +1021,17 @@ void OpenZoomApp::PopulatePresetList()
     presetSelectionSyncSuspended_ = false;
 }
 
-void OpenZoomApp::RefreshPresetSelection()
+void OpenZoomApp::RefreshPresetSelection(bool preserveCurrentSelection)
 {
     QString matchedPresetId;
     const settings::AdvancedConfig current = CaptureCurrentAdvancedConfig();
+
+    if (preserveCurrentSelection &&
+        settings::ResolveConfigForPreset(persistentSettings_.selectedPresetId,
+                                         persistentSettings_.customConfigs,
+                                         persistentSettings_.customPresets)) {
+        matchedPresetId = persistentSettings_.selectedPresetId;
+    }
 
     auto maybeMatch = [&](const settings::PresetDefinition& preset) {
         auto config = settings::ResolveConfigForPreset(preset.id,
@@ -646,9 +1044,11 @@ void OpenZoomApp::RefreshPresetSelection()
         return false;
     };
 
-    for (const settings::PresetDefinition& preset : settings::BuiltInPresets()) {
-        if (maybeMatch(preset)) {
-            break;
+    if (matchedPresetId.isEmpty()) {
+        for (const settings::PresetDefinition& preset : settings::BuiltInPresets()) {
+            if (maybeMatch(preset)) {
+                break;
+            }
         }
     }
     if (matchedPresetId.isEmpty()) {
@@ -716,13 +1116,15 @@ void OpenZoomApp::UpdatePresetDescription()
     presetDescriptionLabel_->setText(text + QStringLiteral("\n") + assistiveText);
 }
 
-void OpenZoomApp::SyncCurrentConfigToPersistence()
+void OpenZoomApp::SyncCurrentConfigToPersistence(bool preservePresetSelection)
 {
     if (configTrackingSuspended_) {
         return;
     }
     persistentSettings_.currentConfig = CaptureCurrentAdvancedConfig();
-    RefreshPresetSelection();
+    if (!preservePresetSelection) {
+        RefreshPresetSelection();
+    }
     if (persistentSettings_.selectedPresetId.isEmpty()) {
         persistentSettings_.currentConfig.id = QStringLiteral("current-live");
         persistentSettings_.currentConfig.name = QStringLiteral("Current Setup");
@@ -811,6 +1213,66 @@ void OpenZoomApp::ApplyAdvancedConfig(const settings::AdvancedConfig& config)
     OnTemporalSmoothToggled(temporalSmoothEnabled_);
     OnTemporalSmoothStrengthChanged(static_cast<int>(std::round(temporalSmoothAlpha_ * 100.0f)));
 
+    if (stabilizationCheckbox_) {
+        QSignalBlocker block(stabilizationCheckbox_);
+        stabilizationCheckbox_->setChecked(config.stabilizationEnabled);
+    }
+    stabilizationEnabled_ = config.stabilizationEnabled;
+    stabilizationStrength_ = std::clamp(config.stabilizationStrength, 0.0f, 0.98f);
+    if (stabilizationStrengthSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(stabilizationStrength_ * 100.0f)),
+                                           stabilizationStrengthSlider_->minimum(), stabilizationStrengthSlider_->maximum());
+        QSignalBlocker block(stabilizationStrengthSlider_);
+        stabilizationStrengthSlider_->setValue(sliderValue);
+    }
+    OnStabilizationToggled(stabilizationEnabled_);
+    OnStabilizationStrengthChanged(static_cast<int>(std::round(stabilizationStrength_ * 100.0f)));
+
+    if (keystoneCheckbox_) {
+        QSignalBlocker block(keystoneCheckbox_);
+        keystoneCheckbox_->setChecked(config.keystoneEnabled);
+    }
+    keystoneEnabled_ = config.keystoneEnabled;
+    OnKeystoneToggled(keystoneEnabled_);
+
+    if (autoContrastCheckbox_) {
+        QSignalBlocker block(autoContrastCheckbox_);
+        autoContrastCheckbox_->setChecked(config.autoContrastEnabled);
+    }
+    autoContrastEnabled_ = config.autoContrastEnabled;
+    autoContrastStrength_ = std::clamp(config.autoContrastStrength, 0.0f, 1.0f);
+    if (autoContrastStrengthSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(autoContrastStrength_ * 100.0f)),
+                                           autoContrastStrengthSlider_->minimum(), autoContrastStrengthSlider_->maximum());
+        QSignalBlocker block(autoContrastStrengthSlider_);
+        autoContrastStrengthSlider_->setValue(sliderValue);
+    }
+    OnAutoContrastToggled(autoContrastEnabled_);
+    OnAutoContrastStrengthChanged(static_cast<int>(std::round(autoContrastStrength_ * 100.0f)));
+
+    displayColorMode_ = std::clamp(config.displayColorMode, 0, 4);
+    if (displayColorCombo_) {
+        QSignalBlocker block(displayColorCombo_);
+        displayColorCombo_->setCurrentIndex(displayColorMode_);
+    }
+    contrast_ = std::clamp(config.contrast, 0.25f, 4.0f);
+    if (contrastSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(contrast_ * 100.0f)),
+                                           contrastSlider_->minimum(), contrastSlider_->maximum());
+        QSignalBlocker block(contrastSlider_);
+        contrastSlider_->setValue(sliderValue);
+    }
+    brightness_ = std::clamp(config.brightness, -1.0f, 1.0f);
+    if (brightnessSlider_) {
+        const int sliderValue = std::clamp(static_cast<int>(std::round(brightness_ * 100.0f)),
+                                           brightnessSlider_->minimum(), brightnessSlider_->maximum());
+        QSignalBlocker block(brightnessSlider_);
+        brightnessSlider_->setValue(sliderValue);
+    }
+    OnDisplayColorModeChanged(displayColorMode_);
+    OnContrastChanged(static_cast<int>(std::round(contrast_ * 100.0f)));
+    OnBrightnessChanged(static_cast<int>(std::round(brightness_ * 100.0f)));
+
     if (ocrAssistCheckbox_) {
         QSignalBlocker block(ocrAssistCheckbox_);
         ocrAssistCheckbox_->setChecked(config.ocrAssistEnabled);
@@ -863,12 +1325,6 @@ void OpenZoomApp::ApplyAdvancedConfig(const settings::AdvancedConfig& config)
     focusMarkerEnabled_ = config.focusMarker;
     OnFocusMarkerToggled(focusMarkerEnabled_);
 
-    rotationQuarterTurns_ = config.rotationQuarterTurns % 4;
-    if (rotationQuarterTurns_ < 0) {
-        rotationQuarterTurns_ += 4;
-    }
-    UpdateRotationUi();
-
     configTrackingSuspended_ = false;
     SyncCurrentConfigToPersistence();
     UpdateProcessingStatusLabel();
@@ -915,7 +1371,7 @@ void OpenZoomApp::PromoteCurrentConfigToPreset()
     persistentSettings_.selectedPresetId = preset.id;
 
     PopulatePresetList();
-    RefreshPresetSelection();
+    RefreshPresetSelection(true);
     UpdatePresetDescription();
 }
 
@@ -971,6 +1427,277 @@ void OpenZoomApp::MaybeRequestAssistiveAnalysis(const uint8_t* data, UINT width,
     assistiveRuntime_->SubmitFrame(data, static_cast<int>(width), static_cast<int>(height));
 }
 
+AssistiveRuntimeConfig OpenZoomApp::BuildAssistiveRuntimeConfig() const
+{
+    const settings::AssistiveSettings& assistive = persistentSettings_.assistive;
+    AssistiveRuntimeConfig cfg;
+    cfg.aiProvider = assistive.aiProvider;
+    cfg.codexExecutablePath = assistive.codexExecutablePath;
+    cfg.codexModel = assistive.codexModel;
+    cfg.codexReasoningEffort = assistive.codexReasoningEffort;
+    cfg.codexInternetEnabled = assistive.codexInternetEnabled;
+    cfg.codexCodingEnabled = assistive.codexCodingEnabled;
+    cfg.codexWorkspaceDirectory = assistive.codexWorkspaceDirectory;
+    cfg.assistantInstructions = assistive.assistantInstructions;
+    cfg.vlmApiUrl = assistive.vlmApiUrl;
+    cfg.vlmApiKey = assistive.vlmApiKey;
+    cfg.vlmModel = assistive.vlmModel;
+    cfg.vlmPrompt = assistive.vlmPrompt;
+    cfg.tesseractPath = assistive.tesseractPath;
+    cfg.ocrLanguage = assistive.ocrLanguage;
+    cfg.ttsEngine = assistive.ttsEngine;
+    cfg.ttsVoiceName = assistive.ttsVoiceName;
+    cfg.ttsVoiceLocale = assistive.ttsVoiceLocale;
+    cfg.ttsRate = assistive.ttsRate;
+    cfg.lectureNotesEnabled = assistive.lectureNotesEnabled;
+    cfg.notesDirectory = QDir(QCoreApplication::applicationDirPath()).filePath(QStringLiteral("output/notes"));
+    return cfg;
+}
+
+void OpenZoomApp::ApplyAssistiveSettingsToRuntime()
+{
+    if (assistiveRuntime_) {
+        assistiveRuntime_->SetConfig(BuildAssistiveRuntimeConfig());
+    }
+}
+
+void OpenZoomApp::OpenAiSettingsDialog()
+{
+    if (!mainWindow_) {
+        return;
+    }
+    AiSettingsDialog dialog(persistentSettings_.assistive, mainWindow_.get());
+    if (dialog.exec() == QDialog::Accepted) {
+        persistentSettings_.assistive = dialog.result();
+        ApplyAssistiveSettingsToRuntime();
+        SavePersistentSettings();
+    }
+}
+
+void OpenZoomApp::OpenNotesFile()
+{
+    const QString path = assistiveRuntime_ ? assistiveRuntime_->notesFilePath() : QString();
+    if (path.isEmpty()) {
+        if (processingStatusLabel_) {
+            processingStatusLabel_->setText(
+                QStringLiteral("No lecture notes yet — notes appear once OCR or Explain produces text."));
+        }
+        qInfo() << "Open notes skipped: no notes file written yet";
+        return;
+    }
+    QDesktopServices::openUrl(QUrl::fromLocalFile(path));
+}
+
+void OpenZoomApp::SubmitOnDemandAnalysis(bool runOcr, bool runVlm)
+{
+    if (!assistiveRuntime_) {
+        return;
+    }
+
+    // Prefer the processed GPU output, using the same readback path as the
+    // periodic assistive loop.
+    if (usingCudaLastFrame_ && cudaSharedTexture_ && presenter_ &&
+        processedFrameWidth_ > 0 && processedFrameHeight_ > 0 &&
+        presenter_->ReadbackTexture(cudaSharedTexture_.Get(),
+                                    processedFrameWidth_,
+                                    processedFrameHeight_,
+                                    assistiveBuffer_)) {
+        assistiveRuntime_->SubmitFrameForced(assistiveBuffer_.data(),
+                                             static_cast<int>(processedFrameWidth_),
+                                             static_cast<int>(processedFrameHeight_),
+                                             runOcr, runVlm);
+        return;
+    }
+
+    // Fall back to the CPU-converted presentation frame when GPU readback is
+    // unavailable (passthrough or debug view).
+    if (!presentationBuffer_.empty() && presentationWidth_ > 0 && presentationHeight_ > 0) {
+        assistiveRuntime_->SubmitFrameForced(presentationBuffer_.data(),
+                                             static_cast<int>(presentationWidth_),
+                                             static_cast<int>(presentationHeight_),
+                                             runOcr, runVlm);
+        return;
+    }
+
+    qWarning() << "On-demand analysis skipped: no frame available";
+}
+
+void OpenZoomApp::SubmitAssistantPrompt()
+{
+    if (!assistiveRuntime_ || !assistantPromptEdit_ || assistiveRuntime_->IsCodexTurnActive()) {
+        return;
+    }
+    const QString prompt = assistantPromptEdit_->toPlainText().trimmed();
+    if (prompt.isEmpty()) {
+        assistantPromptEdit_->setFocus();
+        return;
+    }
+    SubmitAssistantPromptText(prompt, true, false);
+}
+
+void OpenZoomApp::SubmitFloatingAssistantPrompt(const QString& prompt)
+{
+    if (prompt.trimmed().isEmpty()) {
+        return;
+    }
+    SubmitAssistantPromptText(prompt.trimmed(), false, true);
+}
+
+void OpenZoomApp::SubmitAssistantPromptText(const QString& prompt,
+                                            bool clearAdvancedEditor,
+                                            bool forceAttachFrame)
+{
+    if (!assistiveRuntime_ || prompt.trimmed().isEmpty() || assistiveRuntime_->IsCodexTurnActive()) {
+        return;
+    }
+    const bool attachFrame = forceAttachFrame ||
+                             (assistantAttachFrameCheckbox_ && assistantAttachFrameCheckbox_->isChecked());
+    const uint8_t* data = nullptr;
+    int width = 0;
+    int height = 0;
+    if (attachFrame && usingCudaLastFrame_ && cudaSharedTexture_ && presenter_ &&
+        processedFrameWidth_ > 0 && processedFrameHeight_ > 0 &&
+        presenter_->ReadbackTexture(cudaSharedTexture_.Get(),
+                                    processedFrameWidth_,
+                                    processedFrameHeight_,
+                                    assistiveBuffer_)) {
+        data = assistiveBuffer_.data();
+        width = static_cast<int>(processedFrameWidth_);
+        height = static_cast<int>(processedFrameHeight_);
+    } else if (attachFrame && !presentationBuffer_.empty() &&
+               presentationWidth_ > 0 && presentationHeight_ > 0) {
+        data = presentationBuffer_.data();
+        width = static_cast<int>(presentationWidth_);
+        height = static_cast<int>(presentationHeight_);
+    }
+
+    const QString submittedPrompt = prompt.trimmed();
+    pendingAssistantPrompt_ = submittedPrompt;
+    AppendAssistantMessage(QStringLiteral("You"), submittedPrompt);
+    QTextCursor cursor = assistantTranscript_->textCursor();
+    cursor.movePosition(QTextCursor::End);
+    cursor.insertText(QStringLiteral("OpenZoom Assistant\n"));
+    assistantTranscript_->setTextCursor(cursor);
+    assistantResponseOpen_ = true;
+    assistantResponseReceivedText_ = false;
+    if (clearAdvancedEditor && assistantPromptEdit_) {
+        assistantPromptEdit_->clear();
+    }
+    SetAssistantBusy(true);
+    assistiveRuntime_->SubmitAssistantPrompt(submittedPrompt,
+                                             currentAssistantThreadId_,
+                                             data,
+                                             width,
+                                             height,
+                                             attachFrame);
+}
+
+void OpenZoomApp::PopulateAssistantHistory()
+{
+    if (!assistantHistoryList_) {
+        return;
+    }
+    QSignalBlocker blocker(assistantHistoryList_);
+    assistantHistoryList_->clear();
+    std::vector<const settings::CodexConversation*> conversations;
+    conversations.reserve(persistentSettings_.codexConversations.size());
+    for (const settings::CodexConversation& conversation : persistentSettings_.codexConversations) {
+        conversations.push_back(&conversation);
+    }
+    std::sort(conversations.begin(), conversations.end(),
+              [](const settings::CodexConversation* lhs, const settings::CodexConversation* rhs) {
+                  return lhs->updatedAt > rhs->updatedAt;
+              });
+    for (const settings::CodexConversation* conversation : conversations) {
+        const qint64 timestamp = conversation->updatedAt > 0
+                                     ? conversation->updatedAt
+                                     : conversation->createdAt;
+        const QString timeText = timestamp > 0
+                                     ? QDateTime::fromSecsSinceEpoch(timestamp).toString(
+                                           QStringLiteral("yyyy-MM-dd  HH:mm"))
+                                     : QString();
+        const QString title = conversation->title.trimmed().isEmpty()
+                                  ? QStringLiteral("OpenZoom Assistant")
+                                  : conversation->title.trimmed();
+        const QString preview = conversation->preview.simplified().left(110);
+        auto* item = new QListWidgetItem(
+            QStringLiteral("%1\n%2%3")
+                .arg(title,
+                     timeText,
+                     preview.isEmpty() ? QString() : QStringLiteral("\n%1").arg(preview)),
+            assistantHistoryList_);
+        item->setData(Qt::UserRole, conversation->threadId);
+        item->setData(Qt::UserRole + 1, title);
+        item->setToolTip(preview);
+        if (conversation->threadId == currentAssistantThreadId_) {
+            assistantHistoryList_->setCurrentItem(item);
+        }
+    }
+}
+
+void OpenZoomApp::LoadSelectedAssistantConversation()
+{
+    if (!assistantHistoryList_ || !assistiveRuntime_ || assistiveRuntime_->IsCodexTurnActive()) {
+        return;
+    }
+    QListWidgetItem* item = assistantHistoryList_->currentItem();
+    if (!item) {
+        return;
+    }
+    const QString threadId = item->data(Qt::UserRole).toString();
+    if (threadId.isEmpty()) {
+        return;
+    }
+    currentAssistantThreadId_ = threadId;
+    assistantTranscript_->setPlainText(QStringLiteral("Loading conversation..."));
+    assistiveRuntime_->LoadAssistantConversation(threadId);
+}
+
+void OpenZoomApp::SetAssistantBusy(bool busy)
+{
+    if (assistiveOverlay_) {
+        assistiveOverlay_->SetBusy(busy);
+    }
+    if (assistantSendButton_) {
+        assistantSendButton_->setEnabled(!busy && codexReady_ && codexSignedIn_);
+    }
+    if (assistantStopButton_) {
+        assistantStopButton_->setEnabled(busy);
+    }
+    if (assistantNewButton_) {
+        assistantNewButton_->setEnabled(!busy);
+    }
+    if (assistantConnectButton_) {
+        assistantConnectButton_->setEnabled(!busy);
+    }
+    if (assistantPromptEdit_) {
+        assistantPromptEdit_->setEnabled(!busy);
+    }
+    if (assistantHistoryList_) {
+        assistantHistoryList_->setEnabled(!busy);
+    }
+    for (QPushButton* button : {assistantRenameButton_, assistantExportButton_, assistantDeleteButton_}) {
+        if (button) {
+            button->setEnabled(!busy);
+        }
+    }
+}
+
+void OpenZoomApp::AppendAssistantMessage(const QString& speaker, const QString& text)
+{
+    if (!assistantTranscript_ || text.trimmed().isEmpty()) {
+        return;
+    }
+    QTextCursor cursor = assistantTranscript_->textCursor();
+    cursor.movePosition(QTextCursor::End);
+    if (!assistantTranscript_->document()->isEmpty()) {
+        cursor.insertText(QStringLiteral("\n"));
+    }
+    cursor.insertText(QStringLiteral("%1\n%2\n").arg(speaker, text.trimmed()));
+    assistantTranscript_->setTextCursor(cursor);
+    assistantTranscript_->ensureCursorVisible();
+}
+
 void OpenZoomApp::OnOcrAssistToggled(bool checked)
 {
     ocrAssistEnabled_ = checked;
@@ -1000,7 +1727,7 @@ void OpenZoomApp::OnAssistiveOverlayUpdated(const QString& title, const QString&
     if (!assistiveOverlay_) {
         return;
     }
-    assistiveOverlay_->SetContent(title, body, visible && assistiveOverlayEnabled_ && (ocrAssistEnabled_ || vlmAssistEnabled_));
+    assistiveOverlay_->SetContent(title, body, visible && assistiveOverlayEnabled_);
 }
 
 void OpenZoomApp::InitializePlatform() {
@@ -1137,6 +1864,8 @@ void OpenZoomApp::OnCameraSelectionChanged(int index) {
         return;
     }
 
+    // A manual camera pick always wins over an in-flight automatic reconnect.
+    cameraReconnectPending_ = false;
     persistentSettings_.cameraIndex = index;
     RefreshCameraModesList(static_cast<size_t>(index));
     StartCameraCapture(static_cast<size_t>(index));
@@ -1208,15 +1937,18 @@ void OpenZoomApp::OnRotationSelectionChanged(int index) {
 
     const int delta = (clamped - previous + 4) % 4;
     rotationQuarterTurns_ = clamped;
+    persistentSettings_.rotationQuarterTurns = rotationQuarterTurns_;
 
     float rotatedX = zoomCenterX_;
     float rotatedY = zoomCenterY_;
     RotateNormalizedPoint(zoomCenterX_, zoomCenterY_, delta, rotatedX, rotatedY);
-    SetZoomCenter(rotatedX, rotatedY, true);
+    SetZoomCenter(rotatedX, rotatedY, true, true);
 
     cpuPipeline_.ResetTemporalHistory();
     if (cudaSurface_) {
         cudaSurface_->ResetTemporalHistory();
+        cudaSurface_->ResetStabilization();
+        cudaSurface_->ResetKeystone();
     }
     ResetCudaFenceState();
 
@@ -1340,7 +2072,64 @@ void OpenZoomApp::OnTemporalSmoothStrengthChanged(int value) {
     UpdateProcessingStatusLabel();
     SyncCurrentConfigToPersistence();
 }
-void OpenZoomApp::SetZoomCenter(float normX, float normY, bool syncUi) {
+void OpenZoomApp::OnStabilizationToggled(bool checked) {
+    stabilizationEnabled_ = checked;
+    if (stabilizationStrengthSlider_) {
+        stabilizationStrengthSlider_->setEnabled(checked);
+    }
+    if (cudaSurface_) {
+        cudaSurface_->ResetStabilization();
+        cudaSurface_->ResetKeystone();
+    }
+    UpdateProcessingStatusLabel();
+    SyncCurrentConfigToPersistence();
+}
+void OpenZoomApp::OnStabilizationStrengthChanged(int value) {
+    const int sliderMin = stabilizationStrengthSlider_ ? stabilizationStrengthSlider_->minimum() : 0;
+    const int sliderMax = stabilizationStrengthSlider_ ? stabilizationStrengthSlider_->maximum() : 98;
+    const int clamped = std::clamp(value, sliderMin, sliderMax);
+    if (stabilizationStrengthSlider_ && clamped != value) {
+        QSignalBlocker block(stabilizationStrengthSlider_);
+        stabilizationStrengthSlider_->setValue(clamped);
+    }
+    stabilizationStrength_ = std::clamp(static_cast<float>(clamped) / 100.0f, 0.0f, 0.98f);
+    SyncCurrentConfigToPersistence();
+}
+void OpenZoomApp::OnKeystoneToggled(bool checked) {
+    keystoneEnabled_ = checked;
+    if (cudaSurface_) {
+        cudaSurface_->ResetKeystone();
+    }
+    UpdateProcessingStatusLabel();
+    SyncCurrentConfigToPersistence();
+}
+void OpenZoomApp::OnAutoContrastToggled(bool checked) {
+    autoContrastEnabled_ = checked;
+    if (autoContrastStrengthSlider_) {
+        autoContrastStrengthSlider_->setEnabled(checked);
+    }
+    UpdateProcessingStatusLabel();
+    SyncCurrentConfigToPersistence();
+}
+void OpenZoomApp::OnAutoContrastStrengthChanged(int value) {
+    autoContrastStrength_ = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
+    SyncCurrentConfigToPersistence();
+}
+void OpenZoomApp::OnDisplayColorModeChanged(int index) {
+    displayColorMode_ = std::clamp(index, 0, 4);
+    UpdateProcessingStatusLabel();
+    SyncCurrentConfigToPersistence();
+}
+void OpenZoomApp::OnContrastChanged(int value) {
+    contrast_ = std::clamp(static_cast<float>(value) / 100.0f, 0.25f, 4.0f);
+    SyncCurrentConfigToPersistence();
+}
+void OpenZoomApp::OnBrightnessChanged(int value) {
+    brightness_ = std::clamp(static_cast<float>(value) / 100.0f, -1.0f, 1.0f);
+    SyncCurrentConfigToPersistence();
+}
+void OpenZoomApp::SetZoomCenter(float normX, float normY, bool syncUi,
+                                bool preservePresetSelection) {
     const float clampedX = std::clamp(normX, 0.0f, 1.0f);
     const float clampedY = std::clamp(normY, 0.0f, 1.0f);
     zoomCenterX_ = clampedX;
@@ -1358,7 +2147,7 @@ void OpenZoomApp::SetZoomCenter(float normX, float normY, bool syncUi) {
         }
         suspendControlSync_ = false;
     }
-    SyncCurrentConfigToPersistence();
+    SyncCurrentConfigToPersistence(preservePresetSelection);
 }
 
 bool OpenZoomApp::HandlePanKey(int key, bool pressed) {
@@ -1515,6 +2304,7 @@ void OpenZoomApp::UpdateProcessingStatusLabel() {
     }
 
     QString text;
+    QString detail;
     QString color;
 
     auto backendLabel = [this]() -> QString {
@@ -1530,45 +2320,76 @@ void OpenZoomApp::UpdateProcessingStatusLabel() {
         return QStringLiteral("None");
     };
 
-    if (!cameraActive_) {
+    if (!cameraActive_ && cameraReconnectPending_) {
+        text = QStringLiteral("Reconnecting to camera…");
+        detail = QStringLiteral("Camera connection lost - reconnecting automatically");
+        color = QStringLiteral("#d17c00");
+    } else if (!cameraActive_) {
+        text = QStringLiteral("Camera Offline");
         if (lastCameraError_.isEmpty()) {
-            text = QStringLiteral("Processing: Idle (camera offline)");
+            detail = QStringLiteral("Processing: Idle (camera offline)");
         } else {
-            text = QStringLiteral("Processing: Idle (camera offline — %1)").arg(lastCameraError_);
+            detail = QStringLiteral("Processing: Idle (camera offline - %1)").arg(lastCameraError_);
         }
         color = QStringLiteral("#c0392b");
     } else if (debugViewEnabled_) {
-        text = QStringLiteral("Processing: CPU (debug view)");
+        text = QStringLiteral("CPU Debug");
+        detail = QStringLiteral("Processing: CPU (debug view)");
         color = QStringLiteral("#d17c00");
     } else if (usingCudaLastFrame_ && cudaPipelineAvailable_) {
+        text = QStringLiteral("GPU Ready");
         const QString backend = backendLabel();
         if (cudaFenceInteropEnabled_) {
-            text = QStringLiteral("Processing: GPU (fence interop, %1)").arg(backend);
+            detail = QStringLiteral("Processing: GPU (fence interop, %1)").arg(backend);
         } else {
-            text = QStringLiteral("Processing: GPU (%1)").arg(backend);
+            detail = QStringLiteral("Processing: GPU (%1)").arg(backend);
         }
         color = QStringLiteral("#1c9c3e");
-    } else if (cudaPipelineAvailable_) {
-        text = QStringLiteral("Processing: CPU (fallback, %1)").arg(backendLabel());
-        color = QStringLiteral("#c0392b");
     } else {
-        text = QStringLiteral("Processing: CPU (%1)").arg(backendLabel());
+        // CPU effects path is deprecated: without the GPU pipeline the app
+        // shows unprocessed passthrough video.
+        text = QStringLiteral("GPU Required");
+        detail = QStringLiteral("GPU required - processing disabled (showing raw video)");
         color = QStringLiteral("#c0392b");
     }
 
     if (recording_) {
         text.append(QStringLiteral(" [REC]"));
+        detail.append(QStringLiteral(" [REC]"));
     }
 
     if (ocrAssistEnabled_) {
         text.append(QStringLiteral(" [OCR]"));
+        detail.append(QStringLiteral(" [OCR]"));
     }
     if (vlmAssistEnabled_) {
         text.append(QStringLiteral(" [VLM]"));
+        detail.append(QStringLiteral(" [VLM]"));
+    }
+
+    // Transient, non-modal notifications (disk-full recording stop, reconnect
+    // give-up, ...) override the pipeline summary for a few seconds. The label
+    // is refreshed every presented frame, so the message clears on its own.
+    if (!transientStatusMessage_.isEmpty()) {
+        if (QDateTime::currentMSecsSinceEpoch() < transientStatusUntilMs_) {
+            detail = text + QStringLiteral(" - ") + transientStatusMessage_;
+            text = transientStatusMessage_;
+            color = QStringLiteral("#1c6dd0");
+        } else {
+            transientStatusMessage_.clear();
+        }
     }
 
     processingStatusLabel_->setText(text);
+    processingStatusLabel_->setToolTip(detail);
     processingStatusLabel_->setStyleSheet(QStringLiteral("color: %1;").arg(color));
+}
+
+void OpenZoomApp::ShowStatusMessage(const QString& message, int durationMs)
+{
+    transientStatusMessage_ = message;
+    transientStatusUntilMs_ = QDateTime::currentMSecsSinceEpoch() + durationMs;
+    UpdateProcessingStatusLabel();
 }
 
 void OpenZoomApp::HandleZoomWheel(int delta, const QPointF& localPos) {
@@ -1617,6 +2438,7 @@ void OpenZoomApp::ResetCudaFenceState() {
     sharedFenceCounter_ = baseValue + 1;
     lastCudaSignalValue_ = 0;
     lastGraphicsSignalValue_ = baseValue;
+    lastReadbackSignalValue_ = 0;
     cudaFenceInteropEnabled_ = false;
 }
 
@@ -1631,6 +2453,9 @@ bool OpenZoomApp::EnsureCudaSurface(UINT width, UINT height) {
         return true;
     }
 
+    // Drain the graphics queue first: pipelined presents may still be copying
+    // from the shared texture we are about to release.
+    presenter_->WaitForIdle();
     cudaSurface_.reset();
     cudaSharedTexture_.Reset();
     cudaSurfaceWidth_ = 0;
@@ -1733,18 +2558,109 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
         return false;
     }
 
-    if (!cudaSurface_) {
-        qWarning() << "CUDA pipeline disabled: surface not available";
-        usingCudaLastFrame_ = false;
-        return false;
-    }
-
     ProcessingInput input{};
     input.hostPixels = stageRaw.data();
     input.hostStrideBytes = width * 4;
     input.pixelSizeBytes = static_cast<unsigned int>(sizeof(uint32_t));
     input.width = width;
     input.height = height;
+    // inputFormat 0 (BGRA): the CPU already converted and rotated, so
+    // rotationQuarterTurns stays 0.
+
+    return RunCudaPipeline(input, width, height);
+}
+
+// Feeds raw NV12/YUY2 camera frames straight to the CUDA pipeline: color
+// conversion and rotation both run on the GPU and the per-frame CPU
+// convert/rotate work is skipped entirely. Returns false whenever anything is
+// off (unsupported layout, surface failure, ProcessFrame failure) so the
+// caller can fall back to the CPU-converted BGRA path for that frame.
+bool OpenZoomApp::TryProcessRawFrameWithCuda(const MediaFrame& frame) {
+    const bool isNv12 = IsEqualGUID(frame.subtype, MFVideoFormat_NV12);
+    const bool isYuy2 = IsEqualGUID(frame.subtype, MFVideoFormat_YUY2);
+    if (!isNv12 && !isYuy2) {
+        return false;
+    }
+
+    const UINT width = frame.width;
+    const UINT height = frame.height;
+    if (width == 0 || height == 0 || frame.data.empty()) {
+        return false;
+    }
+
+    UINT stride = frame.stride;
+    const uint8_t* plane2 = nullptr;
+    UINT plane2Stride = 0;
+    if (isNv12) {
+        if (stride < width) {
+            stride = width;
+        }
+        // Media Foundation NV12 buffers are contiguous: Y rows followed by
+        // interleaved UV rows, both at the Y stride.
+        const size_t yBytes = static_cast<size_t>(stride) * height;
+        const size_t uvBytes = static_cast<size_t>(stride) * ((height + 1) / 2);
+        if (frame.dataSize < yBytes + uvBytes) {
+            return false;
+        }
+        plane2 = frame.data.data() + yBytes;
+        plane2Stride = stride;
+    } else {
+        if (stride < width * 2) {
+            stride = width * 2;
+        }
+        if (frame.dataSize < static_cast<size_t>(stride) * height) {
+            return false;
+        }
+    }
+
+    // Rotation happens on the GPU after conversion, so the interop surface and
+    // every processing stage run at the post-rotation extent.
+    const int turns = ((rotationQuarterTurns_ % 4) + 4) % 4;
+    const UINT outWidth = ((turns & 1) != 0) ? height : width;
+    const UINT outHeight = ((turns & 1) != 0) ? width : height;
+
+    if (!EnsureCudaSurface(outWidth, outHeight)) {
+        usingCudaLastFrame_ = false;
+        return false;
+    }
+
+    ProcessingInput input{};
+    input.hostPixels = frame.data.data();
+    input.hostStrideBytes = stride;
+    input.pixelSizeBytes = isNv12 ? 1u : 2u;
+    input.width = width;    // pre-rotation host layout
+    input.height = height;
+    input.inputFormat = isNv12 ? 1 : 2;
+    input.hostPlane2 = plane2;
+    input.hostPlane2StrideBytes = plane2Stride;
+    input.rotationQuarterTurns = turns;
+
+    if (!RunCudaPipeline(input, outWidth, outHeight)) {
+        if (!rawCudaPathWarned_) {
+            qWarning() << "GPU raw-format path failed; falling back to CPU conversion for"
+                       << (isNv12 ? "NV12" : "YUY2") << "frames";
+            rawCudaPathWarned_ = true;
+        }
+        return false;
+    }
+
+    processedFrameWidth_ = outWidth;
+    processedFrameHeight_ = outHeight;
+    usingCudaLastFrame_ = true;
+    HandleGpuFramePresented(outWidth, outHeight);
+    UpdateProcessingStatusLabel();
+    return true;
+}
+
+// Shared tail of the CUDA path: builds ProcessingSettings from the live UI
+// state, runs ProcessFrame with the fence dance, and presents the result.
+// The interop surface must already exist at presentWidth x presentHeight.
+bool OpenZoomApp::RunCudaPipeline(const ProcessingInput& input, UINT presentWidth, UINT presentHeight) {
+    if (!cudaSurface_) {
+        qWarning() << "CUDA pipeline disabled: surface not available";
+        usingCudaLastFrame_ = false;
+        return false;
+    }
 
     ProcessingSettings settings{};
     settings.enableBlackWhite = blackWhiteEnabled_;
@@ -1763,12 +2679,29 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
     settings.stagingFormat = cudaBufferFormat_;
     settings.enableTemporalSmoothing = temporalSmoothEnabled_;
     settings.temporalSmoothingAlpha = temporalSmoothAlpha_;
+    settings.enableStabilization = stabilizationEnabled_;
+    settings.stabilizationStrength = stabilizationStrength_;
+    settings.displayColorMode = displayColorMode_;
+    settings.contrast = contrast_;
+    settings.brightness = brightness_;
+    settings.enableKeystone = keystoneEnabled_;
+    settings.enableAutoContrast = autoContrastEnabled_;
+    settings.autoContrastStrength = autoContrastStrength_;
 
     FenceSyncParams cudaSyncParams{};
     uint64_t cudaSignalCandidate = 0;
     if (cudaFenceInteropEnabled_) {
+        // Re-seed from the presenter so our values stay above any internal
+        // fence signals issued by CPU-path frames in between; signaling the
+        // shared fence with a lower value would move it backwards and break
+        // the wait/signal ordering below.
+        sharedFenceCounter_ = std::max(sharedFenceCounter_,
+                                       presenter_->GetLastSignaledFenceValue() + 1);
         cudaSyncParams.enable = true;
-        cudaSyncParams.waitValue = lastGraphicsSignalValue_;
+        // Async readbacks copy from the shared texture on the graphics queue;
+        // CUDA must not write the next frame until both the present and the
+        // newest readback copy have retired (GPU-side wait only).
+        cudaSyncParams.waitValue = std::max(lastGraphicsSignalValue_, lastReadbackSignalValue_);
         cudaSignalCandidate = sharedFenceCounter_;
         cudaSyncParams.signalValue = cudaSignalCandidate;
     }
@@ -1797,8 +2730,8 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
     }
 
     presenter_->PresentFromTexture(cudaSharedTexture_.Get(),
-                                   width,
-                                   height,
+                                   presentWidth,
+                                   presentHeight,
                                    presentSync.enable ? &presentSync : nullptr);
 
     if (presentSync.enable) {
@@ -1808,6 +2741,46 @@ bool OpenZoomApp::ProcessFrameWithCuda(UINT width, UINT height) {
 
     usingCudaLastFrame_ = true;
     return true;
+}
+
+// Post-present GPU housekeeping: pump the presenter's async readback ring for
+// recording and the periodic assistive grab. One request per frame at most and
+// a single drain point, so the two consumers never steal each other's results.
+// Nothing here blocks: requests are skip-on-busy and completed copies surface
+// one or more frames later with their own dimensions (results are silently
+// dropped on resize).
+void OpenZoomApp::HandleGpuFramePresented(UINT width, UINT height) {
+    if (!presenter_ || !cudaSharedTexture_) {
+        return;
+    }
+
+    // Drain first so a fully occupied ring frees up before the new request.
+    UINT readbackWidth = 0;
+    UINT readbackHeight = 0;
+    while (presenter_->TryGetCompletedReadback(asyncReadbackBuffer_, readbackWidth, readbackHeight)) {
+        if (recording_) {
+            MaybeRecordFrame(asyncReadbackBuffer_.data(), readbackWidth, readbackHeight);
+        }
+        MaybeRequestAssistiveAnalysis(asyncReadbackBuffer_.data(), readbackWidth, readbackHeight);
+    }
+
+    const bool assistiveWanted = assistiveRuntime_ && assistiveRuntime_->WantsAnalysis() &&
+                                 assistiveOverlayEnabled_ && !debugViewEnabled_ &&
+                                 !assistiveRuntime_->IsBusy() && AssistiveAnalysisDue();
+    if (recording_ || assistiveWanted) {
+        if (presenter_->RequestReadback(cudaSharedTexture_.Get(), width, height)) {
+            // The readback copy runs on the graphics queue after the present;
+            // next frame's CUDA pass must wait for it before writing the
+            // shared texture again.
+            lastReadbackSignalValue_ = presenter_->GetLastSignaledFenceValue();
+        }
+    }
+}
+
+bool OpenZoomApp::AssistiveAnalysisDue() const {
+    constexpr qint64 kAssistiveIntervalMs = 1600;
+    return !assistiveAnalysisTimer_.isValid() ||
+           assistiveAnalysisTimer_.elapsed() >= kAssistiveIntervalMs;
 }
 
 void OpenZoomApp::BeginMousePan(const QPointF& pos, const QSize& widgetSize) {
@@ -1836,16 +2809,19 @@ bool OpenZoomApp::IsMousePanActive() const
     return interactionController_ && interactionController_->IsMousePanActive();
 }
 
-void OpenZoomApp::StartCameraCapture(size_t index) {
+bool OpenZoomApp::StartCameraCapture(size_t index, bool interactive) {
     if (index >= cameras_.size()) {
-        return;
+        return false;
     }
 
     selectedCameraIndex_ = static_cast<int>(index);
     StopCameraCapture();
+    const uint64_t captureSession = cameraSessionId_;
     cpuPipeline_.ResetTemporalHistory();
     if (cudaSurface_) {
         cudaSurface_->ResetTemporalHistory();
+        cudaSurface_->ResetStabilization();
+        cudaSurface_->ResetKeystone();
     }
 
     const CameraDescriptor& descriptor = cameras_[index];
@@ -1853,15 +2829,42 @@ void OpenZoomApp::StartCameraCapture(size_t index) {
         std::scoped_lock lock(cameraMutex_);
         latestFrame_ = frame;
     };
+    CaptureErrorCallback errorCallback = [this, captureSession](const std::string& detail) {
+        const QString message = QString::fromStdString(detail);
+        QMetaObject::invokeMethod(this,
+                                  [this, captureSession, message]() {
+                                      HandleCameraRuntimeFailure(captureSession, message);
+                                  },
+                                  Qt::QueuedConnection);
+    };
 
-    if (!mediaCapture_.StartCapture(descriptor, std::move(callback))) {
+    if (!mediaCapture_.StartCapture(descriptor,
+                                    std::move(callback),
+                                    MFVideoFormat_NV12,
+                                    std::move(errorCallback))) {
         const std::string detail = mediaCapture_.LastError();
-        QString message = QStringLiteral("Failed to start camera capture");
-        if (!detail.empty()) {
-            message += QStringLiteral(" (%1)").arg(QString::fromStdString(detail));
+        const CameraFailureKind kind = mediaCapture_.LastFailureKind();
+        QString message;
+        if (!detail.empty() && (kind == CameraFailureKind::DeviceBusy ||
+                                kind == CameraFailureKind::DeviceMissing ||
+                                kind == CameraFailureKind::AccessDenied)) {
+            // LastError() is already a full plain-language sentence for these
+            // failure kinds; show it verbatim.
+            message = QString::fromStdString(detail);
+        } else {
+            message = QStringLiteral("Failed to start camera capture");
+            if (!detail.empty()) {
+                message += QStringLiteral(" (%1)").arg(QString::fromStdString(detail));
+            }
         }
-        HandleCameraStartFailure(message);
-        return;
+        if (interactive) {
+            HandleCameraStartFailure(message);
+        } else {
+            qWarning() << "Camera start failed (silent):" << message;
+            lastCameraError_ = message;
+            UpdateProcessingStatusLabel();
+        }
+        return false;
     }
 
     processedFrameWidth_ = 0;
@@ -1869,9 +2872,11 @@ void OpenZoomApp::StartCameraCapture(size_t index) {
     cameraActive_ = true;
     lastCameraError_.clear();
     UpdateProcessingStatusLabel();
+    return true;
 }
 
 void OpenZoomApp::StopCameraCapture() {
+    ++cameraSessionId_;
     mediaCapture_.StopCapture();
     cameraActive_ = false;
 
@@ -1883,6 +2888,8 @@ void OpenZoomApp::StopCameraCapture() {
     cpuPipeline_.ResetTemporalHistory();
     if (cudaSurface_) {
         cudaSurface_->ResetTemporalHistory();
+        cudaSurface_->ResetStabilization();
+        cudaSurface_->ResetKeystone();
     }
     processedFrameWidth_ = 0;
     processedFrameHeight_ = 0;
@@ -1897,6 +2904,107 @@ void OpenZoomApp::HandleCameraStartFailure(const QString& message) {
     if (mainWindow_) {
         QMessageBox::warning(mainWindow_.get(), QStringLiteral("Camera Error"), message);
     }
+}
+
+void OpenZoomApp::HandleCameraRuntimeFailure(uint64_t captureSession, const QString& message) {
+    // Never surface a modal dialog while the automatic reconnect is running:
+    // popping one up mid-lecture would steal focus from the student.
+    if (cameraReconnectPending_) {
+        return;
+    }
+    if (captureSession != cameraSessionId_ || !cameraActive_) {
+        return;
+    }
+
+    qWarning() << "Camera runtime failure:" << message;
+    lastCameraError_ = message;
+
+    // Mid-stream device loss is handled by the reconnect state machine instead
+    // of an error dialog; the flag is also polled from OnFrameTick in case the
+    // tick sees it first.
+    if (mediaCapture_.ConsumeDeviceLost()) {
+        BeginCameraReconnect();
+        return;
+    }
+
+    StopCameraCapture();
+    UpdateProcessingStatusLabel();
+    if (mainWindow_) {
+        QMessageBox::warning(mainWindow_.get(), QStringLiteral("Camera Error"), message);
+    }
+}
+
+// Camera reconnect state machine. Entered on mid-stream device loss; driven
+// from OnFrameTick with QDateTime-based backoff (2s/4s/8s), no blocking
+// sleeps, no modal dialogs. Gives up after ~30 seconds.
+void OpenZoomApp::BeginCameraReconnect() {
+    if (cameraReconnectPending_) {
+        return;
+    }
+    qWarning() << "Camera connection lost; reconnecting automatically";
+    cameraReconnectPending_ = true;
+    cameraReconnectAttempt_ = 0;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    cameraReconnectStartedMs_ = now;
+    cameraReconnectNextAttemptMs_ = now + 2000;
+    lastCameraError_ = QStringLiteral("Reconnecting to camera…");
+    StopCameraCapture();
+    UpdateProcessingStatusLabel();
+}
+
+void OpenZoomApp::DriveCameraReconnect() {
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+    if (now < cameraReconnectNextAttemptMs_) {
+        return;
+    }
+
+    // Re-enumerate and look for the same physical device again.
+    const std::wstring targetLink = mediaCapture_.LastSymbolicLink();
+    cameras_ = mediaCapture_.EnumerateCameras();
+    {
+        QSignalBlocker blocker(cameraCombo_);
+        PopulateCameraCombo();
+    }
+
+    int matchIndex = -1;
+    if (!targetLink.empty()) {
+        for (size_t i = 0; i < cameras_.size(); ++i) {
+            if (cameras_[i].symbolicLink == targetLink) {
+                matchIndex = static_cast<int>(i);
+                break;
+            }
+        }
+    }
+
+    if (matchIndex >= 0 && StartCameraCapture(static_cast<size_t>(matchIndex), false)) {
+        cameraReconnectPending_ = false;
+        qInfo() << "Camera reconnected after" << (cameraReconnectAttempt_ + 1) << "attempt(s)";
+        if (cameraCombo_) {
+            QSignalBlocker blocker(cameraCombo_);
+            cameraCombo_->setCurrentIndex(matchIndex);
+        }
+        RefreshCameraModesList(static_cast<size_t>(matchIndex));
+        ShowStatusMessage(QStringLiteral("Camera reconnected."), 5000);
+        return;
+    }
+
+    ++cameraReconnectAttempt_;
+    constexpr qint64 kReconnectWindowMs = 30000;
+    if (now - cameraReconnectStartedMs_ >= kReconnectWindowMs) {
+        cameraReconnectPending_ = false;
+        const std::string detail = mediaCapture_.LastError();
+        lastCameraError_ = !detail.empty()
+            ? QString::fromStdString(detail)
+            : QStringLiteral("The camera did not come back. Check the connection, then pick it "
+                             "again from the camera list.");
+        qWarning() << "Camera reconnect gave up:" << lastCameraError_;
+        ShowStatusMessage(lastCameraError_, 15000);
+        return;
+    }
+
+    // Backoff: 2s after the loss, then 4s, then 8s between attempts.
+    const qint64 delayMs = std::min<qint64>(2000ll << std::min(cameraReconnectAttempt_, 2), 8000ll);
+    cameraReconnectNextAttemptMs_ = now + delayMs;
 }
 
 
@@ -1915,21 +3023,40 @@ void OpenZoomApp::ApplyPersistentSettings(const settings::PersistentSettings& se
     }
     controlsCollapsed_ = settings.controlsCollapsed;
     OnControlsCollapsedToggled(collapseButton_ ? collapseButton_->isChecked() : !controlsCollapsed_);
+    simpleUiMode_ = settings.simpleUiMode;
+    if (mainWindow_) {
+        mainWindow_->setSimpleMode(settings.simpleUiMode);
+    }
     ApplyAdvancedConfig(settings.currentConfig);
+    rotationQuarterTurns_ = ((settings.rotationQuarterTurns % 4) + 4) % 4;
+    UpdateRotationUi();
     persistentSettings_.selectedPresetId = settings.selectedPresetId;
-    RefreshPresetSelection();
+    RefreshPresetSelection(true);
     UpdatePresetDescription();
+    ApplyAssistiveSettingsToRuntime();
 }
 
 void OpenZoomApp::SavePersistentSettings() {
     persistentSettings_.cameraIndex = selectedCameraIndex_;
+    persistentSettings_.rotationQuarterTurns = rotationQuarterTurns_;
     persistentSettings_.virtualJoystick = virtualJoystickEnabled_;
     persistentSettings_.controlsCollapsed = controlsCollapsed_;
+    persistentSettings_.simpleUiMode = simpleUiMode_;
     persistentSettings_.currentConfig = CaptureCurrentAdvancedConfig();
     settings::Save(settingsPath_, persistentSettings_);
 }
 
 void OpenZoomApp::OnFrameTick() {
+    // Camera loss / reconnect state machine. ConsumeDeviceLost() is polled
+    // here in addition to the capture error callback so the reconnect starts
+    // no matter which side notices the loss first.
+    if (mediaCapture_.ConsumeDeviceLost() && !cameraReconnectPending_) {
+        BeginCameraReconnect();
+    }
+    if (cameraReconnectPending_) {
+        DriveCameraReconnect();
+    }
+
     if (!cameraActive_) {
         return;
     }
@@ -1942,6 +3069,14 @@ void OpenZoomApp::OnFrameTick() {
     }
 
     if (frame.data.empty() || frame.width == 0 || frame.height == 0) {
+        return;
+    }
+
+    // GPU fast path: NV12/YUY2 frames go straight to CUDA (conversion and
+    // rotation on the GPU), skipping the per-pixel CPU work below. The CPU
+    // path remains for the debug view, other subtypes, GPU-unavailable
+    // passthrough, and any frame the raw path rejects.
+    if (!debugViewEnabled_ && TryProcessRawFrameWithCuda(frame)) {
         return;
     }
 
@@ -1979,16 +3114,28 @@ void OpenZoomApp::BuildCompositeAndPresent(UINT width, UINT height) {
     usingCudaLastFrame_ = false;
     if (!debugViewEnabled_ && ProcessFrameWithCuda(width, height)) {
         usingCudaLastFrame_ = true;
-        if (assistiveRuntime_ && assistiveRuntime_->WantsAnalysis() && assistiveOverlayEnabled_ &&
-            presenter_ && presenter_->ReadbackTexture(cudaSharedTexture_.Get(), width, height, assistiveBuffer_)) {
-            MaybeRequestAssistiveAnalysis(assistiveBuffer_.data(), width, height);
-        }
-        if (recording_) {
-            MaybeRecordFrame(nullptr, width, height, cudaSharedTexture_.Get());
-        }
+        // Recording and the periodic assistive grab both use the async
+        // readback ring; nothing on this path blocks on the GPU anymore.
+        HandleGpuFramePresented(width, height);
         UpdateProcessingStatusLabel();
         return;
     }
+
+    if (!debugViewEnabled_) {
+        // The CPU effects pipeline is deprecated: without CUDA the app
+        // presents the unprocessed converted frame and reports that the GPU
+        // is required. Recording, snapshots, and assistive readback continue
+        // to work from the presentation buffer inside PresentFitted.
+        const std::vector<uint8_t>& raw = cpuPipeline_.StageRaw();
+        if (raw.empty()) {
+            UpdateProcessingStatusLabel();
+            return;
+        }
+        PresentFitted(raw.data(), width, height, true, zoomCenterX_, zoomCenterY_);
+        return;
+    }
+
+    // Legacy CPU composite, kept as a diagnostic for the debug view only.
     processing::CpuPipelineConfig config{};
     config.enableBlackWhite = blackWhiteEnabled_;
     config.blackWhiteThreshold = blackWhiteThreshold_;
@@ -2113,7 +3260,7 @@ void OpenZoomApp::PresentFitted(const uint8_t* data,
     }
 
     MaybeRequestAssistiveAnalysis(presentationBuffer_.data(), mapping.targetWidth, mapping.targetHeight);
-    MaybeRecordFrame(presentationBuffer_.data(), mapping.targetWidth, mapping.targetHeight, nullptr);
+    MaybeRecordFrame(presentationBuffer_.data(), mapping.targetWidth, mapping.targetHeight);
     presenter_->Present(presentationBuffer_.data(), mapping.targetWidth, mapping.targetHeight);
     UpdateProcessingStatusLabel();
 }
@@ -2149,15 +3296,30 @@ void OpenZoomApp::CaptureSnapshot(const uint8_t* data, UINT width, UINT height)
         qWarning() << "Failed to save snapshot to" << fullPath;
     } else {
         qInfo() << "Saved snapshot to" << fullPath;
+        if (assistiveRuntime_) {
+            assistiveRuntime_->NoteCapturedPhoto(fullPath);
+        }
     }
 }
 
-void OpenZoomApp::MaybeRecordFrame(const uint8_t* data, UINT width, UINT height, ID3D12Resource* texture)
+void OpenZoomApp::StopRecordingUi()
+{
+    recording_ = false;
+    if (recordButton_) {
+        QSignalBlocker block(recordButton_);
+        recordButton_->setChecked(false);
+        recordButton_->setText(QStringLiteral("Record"));
+    }
+}
+
+// Delivers one BGRA frame to the recorder. On the GPU path the frames arrive
+// from the async readback ring (one or more presents after they were
+// requested) with their own dimensions; on the CPU passthrough path they come
+// straight from the presentation buffer.
+void OpenZoomApp::MaybeRecordFrame(const uint8_t* data, UINT width, UINT height)
 {
     if (!recording_ || !data || width == 0 || height == 0) {
-        if (!recording_) {
-            return;
-        }
+        return;
     }
 
     // Start recorder lazily on first frame so we have dimensions.
@@ -2169,46 +3331,52 @@ void OpenZoomApp::MaybeRecordFrame(const uint8_t* data, UINT width, UINT height,
         const std::wstring filePathW = fullPath.toStdWString();
         const UINT fps = 30;
         if (!videoRecorder_.Start(filePathW, width, height, fps)) {
-            qWarning() << "Failed to start recording:" << QString::fromStdString(videoRecorder_.LastError());
-            recording_ = false;
-            if (recordButton_) {
-                QSignalBlocker block(recordButton_);
-                recordButton_->setChecked(false);
-                recordButton_->setText(QStringLiteral("Start Recording"));
+            // Start() refuses when the disk is nearly full; surface its
+            // explanation without a modal dialog.
+            const QString reason = QString::fromStdString(videoRecorder_.LastError());
+            qWarning() << "Failed to start recording:" << reason;
+            StopRecordingUi();
+            if (!reason.isEmpty()) {
+                ShowStatusMessage(reason);
             }
             return;
         }
+        recordingWidth_ = width;
+        recordingHeight_ = height;
         recordingTimer_.restart();
         recordingFrameCount_ = 0;
         qInfo() << "Recording started:" << fullPath;
     }
 
-    const uint8_t* framePtr = data;
-    std::vector<uint8_t>* sourceBuffer = nullptr;
-
-    if (!framePtr && texture && presenter_) {
-        // Read back from GPU texture
-        if (!presenter_->ReadbackTexture(texture, width, height, recordingBuffer_)) {
-            qWarning() << "Recording readback failed";
-            return;
-        }
-        framePtr = recordingBuffer_.data();
-        sourceBuffer = &recordingBuffer_;
-    }
-
-    if (!framePtr) {
+    if (width != recordingWidth_ || height != recordingHeight_) {
+        // The processed frame size changed mid-recording (rotation or window
+        // change on the passthrough path). The sink cannot switch dimensions,
+        // so finalize the file cleanly instead of feeding it garbage.
+        qInfo() << "Recording stopped: frame size changed from"
+                << recordingWidth_ << "x" << recordingHeight_ << "to" << width << "x" << height;
+        videoRecorder_.Stop();
+        StopRecordingUi();
+        ShowStatusMessage(QStringLiteral("Recording stopped: the video size changed. "
+                                         "The recording so far was saved."));
         return;
     }
 
     const size_t stride = static_cast<size_t>(width) * 4;
-    if (!videoRecorder_.AddFrame(framePtr, stride)) {
-        qWarning() << "Recording error:" << QString::fromStdString(videoRecorder_.LastError());
-        videoRecorder_.Stop();
-        recording_ = false;
-        if (recordButton_) {
-            QSignalBlocker block(recordButton_);
-            recordButton_->setChecked(false);
-            recordButton_->setText(QStringLiteral("Start Recording"));
+    if (!videoRecorder_.AddFrame(data, stride)) {
+        const VideoRecorder::StopReason reason = videoRecorder_.LastStopReason();
+        const QString message = QString::fromStdString(videoRecorder_.LastError());
+        StopRecordingUi();
+        if (reason == VideoRecorder::StopReason::DiskFull) {
+            // The recorder already finalized the file; everything up to this
+            // point is safe on disk. Informational, not an error dialog.
+            qInfo() << "Recording finalized (disk full):" << message;
+            ShowStatusMessage(message);
+        } else {
+            qWarning() << "Recording error:" << message;
+            videoRecorder_.Stop();
+            if (!message.isEmpty()) {
+                ShowStatusMessage(message);
+            }
         }
         return;
     }
@@ -2219,12 +3387,7 @@ void OpenZoomApp::MaybeRecordFrame(const uint8_t* data, UINT width, UINT height,
     if (videoRecorder_.DurationSeconds() >= kMaxSeconds) {
         qInfo() << "Recording stopped: reached 12-hour limit";
         videoRecorder_.Stop();
-        recording_ = false;
-        if (recordButton_) {
-            QSignalBlocker block(recordButton_);
-            recordButton_->setChecked(false);
-            recordButton_->setText(QStringLiteral("Start Recording"));
-        }
+        StopRecordingUi();
     }
 }
 

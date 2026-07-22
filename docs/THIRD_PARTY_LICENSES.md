@@ -32,6 +32,30 @@ OpenZoom relies on several third-party SDKs and code drops. Keep this summary wi
   - no CUDA headers, compilers, or developer tools are bundled
 - Review NVIDIA's current redistribution terms before shipping binaries that include CUDA runtime files
 
+## Tesseract OCR Windows Runtime
+- Upstream engine: <https://github.com/tesseract-ocr/tesseract>
+- Windows distribution: <https://github.com/UB-Mannheim/tesseract/wiki>
+- Tesseract license: Apache-2.0
+- OpenZoom usage: optional local OCR process; release bundles copy the installed
+  runtime, English/orientation language data, and the distribution's Tesseract
+  license/authors/readme under `tools/tesseract/`
+- The Windows runtime dynamically links Leptonica plus image, compression,
+  Unicode, font, and GNU runtime libraries shipped by the UB Mannheim build.
+  Those components retain their own permissive, LGPL, or runtime-exception
+  terms. Keep all DLLs replaceable and complete a transitive-license notice
+  audit before commercial redistribution outside this development bundle.
+
+## Lucide Icons
+- Upstream: <https://lucide.dev/>
+- Package/version: `lucide-static` 1.25.0
+- Local notice file: [`assets/icons/lucide/LICENSE`](../assets/icons/lucide/LICENSE)
+- License: ISC; several inherited Feather icons also carry the MIT notice in
+  the same license file
+- OpenZoom usage: embedded Qt resource icons for camera actions, floating
+  Assistant controls, and Advanced section navigation
+- Attribution: retain the local license file in source and the third-party
+  notice in redistributed builds
+
 ## Microsoft Platform Components
 - APIs used: Media Foundation, Direct3D 12, DXGI, Windows Imaging Component, and other Windows SDK libraries
 - License source: Windows SDK / Visual Studio / OS redistribution terms
@@ -45,5 +69,8 @@ OpenZoom relies on several third-party SDKs and code drops. Keep this summary wi
 Those remain roadmap items. If they are added later, this file must be expanded in the same change.
 
 ## Optional External Tools And Services
-- Tesseract OCR may be used at runtime if installed locally, but it is not bundled by this repository or the current Windows packaging scripts.
 - OpenAI-compatible VLM services may be used at runtime through user-supplied endpoint credentials, but no hosted model or service SDK is bundled here.
+- OpenAI Codex CLI may be launched as an optional external `codex app-server`
+  process. OpenZoom does not bundle Codex source, binaries, model weights, or an
+  OpenAI SDK. Codex authentication, service access, usage limits, updates, and
+  licensing remain governed by the user's Codex installation and OpenAI terms.

@@ -59,3 +59,9 @@ open while contributing and update it whenever the workflow evolves.
 
 Agents that modify the workflow must append to this guide so future runs remain
 aligned with the project goals.
+
+## Validation Script Behavior
+- `scripts/run_minimal_test.bat` always requires the main application build to
+  succeed. It runs `dx12_cuda_minimal` when
+  `sandbox/dx12_cuda_minimal/CMakeLists.txt` exists and otherwise reports the
+  optional harness as skipped without failing the validation run.

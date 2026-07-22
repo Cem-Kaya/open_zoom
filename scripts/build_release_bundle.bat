@@ -19,6 +19,7 @@ set DIST_DIR=%ROOT_DIR%\dist
 set OUTPUT_DIR=%DIST_DIR%\OpenZoom
 set QT_PREFIX_DEFAULT=C:\Qt\6.9.3\msvc2022_64
 set CUDA_PREFIX_DEFAULT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0
+set TESSERACT_PREFIX_DEFAULT=C:\Program Files\Tesseract-OCR
 
 if not exist "%DIST_DIR%" mkdir "%DIST_DIR%"
 if exist "%OUTPUT_DIR%" (
@@ -61,12 +62,11 @@ if /I "%GENERATOR%"=="Visual Studio 17 2022" (
 )
 if errorlevel 1 goto :fail
 
-set EXE_PATH=%BUILD_DIR%\open_zoom.exe
+set EXE_PATH=%BUILD_DIR%\cmake\Release\open_zoom.exe
+if not exist "%EXE_PATH%" set EXE_PATH=%BUILD_DIR%\Release\open_zoom.exe
+if not exist "%EXE_PATH%" set EXE_PATH=%BUILD_DIR%\open_zoom.exe
 if not exist "%EXE_PATH%" (
-    set EXE_PATH=%BUILD_DIR%\Release\open_zoom.exe
-)
-if not exist "%EXE_PATH%" (
-    echo Built executable not found. Expected at %BUILD_DIR%\open_zoom.exe
+    echo Built executable not found under %BUILD_DIR%.
     goto :fail
 )
 
@@ -115,11 +115,19 @@ rem -------------------------------------------------------------
 call :copy_cuda_runtime "%OUTPUT_DIR%"
 
 rem -------------------------------------------------------------
+rem Copy optional local OCR runtime (if available)
+rem -------------------------------------------------------------
+call :copy_tesseract_runtime "%OUTPUT_DIR%"
+if errorlevel 1 goto :fail
+
+rem -------------------------------------------------------------
 rem Copy ancillary files
 rem -------------------------------------------------------------
 if exist "%ROOT_DIR%\LICENSE" copy /y "%ROOT_DIR%\LICENSE" "%OUTPUT_DIR%\LICENSE" >nul
 if exist "%ROOT_DIR%\README.md" copy /y "%ROOT_DIR%\README.md" "%OUTPUT_DIR%\README.txt" >nul
 if exist "%ROOT_DIR%\docs\THIRD_PARTY_LICENSES.md" copy /y "%ROOT_DIR%\docs\THIRD_PARTY_LICENSES.md" "%OUTPUT_DIR%\THIRD_PARTY_LICENSES.md" >nul
+if not exist "%OUTPUT_DIR%\licenses" mkdir "%OUTPUT_DIR%\licenses"
+if exist "%ROOT_DIR%\assets\icons\lucide\LICENSE" copy /y "%ROOT_DIR%\assets\icons\lucide\LICENSE" "%OUTPUT_DIR%\licenses\LUCIDE_LICENSE.txt" >nul
 
 popd
 
@@ -157,6 +165,56 @@ for /f "delims=" %%Q in ('where /r "%QT_SEARCH_ROOT%" windeployqt.exe 2^>nul') d
     goto :eof
 )
 goto :eof
+
+:copy_tesseract_runtime
+set "TESSERACT_BUNDLE_ROOT=%~1"
+if not defined TESSERACT_BUNDLE_ROOT goto :eof
+set "TESSERACT_SOURCE="
+
+if defined OPENZOOM_TESSERACT_DIR if exist "%OPENZOOM_TESSERACT_DIR%\tesseract.exe" (
+    set "TESSERACT_SOURCE=%OPENZOOM_TESSERACT_DIR%"
+)
+if not defined TESSERACT_SOURCE if defined TESSERACT_PREFIX if exist "%TESSERACT_PREFIX%\tesseract.exe" (
+    set "TESSERACT_SOURCE=%TESSERACT_PREFIX%"
+)
+if not defined TESSERACT_SOURCE if exist "%TESSERACT_PREFIX_DEFAULT%\tesseract.exe" (
+    set "TESSERACT_SOURCE=%TESSERACT_PREFIX_DEFAULT%"
+)
+if not defined TESSERACT_SOURCE (
+    for /f "delims=" %%T in ('where tesseract.exe 2^>nul') do if not defined TESSERACT_SOURCE (
+        for %%P in ("%%~fT") do set "TESSERACT_SOURCE=%%~dpP"
+    )
+)
+
+if not defined TESSERACT_SOURCE (
+    echo Tesseract OCR was not found; release bundle will not include local OCR.
+    goto :eof
+)
+
+set "TESSERACT_DEST=%TESSERACT_BUNDLE_ROOT%\tools\tesseract"
+if not exist "%TESSERACT_DEST%" mkdir "%TESSERACT_DEST%"
+echo Bundling Tesseract OCR from %TESSERACT_SOURCE%
+
+copy /y "%TESSERACT_SOURCE%\tesseract.exe" "%TESSERACT_DEST%\tesseract.exe" >nul
+if errorlevel 1 goto :tesseract_failed
+for %%F in ("%TESSERACT_SOURCE%\*.dll") do if exist "%%~fF" (
+    copy /y "%%~fF" "%TESSERACT_DEST%" >nul
+    if errorlevel 1 goto :tesseract_failed
+)
+if exist "%TESSERACT_SOURCE%\tessdata" (
+    xcopy /e /i /y "%TESSERACT_SOURCE%\tessdata" "%TESSERACT_DEST%\tessdata" >nul
+    if errorlevel 1 goto :tesseract_failed
+)
+if not exist "%TESSERACT_DEST%\licenses" mkdir "%TESSERACT_DEST%\licenses"
+if exist "%TESSERACT_SOURCE%\doc\LICENSE" copy /y "%TESSERACT_SOURCE%\doc\LICENSE" "%TESSERACT_DEST%\licenses\TESSERACT_LICENSE.txt" >nul
+if exist "%TESSERACT_SOURCE%\doc\AUTHORS" copy /y "%TESSERACT_SOURCE%\doc\AUTHORS" "%TESSERACT_DEST%\licenses\TESSERACT_AUTHORS.txt" >nul
+if exist "%TESSERACT_SOURCE%\doc\README.md" copy /y "%TESSERACT_SOURCE%\doc\README.md" "%TESSERACT_DEST%\licenses\TESSERACT_README.md" >nul
+echo Bundled Tesseract OCR runtime and language data.
+goto :eof
+
+:tesseract_failed
+echo Failed to copy the Tesseract OCR runtime.
+exit /b 1
 
 :copy_cuda_runtime
 set "DEST_DIR=%~1"

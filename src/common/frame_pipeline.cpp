@@ -7,8 +7,34 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 
 namespace openzoom::processing {
+
+namespace {
+
+constexpr UINT kMaxFrameExtent = 16384;
+
+bool PackedFrameIsValid(const std::vector<uint8_t>& frame,
+                        std::size_t availableBytes,
+                        UINT width,
+                        UINT height,
+                        UINT stride,
+                        std::size_t minimumStride)
+{
+    if (frame.empty() || width == 0 || height == 0 ||
+        width > kMaxFrameExtent || height > kMaxFrameExtent ||
+        static_cast<std::size_t>(stride) < minimumStride) {
+        return false;
+    }
+    if (static_cast<std::size_t>(stride) >
+        std::numeric_limits<std::size_t>::max() / height) {
+        return false;
+    }
+    return static_cast<std::size_t>(stride) * height <= availableBytes;
+}
+
+} // namespace
 
 bool CpuFramePipeline::ConvertFrameToBgra(const std::vector<uint8_t>& frame,
                                           const GUID& subtype,
@@ -17,16 +43,27 @@ bool CpuFramePipeline::ConvertFrameToBgra(const std::vector<uint8_t>& frame,
                                           UINT stride,
                                           std::size_t dataSize)
 {
-    if (width == 0 || height == 0) {
+    auto rejectFrame = [this]() {
         stageRaw_.clear();
         rawWidth_ = 0;
         rawHeight_ = 0;
         return false;
+    };
+
+    if (width == 0 || height == 0 || width > kMaxFrameExtent ||
+        height > kMaxFrameExtent || frame.empty()) {
+        return rejectFrame();
     }
 
+    const std::size_t availableBytes =
+        dataSize == 0 ? frame.size() : std::min(frame.size(), dataSize);
     const UINT effectiveStride = stride != 0 ? stride : width * 4u;
 
     if (IsEqualGUID(subtype, MFVideoFormat_ARGB32)) {
+        if (!PackedFrameIsValid(frame, availableBytes, width, height,
+                                effectiveStride, static_cast<std::size_t>(width) * 4u)) {
+            return rejectFrame();
+        }
         CopyArgbToBgra(frame.data(), effectiveStride, width, height, stageRaw_);
         rawWidth_ = width;
         rawHeight_ = height;
@@ -34,6 +71,10 @@ bool CpuFramePipeline::ConvertFrameToBgra(const std::vector<uint8_t>& frame,
     }
 
     if (IsEqualGUID(subtype, MFVideoFormat_RGB32)) {
+        if (!PackedFrameIsValid(frame, availableBytes, width, height,
+                                effectiveStride, static_cast<std::size_t>(width) * 4u)) {
+            return rejectFrame();
+        }
         CopyRgbxToBgra(frame.data(), effectiveStride, width, height, stageRaw_);
         rawWidth_ = width;
         rawHeight_ = height;
@@ -41,28 +82,32 @@ bool CpuFramePipeline::ConvertFrameToBgra(const std::vector<uint8_t>& frame,
     }
 
     if (IsEqualGUID(subtype, MFVideoFormat_NV12)) {
-        bool ok = ConvertNv12ToBgra(frame.data(), dataSize, stride != 0 ? stride : width, width, height, stageRaw_);
+        const bool ok = ConvertNv12ToBgra(frame.data(), availableBytes,
+                                          stride != 0 ? stride : width,
+                                          width, height, stageRaw_);
         if (ok) {
             rawWidth_ = width;
             rawHeight_ = height;
+        } else {
+            return rejectFrame();
         }
         return ok;
     }
 
     if (IsEqualGUID(subtype, MFVideoFormat_YUY2)) {
         const UINT packedStride = stride != 0 ? stride : width * 2u;
-        bool ok = ConvertYuy2ToBgra(frame.data(), dataSize, packedStride, width, height, stageRaw_);
+        const bool ok = ConvertYuy2ToBgra(frame.data(), availableBytes,
+                                          packedStride, width, height, stageRaw_);
         if (ok) {
             rawWidth_ = width;
             rawHeight_ = height;
+        } else {
+            return rejectFrame();
         }
         return ok;
     }
 
-    stageRaw_.clear();
-    rawWidth_ = 0;
-    rawHeight_ = 0;
-    return false;
+    return rejectFrame();
 }
 
 bool CpuFramePipeline::RotateRawBuffer(int quarterTurns, UINT& width, UINT& height)

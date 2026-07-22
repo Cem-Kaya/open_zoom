@@ -31,6 +31,40 @@ void ThrowIfFailed(HRESULT hr, const char* msg)
     }
 }
 
+constexpr ULONGLONG kMinFreeBytesToStart = 500ull * 1024ull * 1024ull;
+constexpr ULONGLONG kMinFreeBytesWhileRecording = 200ull * 1024ull * 1024ull;
+constexpr ULONGLONG kSpaceCheckIntervalMs = 5000;
+
+const char kDiskFullMessage[] = "Recording stopped: disk almost full. The recording so far was saved.";
+
+bool QueryFreeBytesForPath(const std::wstring& filePath, ULONGLONG& outFreeBytes)
+{
+    std::wstring directory = filePath;
+    const size_t separator = directory.find_last_of(L"\\/");
+    if (separator == std::wstring::npos) {
+        directory.clear();
+    } else {
+        directory.erase(separator + 1);
+    }
+
+    ULARGE_INTEGER freeBytesAvailable{};
+    if (!GetDiskFreeSpaceExW(directory.empty() ? nullptr : directory.c_str(),
+                             &freeBytesAvailable,
+                             nullptr,
+                             nullptr)) {
+        return false;
+    }
+    outFreeBytes = freeBytesAvailable.QuadPart;
+    return true;
+}
+
+bool IsDiskFullError(HRESULT hr)
+{
+    return hr == HRESULT_FROM_WIN32(ERROR_DISK_FULL) ||
+           hr == HRESULT_FROM_WIN32(ERROR_HANDLE_DISK_FULL) ||
+           hr == STG_E_MEDIUMFULL;
+}
+
 } // namespace
 
 VideoRecorder::VideoRecorder() = default;
@@ -48,6 +82,14 @@ void VideoRecorder::SetError(const std::string& err)
 bool VideoRecorder::Start(const std::wstring& filePath, UINT width, UINT height, UINT fps)
 {
     Stop();
+
+    ULONGLONG freeBytes = 0;
+    if (QueryFreeBytesForPath(filePath, freeBytes) && freeBytes < kMinFreeBytesToStart) {
+        SetError("Not enough free disk space to start recording (less than 500 MB available). "
+                 "Free up some space and try again.");
+        return false;
+    }
+
     try {
         if (!InitializeSink(filePath, width, height, fps)) {
             return false;
@@ -57,6 +99,9 @@ bool VideoRecorder::Start(const std::wstring& filePath, UINT width, UINT height,
         fps_ = std::max(1u, fps);
         rtStart_ = 0;
         rtDuration_ = 10'000'000LL / static_cast<LONGLONG>(fps_);
+        targetPath_ = filePath;
+        lastSpaceCheckTicks_ = GetTickCount64();
+        stopReason_ = StopReason::None;
         recording_ = true;
         lastError_.clear();
         return true;
@@ -71,10 +116,20 @@ bool VideoRecorder::Start(const std::wstring& filePath, UINT width, UINT height,
 
 void VideoRecorder::Stop()
 {
+    FinalizeAndStop(StopReason::Manual);
+}
+
+void VideoRecorder::FinalizeAndStop(StopReason reason)
+{
     if (sinkWriter_) {
+        // Finalize flushes the trailing fragment; already-written fragments are
+        // valid on disk regardless.
         sinkWriter_->Finalize();
     }
     sinkWriter_.Reset();
+    if (recording_) {
+        stopReason_ = reason;
+    }
     recording_ = false;
     rtStart_ = 0;
 }
@@ -85,6 +140,10 @@ bool VideoRecorder::InitializeSink(const std::wstring& filePath, UINT width, UIN
     ThrowIfFailed(MFCreateAttributes(attrs.GetAddressOf(), 3), "Create sink attributes");
     attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
     attrs->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
+    // Fragmented MP4: the file is playable up to the last completed fragment
+    // even if the process dies mid-recording (no moov finalize needed).
+    ThrowIfFailed(attrs->SetGUID(MF_TRANSCODE_CONTAINERTYPE, MFTranscodeContainerType_FMPEG4),
+                  "Set fragmented MP4 container");
 
     Microsoft::WRL::ComPtr<IMFSinkWriter> writer;
     ThrowIfFailed(MFCreateSinkWriterFromURL(filePath.c_str(), nullptr, attrs.Get(), writer.GetAddressOf()),
@@ -125,6 +184,20 @@ bool VideoRecorder::AddFrame(const uint8_t* bgraData, size_t strideBytes)
     if (!recording_ || !sinkWriter_ || !bgraData) {
         return false;
     }
+
+    // Periodic disk-space guard: stop cleanly before the volume runs dry so the
+    // fragmented MP4 written so far stays intact.
+    const ULONGLONG nowTicks = GetTickCount64();
+    if (nowTicks - lastSpaceCheckTicks_ >= kSpaceCheckIntervalMs) {
+        lastSpaceCheckTicks_ = nowTicks;
+        ULONGLONG freeBytes = 0;
+        if (QueryFreeBytesForPath(targetPath_, freeBytes) && freeBytes < kMinFreeBytesWhileRecording) {
+            FinalizeAndStop(StopReason::DiskFull);
+            SetError(kDiskFullMessage);
+            return false;
+        }
+    }
+
     try {
         const size_t bufferSize = strideBytes * frameHeight_;
         Microsoft::WRL::ComPtr<IMFMediaBuffer> buffer;
@@ -144,7 +217,13 @@ bool VideoRecorder::AddFrame(const uint8_t* bgraData, size_t strideBytes)
         ThrowIfFailed(sample->SetSampleTime(rtStart_), "SetSampleTime");
         ThrowIfFailed(sample->SetSampleDuration(rtDuration_), "SetSampleDuration");
 
-        ThrowIfFailed(sinkWriter_->WriteSample(streamIndex_, sample.Get()), "WriteSample");
+        const HRESULT writeHr = sinkWriter_->WriteSample(streamIndex_, sample.Get());
+        if (IsDiskFullError(writeHr)) {
+            FinalizeAndStop(StopReason::DiskFull);
+            SetError(kDiskFullMessage);
+            return false;
+        }
+        ThrowIfFailed(writeHr, "WriteSample");
         rtStart_ += rtDuration_;
         return true;
     } catch (const std::exception& e) {
@@ -152,7 +231,7 @@ bool VideoRecorder::AddFrame(const uint8_t* bgraData, size_t strideBytes)
     } catch (...) {
         SetError("Unknown exception adding frame");
     }
-    Stop();
+    FinalizeAndStop(StopReason::WriteFailed);
     return false;
 }
 

@@ -44,8 +44,10 @@ target_sources(open_zoom PRIVATE
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/frame_pipeline.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/media_writer.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/assistive_runtime.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/common/codex_app_server_client.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/d3d12/presenter.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/ui/main_window.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/ui/ai_settings_dialog.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/cuda/cuda_interop.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/cuda/cuda_kernels.hpp
 )
@@ -61,7 +63,19 @@ target_compile_definitions(open_zoom PRIVATE
 )
 
 if (WIN32)
+    target_sources(open_zoom PRIVATE
+        ${PROJECT_SOURCE_DIR}/assets/openzoom.rc
+        ${PROJECT_SOURCE_DIR}/assets/openzoom_resources.qrc
+    )
+
     find_package(Qt6 REQUIRED COMPONENTS Widgets Network)
+
+    # Optional text-to-speech support (Qt TextToSpeech module).
+    find_package(Qt6 QUIET COMPONENTS TextToSpeech)
+    if (Qt6TextToSpeech_FOUND)
+        target_link_libraries(open_zoom PRIVATE Qt6::TextToSpeech)
+        target_compile_definitions(open_zoom PRIVATE OPENZOOM_HAS_TTS=1)
+    endif()
 
     if (OPENZOOM_ENABLE_CUDA)
         find_package(CUDAToolkit REQUIRED)

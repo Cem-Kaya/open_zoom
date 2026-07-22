@@ -45,10 +45,26 @@ D3D12Presenter::D3D12Presenter() = default;
 
 D3D12Presenter::~D3D12Presenter()
 {
-    if (uploadBuffer_) {
-        uploadBuffer_->Unmap(0, nullptr);
-        uploadBuffer_.Reset();
-        uploadMappedPtr_ = nullptr;
+    if (commandQueue_ && fence_ && fenceEvent_) {
+        try {
+            WaitForGpu();
+        } catch (const std::exception& e) {
+            qWarning() << "D3D12Presenter teardown wait failed:" << e.what();
+        }
+    }
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        if (uploadBuffers_[i]) {
+            uploadBuffers_[i]->Unmap(0, nullptr);
+            uploadBuffers_[i].Reset();
+            uploadMappedPtrs_[i] = nullptr;
+        }
+    }
+    // The drain above retired any in-flight async readbacks, so the ring
+    // buffers and allocators can be released safely.
+    for (auto& slot : asyncReadbackSlots_) {
+        slot.buffer.Reset();
+        slot.allocator.Reset();
+        slot.inFlight = false;
     }
     if (fenceEvent_) {
         CloseHandle(fenceEvent_);
@@ -79,6 +95,12 @@ void D3D12Presenter::Resize(UINT width, UINT height)
     }
 
     WaitForGpu();
+    // The drain retired any in-flight async readbacks; their contents are for
+    // the old dimensions, so drop them. Callers simply never receive a
+    // TryGetCompletedReadback result for those frames.
+    for (auto& slot : asyncReadbackSlots_) {
+        slot.inFlight = false;
+    }
     for (auto& buffer : backBuffers_) {
         buffer.Reset();
     }
@@ -111,12 +133,19 @@ void D3D12Presenter::Present(const uint8_t* data, UINT width, UINT height)
     }
 
     EnsureUploadBuffer(width, height);
-    CopyToUpload(data, width, height);
 
-    ThrowIfFailed(commandAllocator_->Reset(), "Failed to reset command allocator");
-    ThrowIfFailed(commandList_->Reset(commandAllocator_.Get(), nullptr), "Failed to reset command list");
-
+    // Pipelined presentation: only wait until the GPU has finished the frame
+    // that previously used this slot's allocator/upload buffer/back buffer,
+    // instead of draining the whole queue every frame.
     const UINT backIndex = swapChain_->GetCurrentBackBufferIndex();
+    WaitForFrameSlot(backIndex);
+
+    CopyToUpload(data, width, height, backIndex);
+
+    ID3D12CommandAllocator* allocator = frameCommandAllocators_[backIndex].Get();
+    ThrowIfFailed(allocator->Reset(), "Failed to reset command allocator");
+    ThrowIfFailed(commandList_->Reset(allocator, nullptr), "Failed to reset command list");
+
     Microsoft::WRL::ComPtr<ID3D12Resource> backBuffer = backBuffers_[backIndex];
 
     auto barrierToCopy = TransitionBarrier(backBuffer.Get(), D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -128,7 +157,7 @@ void D3D12Presenter::Present(const uint8_t* data, UINT width, UINT height)
     dest.SubresourceIndex = 0;
 
     D3D12_TEXTURE_COPY_LOCATION src{};
-    src.pResource = uploadBuffer_.Get();
+    src.pResource = uploadBuffers_[backIndex].Get();
     src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     src.PlacedFootprint = uploadFootprint_;
 
@@ -144,7 +173,9 @@ void D3D12Presenter::Present(const uint8_t* data, UINT width, UINT height)
 
     ThrowIfFailed(swapChain_->Present(1, 0), "Failed to present swap chain");
 
-    WaitForGpu();
+    const UINT64 signalValue = ++fenceValue_;
+    ThrowIfFailed(commandQueue_->Signal(fence_.Get(), signalValue), "Failed to signal fence");
+    frameFenceValues_[backIndex] = signalValue;
 }
 
 void D3D12Presenter::PresentFromTexture(ID3D12Resource* texture,
@@ -162,10 +193,13 @@ void D3D12Presenter::PresentFromTexture(ID3D12Resource* texture,
 
     const bool useFenceSync = fenceSync && fenceSync->enable && fence_.Get() != nullptr;
 
-    ThrowIfFailed(commandAllocator_->Reset(), "Failed to reset command allocator");
-    ThrowIfFailed(commandList_->Reset(commandAllocator_.Get(), nullptr), "Failed to reset command list");
-
     const UINT backIndex = swapChain_->GetCurrentBackBufferIndex();
+    WaitForFrameSlot(backIndex);
+
+    ID3D12CommandAllocator* allocator = frameCommandAllocators_[backIndex].Get();
+    ThrowIfFailed(allocator->Reset(), "Failed to reset command allocator");
+    ThrowIfFailed(commandList_->Reset(allocator, nullptr), "Failed to reset command list");
+
     Microsoft::WRL::ComPtr<ID3D12Resource> backBuffer = backBuffers_[backIndex];
 
     if (useFenceSync && fenceSync->waitValue > 0) {
@@ -201,15 +235,26 @@ void D3D12Presenter::PresentFromTexture(ID3D12Resource* texture,
     commandQueue_->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
 
     if (useFenceSync) {
+        // Signal the shared fence as soon as the copy is queued so CUDA can
+        // begin its next frame once the copy executes; no CPU-side wait.
         ThrowIfFailed(commandQueue_->Signal(fence_.Get(), fenceSync->signalValue),
                       "Failed to signal shared fence");
-        fenceValue_ = fenceSync->signalValue;
-        WaitForFenceValue(fenceSync->signalValue);
-    } else {
-        WaitForGpu();
-    }
+        fenceValue_ = std::max(fenceValue_, fenceSync->signalValue);
 
-    ThrowIfFailed(swapChain_->Present(1, 0), "Failed to present swap chain");
+        ThrowIfFailed(swapChain_->Present(1, 0), "Failed to present swap chain");
+
+        // Extra internal signal after Present paces this frame slot's reuse.
+        const UINT64 slotSignal = ++fenceValue_;
+        ThrowIfFailed(commandQueue_->Signal(fence_.Get(), slotSignal), "Failed to signal fence");
+        frameFenceValues_[backIndex] = slotSignal;
+    } else {
+        // Without the shared external semaphore there is no cross-API sync:
+        // the caller's CUDA stream may write the source texture again as soon
+        // as we return, so the queued copy must fully complete first.
+        WaitForGpu();
+        ThrowIfFailed(swapChain_->Present(1, 0), "Failed to present swap chain");
+        frameFenceValues_[backIndex] = fenceValue_;
+    }
 }
 
 ID3D12Device* D3D12Presenter::GetDevice() const
@@ -288,13 +333,23 @@ void D3D12Presenter::CreateCommandObjects()
     ThrowIfFailed(device_->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&commandQueue_)),
                   "Failed to create D3D12 command queue");
 
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        ThrowIfFailed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                      IID_PPV_ARGS(&frameCommandAllocators_[i])),
+                      "Failed to create frame command allocator");
+    }
     ThrowIfFailed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                                  IID_PPV_ARGS(&commandAllocator_)),
-                  "Failed to create command allocator");
+                                                  IID_PPV_ARGS(&readbackCommandAllocator_)),
+                  "Failed to create readback command allocator");
+    for (auto& slot : asyncReadbackSlots_) {
+        ThrowIfFailed(device_->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+                                                      IID_PPV_ARGS(&slot.allocator)),
+                      "Failed to create async readback command allocator");
+    }
 
     ThrowIfFailed(device_->CreateCommandList(0,
                                              D3D12_COMMAND_LIST_TYPE_DIRECT,
-                                             commandAllocator_.Get(),
+                                             frameCommandAllocators_[0].Get(),
                                              nullptr,
                                              IID_PPV_ARGS(&commandList_)),
                   "Failed to create command list");
@@ -353,14 +408,20 @@ void D3D12Presenter::AcquireBackBuffers()
 
 void D3D12Presenter::EnsureUploadBuffer(UINT width, UINT height)
 {
-    if (uploadBuffer_ && uploadWidth_ == width && uploadHeight_ == height) {
+    if (uploadBuffers_[0] && uploadWidth_ == width && uploadHeight_ == height) {
         return;
     }
 
-    if (uploadBuffer_) {
-        uploadBuffer_->Unmap(0, nullptr);
-        uploadBuffer_.Reset();
-        uploadMappedPtr_ = nullptr;
+    if (uploadBuffers_[0]) {
+        // In-flight frames may still be copying from the old buffers.
+        WaitForGpu();
+        for (UINT i = 0; i < kFrameCount; ++i) {
+            if (uploadBuffers_[i]) {
+                uploadBuffers_[i]->Unmap(0, nullptr);
+                uploadBuffers_[i].Reset();
+                uploadMappedPtrs_[i] = nullptr;
+            }
+        }
     }
 
     D3D12_RESOURCE_DESC textureDesc{};
@@ -395,16 +456,18 @@ void D3D12Presenter::EnsureUploadBuffer(UINT width, UINT height)
     D3D12_HEAP_PROPERTIES heapProps{};
     heapProps.Type = D3D12_HEAP_TYPE_UPLOAD;
 
-    ThrowIfFailed(device_->CreateCommittedResource(&heapProps,
-                                                   D3D12_HEAP_FLAG_NONE,
-                                                   &bufferDesc,
-                                                   D3D12_RESOURCE_STATE_GENERIC_READ,
-                                                   nullptr,
-                                                   IID_PPV_ARGS(&uploadBuffer_)),
-                  "Failed to create upload buffer");
+    for (UINT i = 0; i < kFrameCount; ++i) {
+        ThrowIfFailed(device_->CreateCommittedResource(&heapProps,
+                                                       D3D12_HEAP_FLAG_NONE,
+                                                       &bufferDesc,
+                                                       D3D12_RESOURCE_STATE_GENERIC_READ,
+                                                       nullptr,
+                                                       IID_PPV_ARGS(&uploadBuffers_[i])),
+                      "Failed to create upload buffer");
 
-    ThrowIfFailed(uploadBuffer_->Map(0, nullptr, reinterpret_cast<void**>(&uploadMappedPtr_)),
-                  "Failed to map upload buffer");
+        ThrowIfFailed(uploadBuffers_[i]->Map(0, nullptr, reinterpret_cast<void**>(&uploadMappedPtrs_[i])),
+                      "Failed to map upload buffer");
+    }
 
     uploadWidth_ = width;
     uploadHeight_ = height;
@@ -465,8 +528,10 @@ bool D3D12Presenter::ReadbackTexture(ID3D12Resource* texture,
         readbackHeight_ = height;
     }
 
-    ThrowIfFailed(commandAllocator_->Reset(), "Failed to reset command allocator");
-    ThrowIfFailed(commandList_->Reset(commandAllocator_.Get(), nullptr), "Failed to reset command list");
+    // Dedicated allocator: every readback ends with a full WaitForGpu, so this
+    // allocator is always idle on entry even while present frames are in flight.
+    ThrowIfFailed(readbackCommandAllocator_->Reset(), "Failed to reset readback command allocator");
+    ThrowIfFailed(commandList_->Reset(readbackCommandAllocator_.Get(), nullptr), "Failed to reset command list");
 
     auto transitionSourceToCopy = TransitionBarrier(texture,
                                                     D3D12_RESOURCE_STATE_COMMON,
@@ -514,16 +579,167 @@ bool D3D12Presenter::ReadbackTexture(ID3D12Resource* texture,
     return true;
 }
 
-void D3D12Presenter::CopyToUpload(const uint8_t* data, UINT width, UINT height)
+bool D3D12Presenter::RequestReadback(ID3D12Resource* texture, UINT width, UINT height)
 {
+    if (!initialized_ || !texture || width == 0 || height == 0) {
+        return false;
+    }
+
+    AsyncReadbackSlot* slot = nullptr;
+    for (auto& candidate : asyncReadbackSlots_) {
+        if (!candidate.inFlight) {
+            slot = &candidate;
+            break;
+        }
+    }
+    if (!slot) {
+        // Both copies still in flight; the caller skips this frame's readback.
+        return false;
+    }
+
+    if (!slot->buffer || slot->width != width || slot->height != height) {
+        // Safe to recreate: the slot is free, so its previous copy (if any)
+        // has fully retired on the GPU.
+        D3D12_RESOURCE_DESC desc{};
+        desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        desc.Width = width;
+        desc.Height = height;
+        desc.DepthOrArraySize = 1;
+        desc.MipLevels = 1;
+        desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        desc.SampleDesc.Count = 1;
+        desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+
+        UINT numRows = 0;
+        UINT64 rowSizeInBytes = 0;
+        device_->GetCopyableFootprints(&desc,
+                                       0,
+                                       1,
+                                       0,
+                                       &slot->footprint,
+                                       &numRows,
+                                       &rowSizeInBytes,
+                                       &slot->totalBytes);
+
+        D3D12_RESOURCE_DESC bufferDesc{};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = slot->totalBytes;
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.Format = DXGI_FORMAT_UNKNOWN;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+
+        D3D12_HEAP_PROPERTIES heapProps{};
+        heapProps.Type = D3D12_HEAP_TYPE_READBACK;
+
+        slot->buffer.Reset();
+        ThrowIfFailed(device_->CreateCommittedResource(&heapProps,
+                                                       D3D12_HEAP_FLAG_NONE,
+                                                       &bufferDesc,
+                                                       D3D12_RESOURCE_STATE_COPY_DEST,
+                                                       nullptr,
+                                                       IID_PPV_ARGS(&slot->buffer)),
+                      "Failed to create async readback buffer");
+        slot->width = width;
+        slot->height = height;
+    }
+
+    // The slot's previous submission retired before it became free, so the
+    // allocator is idle and safe to reset without any CPU wait.
+    ThrowIfFailed(slot->allocator->Reset(), "Failed to reset async readback command allocator");
+    ThrowIfFailed(commandList_->Reset(slot->allocator.Get(), nullptr), "Failed to reset command list");
+
+    auto transitionSourceToCopy = TransitionBarrier(texture,
+                                                    D3D12_RESOURCE_STATE_COMMON,
+                                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
+    commandList_->ResourceBarrier(1, &transitionSourceToCopy);
+
+    D3D12_TEXTURE_COPY_LOCATION dest{};
+    dest.pResource = slot->buffer.Get();
+    dest.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    dest.PlacedFootprint = slot->footprint;
+
+    D3D12_TEXTURE_COPY_LOCATION src{};
+    src.pResource = texture;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    src.SubresourceIndex = 0;
+
+    commandList_->CopyTextureRegion(&dest, 0, 0, 0, &src, nullptr);
+
+    auto transitionSourceToCommon = TransitionBarrier(texture,
+                                                      D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_COMMON);
+    commandList_->ResourceBarrier(1, &transitionSourceToCommon);
+
+    ThrowIfFailed(commandList_->Close(), "Failed to close command list");
+
+    ID3D12CommandList* lists[] = { commandList_.Get() };
+    commandQueue_->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
+
+    const UINT64 signalValue = ++fenceValue_;
+    ThrowIfFailed(commandQueue_->Signal(fence_.Get(), signalValue), "Failed to signal fence");
+    slot->fenceValue = signalValue;
+    slot->inFlight = true;
+    return true;
+}
+
+bool D3D12Presenter::TryGetCompletedReadback(std::vector<uint8_t>& outBgra,
+                                             UINT& outWidth,
+                                             UINT& outHeight)
+{
+    if (!initialized_ || !fence_) {
+        return false;
+    }
+
+    const UINT64 completedValue = fence_->GetCompletedValue();
+    AsyncReadbackSlot* oldest = nullptr;
+    for (auto& slot : asyncReadbackSlots_) {
+        if (slot.inFlight && slot.fenceValue <= completedValue &&
+            (!oldest || slot.fenceValue < oldest->fenceValue)) {
+            oldest = &slot;
+        }
+    }
+    if (!oldest) {
+        return false;
+    }
+
+    const UINT width = oldest->width;
+    const UINT height = oldest->height;
+    outBgra.resize(static_cast<size_t>(width) * height * 4u);
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE range{0, static_cast<SIZE_T>(oldest->totalBytes)};
+    ThrowIfFailed(oldest->buffer->Map(0, &range, reinterpret_cast<void**>(&mapped)),
+                  "Failed to map async readback buffer");
+
+    const uint8_t* srcData = mapped + oldest->footprint.Offset;
+    const size_t srcPitch = oldest->footprint.Footprint.RowPitch;
+    for (UINT y = 0; y < height; ++y) {
+        const uint8_t* srcRow = srcData + static_cast<size_t>(y) * srcPitch;
+        uint8_t* dstRow = outBgra.data() + static_cast<size_t>(y) * width * 4u;
+        std::memcpy(dstRow, srcRow, static_cast<size_t>(width) * 4u);
+    }
+    D3D12_RANGE emptyRange{0, 0};
+    oldest->buffer->Unmap(0, &emptyRange);
+
+    oldest->inFlight = false;
+    outWidth = width;
+    outHeight = height;
+    return true;
+}
+
+void D3D12Presenter::CopyToUpload(const uint8_t* data, UINT width, UINT height, UINT slot)
+{
+    uint8_t* mapped = uploadMappedPtrs_[slot];
     const UINT rowPitch = uploadFootprint_.Footprint.RowPitch;
     const UINT srcPitch = width * 4;
     for (UINT row = 0; row < height; ++row) {
-        std::memcpy(uploadMappedPtr_ + static_cast<size_t>(row) * rowPitch,
+        std::memcpy(mapped + static_cast<size_t>(row) * rowPitch,
                     data + static_cast<size_t>(row) * srcPitch,
                     srcPitch);
         if (rowPitch > srcPitch) {
-            std::memset(uploadMappedPtr_ + static_cast<size_t>(row) * rowPitch + srcPitch,
+            std::memset(mapped + static_cast<size_t>(row) * rowPitch + srcPitch,
                         0,
                         rowPitch - srcPitch);
         }
@@ -551,6 +767,19 @@ void D3D12Presenter::WaitForFenceValue(UINT64 value)
                       "Failed to set fence completion event");
         WaitForSingleObject(fenceEvent_, INFINITE);
     }
+}
+
+void D3D12Presenter::WaitForFrameSlot(UINT slot)
+{
+    WaitForFenceValue(frameFenceValues_[slot]);
+}
+
+void D3D12Presenter::WaitForIdle()
+{
+    if (!initialized_) {
+        return;
+    }
+    WaitForGpu();
 }
 
 } // namespace openzoom

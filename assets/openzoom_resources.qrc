@@ -1,0 +1,12 @@
+<RCC>
+    <qresource prefix="/openzoom/icons">
+        <file alias="camera.svg">icons/lucide/camera.svg</file>
+        <file alias="record.svg">icons/lucide/circle.svg</file>
+        <file alias="explain.svg">icons/lucide/message-circle-question.svg</file>
+        <file alias="read.svg">icons/lucide/volume-2.svg</file>
+        <file alias="open-settings.svg">icons/lucide/square-arrow-out-up-right.svg</file>
+        <file alias="previous.svg">icons/lucide/chevron-left.svg</file>
+        <file alias="next.svg">icons/lucide/chevron-right.svg</file>
+        <file alias="close.svg">icons/lucide/x.svg</file>
+    </qresource>
+</RCC>
