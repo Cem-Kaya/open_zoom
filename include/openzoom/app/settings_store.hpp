@@ -1,11 +1,27 @@
 #pragma once
 
+#include <QRect>
 #include <QString>
+
+#include "openzoom/app/color_schemes.hpp"
 
 #include <optional>
 #include <vector>
 
 namespace openzoom::settings {
+
+enum class ViewportRateMode {
+    AutoUpTo120 = 0,
+    Fps60 = 1,
+    Fps90 = 2,
+    Fps120 = 3,
+    MatchDisplay = 4,
+};
+
+enum class ViewportFitModeSetting {
+    Fill = 0,
+    Fit = 1,
+};
 
 struct AdvancedConfig {
     QString id;
@@ -34,11 +50,36 @@ struct AdvancedConfig {
     bool stabilizationEnabled{false};
     float stabilizationStrength{0.85f};
     int displayColorMode{0};
+    color_schemes::ColorScheme colorScheme{};
     float contrast{1.0f};
     float brightness{0.0f};
     bool keystoneEnabled{false};
     bool autoContrastEnabled{false};
     float autoContrastStrength{0.7f};
+    bool autoTextClarityEnabled{false};
+    bool backgroundFlattenEnabled{false};
+    float backgroundFlattenStrength{0.8f};
+    bool adaptiveBinarizationEnabled{false};
+    float sauvolaStrength{0.28f};
+    float binarizationSoftness{0.06f};
+    int textPolarityMode{0};
+    int strokeWeight{0};
+    bool smartSharpenEnabled{false};
+    float smartSharpenStrength{0.45f};
+    bool claheEnabled{false};
+    float claheClipLimit{2.0f};
+    bool twoColorTextEnabled{false};
+    bool textHysteresisEnabled{false};
+    float textHysteresisStrength{0.08f};
+    bool selectiveSharpenEnabled{false};
+    bool focusDetectionEnabled{false};
+    float focusThreshold{0.012f};
+    bool glareSuppressionEnabled{false};
+    float glareSuppressionStrength{0.5f};
+    bool mlSuperResEnabled{false};
+    float mlSuperResStrength{0.65f};
+    bool mlSuperResPrefer2x{false};
+    bool mlSuperResUltra1440p{false};
 };
 
 // AI / assistive configuration. Values here take precedence; the matching
@@ -46,8 +87,8 @@ struct AdvancedConfig {
 struct AssistiveSettings {
     QString aiProvider{QStringLiteral("codex")};
     QString codexExecutablePath;
-    QString codexModel{QStringLiteral("gpt-5.5")};
-    QString codexReasoningEffort{QStringLiteral("xhigh")};
+    QString codexModel{QStringLiteral("gpt-5.6-tera")};
+    QString codexReasoningEffort{QStringLiteral("low")};
     bool codexInternetEnabled{false};
     bool codexCodingEnabled{false};
     QString codexWorkspaceDirectory;
@@ -91,8 +132,14 @@ struct PersistentSettings {
     bool virtualJoystick{false};
     bool controlsCollapsed{true};
     bool simpleUiMode{true};
+    int advancedPanelWidth{520};
+    ViewportRateMode viewportRateMode{ViewportRateMode::AutoUpTo120};
+    ViewportFitModeSetting viewportFitMode{ViewportFitModeSetting::Fill};
+    QRect assistiveOverlayGeometry;
+    bool setupAssistantDeclined{false};
     QString selectedPresetId;
     AdvancedConfig currentConfig{};
+    color_schemes::ColorScheme customColorScheme{};
     AssistiveSettings assistive{};
     std::vector<CodexConversation> codexConversations;
     std::vector<AdvancedConfig> customConfigs;

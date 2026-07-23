@@ -1,6 +1,7 @@
 # Architecture: Decomposing the App God-Object
 
-`src/app/app.cpp` is 2,233 lines and `OpenZoomApp` owns everything: 30+ raw widget
+`src/app/app.cpp` is 3,396 lines (as of 2026-07-22; it was 2,233 when this analysis was
+written and keeps growing) and `OpenZoomApp` owns everything: 30+ raw widget
 pointers, 39 `QSignalBlocker` uses, three independent "suspend sync" flags, the frame
 pipeline, CUDA/fence state, recording, settings, and assistive features. Almost every
 other improvement in this backlog is easier after this file is split.

@@ -1,20 +1,29 @@
 #ifdef _WIN32
 
 #include "openzoom/ui/main_window.hpp"
+#include "openzoom/ui/assistive_overlay.hpp"
+#include "openzoom/ui/joystick_overlay.hpp"
 
 #include "openzoom/app/app.hpp"
 #include "openzoom/app/constants.hpp"
 #include "openzoom/d3d12/presenter.hpp"
+#include "openzoom/ui/color_scheme_picker.hpp"
+#include "openzoom/ui/responsive_slider_row.hpp"
+#include "openzoom/ui/wheel_safe_combo_box.hpp"
 
 #include <QAbstractItemModel>
 #include <QAccessible>
 #include <QApplication>
 #include <QButtonGroup>
 #include <QCheckBox>
+#include <QColor>
 #include <QComboBox>
+#include <QDialog>
+#include <QDialogButtonBox>
 #include <QEvent>
 #include <QAbstractItemView>
 #include <QFrame>
+#include <QGridLayout>
 #include <QHBoxLayout>
 #include <QIcon>
 #include <QLabel>
@@ -37,6 +46,7 @@
 #include <QSizePolicy>
 #include <QSignalBlocker>
 #include <QSlider>
+#include <QSplitter>
 #include <QStyle>
 #include <QTabWidget>
 #include <QTextBrowser>
@@ -64,6 +74,8 @@ constexpr int kSimpleChromeIdleMs = 5000;
 constexpr int kSimpleChromeFadeMs = 260;
 constexpr int kModeToastMs = 1200;
 constexpr int kSimpleShortcutCount = 9;
+constexpr int kAdvancedPanelMinimumWidth = 360;
+constexpr int kAdvancedPanelDefaultWidth = 520;
 
 QString PlainPresetLabel(const QString& original)
 {
@@ -78,638 +90,23 @@ QString PlainPresetLabel(const QString& original)
     return original;
 }
 
-QString SpokenAssistiveText(QString body)
+bool HasEditableTextFocus()
 {
-    const std::array<QString, 2> sectionLabels{
-        QStringLiteral("OCR"),
-        QStringLiteral("Scene Explain")};
-    for (const QString& label : sectionLabels) {
-        const QString leadingHeader = label + QLatin1Char('\n');
-        if (body.startsWith(leadingHeader)) {
-            body.remove(0, leadingHeader.size());
+    QWidget* focus = QApplication::focusWidget();
+    while (focus) {
+        if (qobject_cast<QLineEdit*>(focus) ||
+            qobject_cast<QPlainTextEdit*>(focus)) {
+            return true;
         }
-        body.replace(QStringLiteral("\n\n%1\n").arg(label), QStringLiteral("\n\n"));
+        if (auto* combo = qobject_cast<QComboBox*>(focus); combo && combo->isEditable()) {
+            return true;
+        }
+        focus = focus->parentWidget();
     }
-    return body.trimmed();
+    return false;
 }
 
 }  // namespace
-
-RenderWidget::RenderWidget(QWidget* parent)
-    : QWidget(parent)
-{
-    setAttribute(Qt::WA_NativeWindow);
-    setAttribute(Qt::WA_PaintOnScreen);
-    setAttribute(Qt::WA_NoSystemBackground);
-    setFocusPolicy(Qt::StrongFocus);
-    setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
-}
-
-QPaintEngine* RenderWidget::paintEngine() const
-{
-    return nullptr;
-}
-
-void RenderWidget::setPresenter(D3D12Presenter* presenter)
-{
-    presenter_ = presenter;
-}
-
-bool RenderWidget::isPresenterReady() const
-{
-    return presenter_ && presenter_->IsInitialized();
-}
-
-void RenderWidget::showEvent(QShowEvent* event)
-{
-    QWidget::showEvent(event);
-    EnsurePresenter();
-}
-
-void RenderWidget::resizeEvent(QResizeEvent* event)
-{
-    QWidget::resizeEvent(event);
-    if (EnsurePresenter()) {
-        presenter_->Resize(std::max(1, width()), std::max(1, height()));
-    }
-}
-
-bool RenderWidget::EnsurePresenter()
-{
-    if (!presenter_ || presenter_->IsInitialized()) {
-        return presenter_ != nullptr;
-    }
-
-    HWND hwnd = reinterpret_cast<HWND>(winId());
-    presenter_->Initialize(hwnd, std::max(1, width()), std::max(1, height()));
-    return true;
-}
-
-AssistiveOverlay::AssistiveOverlay(QWidget* parent)
-    : QWidget(parent, Qt::Tool | Qt::FramelessWindowHint | Qt::NoDropShadowWindowHint)
-{
-    setObjectName(QStringLiteral("assistiveOverlay"));
-    setAttribute(Qt::WA_StyledBackground, true);
-    setFocusPolicy(Qt::NoFocus);
-    setMouseTracking(true);
-    setMinimumSize(360, 260);
-    setAccessibleName(QStringLiteral("Assistive results"));
-    setStyleSheet(QStringLiteral(R"(
-        QWidget#assistiveOverlay {
-            background: #111111;
-            border: 3px solid #f2f2f2;
-            border-radius: 8px;
-        }
-        QLabel#assistiveTitle {
-            color: #fff7d6;
-            font-size: 14pt;
-            font-weight: 700;
-            border: none;
-        }
-        QTextBrowser#assistiveBody {
-            color: #f5f5f5;
-            background: transparent;
-            border: none;
-            font-size: 13pt;
-            selection-background-color: #a84bc1;
-            selection-color: #ffffff;
-        }
-        QPushButton#assistiveReadButton, QPushButton#assistiveAskButton {
-            color: #ffffff;
-            background: #3d3d3d;
-            border: 2px solid #737373;
-            border-radius: 6px;
-            min-height: 36px;
-        }
-        QPushButton#assistiveReadButton:focus, QPushButton#assistiveAskButton:focus {
-            border: 3px solid #bd52d3;
-        }
-        QLineEdit#assistiveQuestion {
-            color: #ffffff;
-            background: #202020;
-            border: 2px solid #9a9a9a;
-            border-radius: 6px;
-            min-height: 38px;
-            padding: 2px 8px;
-        }
-        QLineEdit#assistiveQuestion:focus { border: 3px solid #bd52d3; }
-        QToolButton#assistiveCloseButton {
-            background: #080808;
-            border: 3px solid #ffffff;
-            border-radius: 6px;
-            padding: 7px;
-        }
-        QToolButton#assistiveCloseButton:hover,
-        QToolButton#assistiveCloseButton:focus {
-            background: #a747c5;
-            border-color: #ffffff;
-        }
-        QToolButton#assistiveCloseButton:pressed { background: #733087; }
-    )"));
-
-    auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(14, 10, 14, 12);
-    layout->setSpacing(8);
-
-    headerWidget_ = new QWidget(this);
-    headerWidget_->setObjectName(QStringLiteral("assistiveHeader"));
-    headerWidget_->setCursor(Qt::SizeAllCursor);
-    headerWidget_->setAccessibleName(QStringLiteral("Move assistive panel"));
-    auto* header = new QHBoxLayout(headerWidget_);
-    header->setContentsMargins(0, 0, 0, 0);
-    header->setSpacing(8);
-    titleLabel_ = new QLabel();
-    titleLabel_->setObjectName(QStringLiteral("assistiveTitle"));
-    titleLabel_->setAccessibleName(QStringLiteral("Assistive result title"));
-    header->addWidget(titleLabel_, 1);
-
-    closeButton_ = new QToolButton();
-    closeButton_->setObjectName(QStringLiteral("assistiveCloseButton"));
-    closeButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/close.svg")));
-    closeButton_->setIconSize(QSize(28, 28));
-    closeButton_->setToolTip(QStringLiteral("Close result"));
-    closeButton_->setAccessibleName(QStringLiteral("Close assistive result"));
-    closeButton_->setAccessibleDescription(
-        QStringLiteral("Hide the current OCR or scene explanation result"));
-    closeButton_->setFixedSize(52, 52);
-    header->addWidget(closeButton_);
-    layout->addWidget(headerWidget_);
-
-    bodyView_ = new QTextBrowser();
-    bodyView_->setObjectName(QStringLiteral("assistiveBody"));
-    bodyView_->setReadOnly(true);
-    bodyView_->setOpenExternalLinks(false);
-    bodyView_->setFocusPolicy(Qt::StrongFocus);
-    bodyView_->setTextInteractionFlags(Qt::TextSelectableByKeyboard | Qt::TextSelectableByMouse);
-    bodyView_->setAccessibleName(QStringLiteral("Assistive result text"));
-    bodyView_->setAccessibleDescription(
-        QStringLiteral("Streaming OCR and scene explanation result. Use arrow keys to read the text."));
-    layout->addWidget(bodyView_, 1);
-
-    auto* questionRow = new QHBoxLayout();
-    questionRow->setSpacing(8);
-    questionEdit_ = new QLineEdit();
-    questionEdit_->setObjectName(QStringLiteral("assistiveQuestion"));
-    questionEdit_->setPlaceholderText(QStringLiteral("Ask about this view..."));
-    questionEdit_->setAccessibleName(QStringLiteral("Question about the current view"));
-    questionEdit_->setAccessibleDescription(
-        QStringLiteral("Ask a follow-up question in the shared OpenZoom Assistant conversation"));
-    askButton_ = new QPushButton(QStringLiteral("Ask"));
-    askButton_->setObjectName(QStringLiteral("assistiveAskButton"));
-    askButton_->setEnabled(false);
-    askButton_->setAccessibleName(QStringLiteral("Ask Assistant"));
-    askButton_->setAccessibleDescription(
-        QStringLiteral("Send the question with the current camera view to OpenZoom Assistant"));
-    questionRow->addWidget(questionEdit_, 1);
-    questionRow->addWidget(askButton_);
-    layout->addLayout(questionRow);
-
-    auto* footer = new QHBoxLayout();
-    footer->addStretch(1);
-    readAloudButton_ = new QPushButton(QStringLiteral("Read Aloud"));
-    readAloudButton_->setObjectName(QStringLiteral("assistiveReadButton"));
-    readAloudButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/read.svg")));
-    readAloudButton_->setIconSize(QSize(24, 24));
-    readAloudButton_->setAccessibleName(QStringLiteral("Read assistive result aloud"));
-    readAloudButton_->setAccessibleDescription(
-        QStringLiteral("Speak the current OCR or scene explanation result"));
-    footer->addWidget(readAloudButton_);
-    layout->addLayout(footer);
-
-    connect(closeButton_, &QToolButton::clicked, this, [this]() {
-        hide();
-        emit Dismissed();
-    });
-    connect(readAloudButton_, &QPushButton::clicked, this, [this]() {
-        const QString speechText = SpokenAssistiveText(body_);
-        if (!speechText.isEmpty()) {
-            emit ReadAloudRequested(speechText);
-        }
-    });
-    connect(questionEdit_, &QLineEdit::textChanged, this, [this](const QString& text) {
-        askButton_->setEnabled(questionEdit_->isEnabled() && !text.trimmed().isEmpty());
-    });
-    connect(questionEdit_, &QLineEdit::returnPressed, this, &AssistiveOverlay::SubmitQuestion);
-    connect(askButton_, &QPushButton::clicked, this, &AssistiveOverlay::SubmitQuestion);
-    auto* closeShortcut = new QShortcut(QKeySequence::Cancel, this);
-    closeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
-    connect(closeShortcut, &QShortcut::activated, closeButton_, &QToolButton::click);
-
-    headerWidget_->installEventFilter(this);
-    titleLabel_->installEventFilter(this);
-    headerWidget_->setMouseTracking(true);
-    titleLabel_->setMouseTracking(true);
-
-    setVisible(false);
-    if (parent) {
-        parent->installEventFilter(this);
-        if (parent->window() != parent) {
-            parent->window()->installEventFilter(this);
-        }
-    }
-}
-
-void AssistiveOverlay::SetBusy(bool busy)
-{
-    questionEdit_->setEnabled(!busy);
-    askButton_->setEnabled(!busy && !questionEdit_->text().trimmed().isEmpty());
-}
-
-void AssistiveOverlay::SetContent(const QString& title, const QString& body, bool visible)
-{
-    if (title_ != title) {
-        title_ = title;
-        titleLabel_->setText(title_);
-    }
-    if (body_ != body) {
-        if (!body_.isEmpty() && body.startsWith(body_)) {
-            QTextCursor cursor = bodyView_->textCursor();
-            cursor.movePosition(QTextCursor::End);
-            cursor.insertText(body.mid(body_.size()));
-            bodyView_->setTextCursor(cursor);
-        } else {
-            bodyView_->setPlainText(body);
-        }
-        body_ = body;
-        bodyView_->ensureCursorVisible();
-    }
-    const bool shouldShow = visible && (!title_.isEmpty() || !body_.isEmpty());
-    const bool wasVisible = isVisible();
-    if (shouldShow != wasVisible) {
-        setVisible(shouldShow);
-    }
-    if (shouldShow && !wasVisible) {
-        raise();
-    }
-}
-
-bool AssistiveOverlay::eventFilter(QObject* watched, QEvent* event)
-{
-    const bool parentGeometryChanged = parentWidget() &&
-                                       (watched == parentWidget() || watched == parentWidget()->window()) &&
-                                       (event->type() == QEvent::Move ||
-                                        event->type() == QEvent::Resize ||
-                                        event->type() == QEvent::WindowStateChange);
-    if (parentGeometryChanged) {
-        UpdatePlacement();
-    } else if ((watched == headerWidget_ || watched == titleLabel_) &&
-               event->type() == QEvent::MouseButtonPress) {
-        auto* mouse = static_cast<QMouseEvent*>(event);
-        if (mouse->button() == Qt::LeftButton) {
-            BeginDrag(mouse->globalPosition().toPoint());
-            return true;
-        }
-    } else if ((watched == headerWidget_ || watched == titleLabel_) &&
-               event->type() == QEvent::MouseMove && dragging_) {
-        ContinueDrag(static_cast<QMouseEvent*>(event)->globalPosition().toPoint());
-        return true;
-    } else if ((watched == headerWidget_ || watched == titleLabel_) &&
-               event->type() == QEvent::MouseButtonRelease && dragging_) {
-        dragging_ = false;
-        releaseMouse();
-        return true;
-    }
-    return QWidget::eventFilter(watched, event);
-}
-
-void AssistiveOverlay::showEvent(QShowEvent* event)
-{
-    QWidget::showEvent(event);
-    UpdatePlacement();
-}
-
-void AssistiveOverlay::UpdatePlacement()
-{
-    if (!parentWidget()) {
-        return;
-    }
-    const int parentWidth = parentWidget()->width();
-    const int parentHeight = parentWidget()->height();
-    const QPoint parentOrigin = parentWidget()->mapToGlobal(QPoint(0, 0));
-    if (!placementInitialized_) {
-        const int margin = std::min(20, std::max(0, std::min(parentWidth, parentHeight) / 12));
-        const int overlayWidth = std::clamp(parentWidth * 3 / 5, 360, 760);
-        const int overlayHeight = std::clamp(parentHeight * 2 / 5, 260, 520);
-        setGeometry(ConstrainedGeometry(
-            QRect(parentOrigin + QPoint(margin, margin), QSize(overlayWidth, overlayHeight))));
-        parentOrigin_ = parentOrigin;
-        placementInitialized_ = true;
-        return;
-    }
-    QRect requested = geometry();
-    requested.translate(parentOrigin - parentOrigin_);
-    parentOrigin_ = parentOrigin;
-    const QRect constrained = ConstrainedGeometry(requested);
-    if (constrained != geometry()) {
-        setGeometry(constrained);
-    }
-}
-
-void AssistiveOverlay::mousePressEvent(QMouseEvent* event)
-{
-    if (event->button() == Qt::LeftButton && ResizeEdgesAt(event->position().toPoint()) != Qt::Edges{}) {
-        BeginResize(event->position().toPoint(), event->globalPosition().toPoint());
-        event->accept();
-        return;
-    }
-    QWidget::mousePressEvent(event);
-}
-
-void AssistiveOverlay::mouseMoveEvent(QMouseEvent* event)
-{
-    if (dragging_) {
-        ContinueDrag(event->globalPosition().toPoint());
-        event->accept();
-        return;
-    }
-    if (resizing_) {
-        ContinueResize(event->globalPosition().toPoint());
-        event->accept();
-        return;
-    }
-    UpdateResizeCursor(event->position().toPoint());
-    QWidget::mouseMoveEvent(event);
-}
-
-void AssistiveOverlay::mouseReleaseEvent(QMouseEvent* event)
-{
-    if (event->button() == Qt::LeftButton && dragging_) {
-        dragging_ = false;
-        releaseMouse();
-        event->accept();
-        return;
-    }
-    if (event->button() == Qt::LeftButton && resizing_) {
-        resizing_ = false;
-        resizeEdges_ = {};
-        releaseMouse();
-        UpdateResizeCursor(event->position().toPoint());
-        event->accept();
-        return;
-    }
-    QWidget::mouseReleaseEvent(event);
-}
-
-void AssistiveOverlay::leaveEvent(QEvent* event)
-{
-    if (!resizing_) {
-        unsetCursor();
-    }
-    QWidget::leaveEvent(event);
-}
-
-void AssistiveOverlay::BeginDrag(const QPoint& globalPosition)
-{
-    resizing_ = false;
-    dragging_ = false;
-    raise();
-    if (QWindow* nativeWindow = windowHandle(); nativeWindow && nativeWindow->startSystemMove()) {
-        return;
-    }
-    dragging_ = true;
-    pointerStartGlobal_ = globalPosition;
-    pointerStartGeometry_ = geometry();
-    grabMouse();
-}
-
-void AssistiveOverlay::ContinueDrag(const QPoint& globalPosition)
-{
-    if (!dragging_) {
-        return;
-    }
-    QRect requested = pointerStartGeometry_;
-    requested.moveTopLeft(pointerStartGeometry_.topLeft() + globalPosition - pointerStartGlobal_);
-    setGeometry(ConstrainedGeometry(requested));
-}
-
-void AssistiveOverlay::BeginResize(const QPoint& localPosition, const QPoint& globalPosition)
-{
-    resizeEdges_ = ResizeEdgesAt(localPosition);
-    if (resizeEdges_ == Qt::Edges{}) {
-        return;
-    }
-    dragging_ = false;
-    resizing_ = false;
-    raise();
-    if (QWindow* nativeWindow = windowHandle();
-        nativeWindow && nativeWindow->startSystemResize(resizeEdges_)) {
-        return;
-    }
-    resizing_ = true;
-    pointerStartGlobal_ = globalPosition;
-    pointerStartGeometry_ = geometry();
-    grabMouse();
-}
-
-void AssistiveOverlay::ContinueResize(const QPoint& globalPosition)
-{
-    if (!resizing_) {
-        return;
-    }
-    const QPoint delta = globalPosition - pointerStartGlobal_;
-    QRect requested = pointerStartGeometry_;
-    if (resizeEdges_.testFlag(Qt::LeftEdge)) requested.setLeft(requested.left() + delta.x());
-    if (resizeEdges_.testFlag(Qt::RightEdge)) requested.setRight(requested.right() + delta.x());
-    if (resizeEdges_.testFlag(Qt::TopEdge)) requested.setTop(requested.top() + delta.y());
-    if (resizeEdges_.testFlag(Qt::BottomEdge)) requested.setBottom(requested.bottom() + delta.y());
-    setGeometry(ConstrainedGeometry(requested.normalized()));
-}
-
-Qt::Edges AssistiveOverlay::ResizeEdgesAt(const QPoint& localPosition) const
-{
-    constexpr int kResizeMargin = 9;
-    Qt::Edges edges;
-    if (localPosition.x() <= kResizeMargin) edges |= Qt::LeftEdge;
-    if (localPosition.x() >= width() - kResizeMargin) edges |= Qt::RightEdge;
-    if (localPosition.y() <= kResizeMargin) edges |= Qt::TopEdge;
-    if (localPosition.y() >= height() - kResizeMargin) edges |= Qt::BottomEdge;
-    return edges;
-}
-
-void AssistiveOverlay::UpdateResizeCursor(const QPoint& localPosition)
-{
-    const Qt::Edges edges = ResizeEdgesAt(localPosition);
-    const bool horizontal = edges.testFlag(Qt::LeftEdge) || edges.testFlag(Qt::RightEdge);
-    const bool vertical = edges.testFlag(Qt::TopEdge) || edges.testFlag(Qt::BottomEdge);
-    if (horizontal && vertical) {
-        const bool forward = (edges.testFlag(Qt::LeftEdge) && edges.testFlag(Qt::TopEdge)) ||
-                             (edges.testFlag(Qt::RightEdge) && edges.testFlag(Qt::BottomEdge));
-        setCursor(forward ? Qt::SizeFDiagCursor : Qt::SizeBDiagCursor);
-    } else if (horizontal) {
-        setCursor(Qt::SizeHorCursor);
-    } else if (vertical) {
-        setCursor(Qt::SizeVerCursor);
-    } else {
-        unsetCursor();
-    }
-}
-
-QRect AssistiveOverlay::ConstrainedGeometry(const QRect& requested) const
-{
-    if (!parentWidget()) {
-        return requested;
-    }
-    const QRect available(parentWidget()->mapToGlobal(QPoint(0, 0)), parentWidget()->size());
-    const int minWidth = std::min(minimumWidth(), available.width());
-    const int minHeight = std::min(minimumHeight(), available.height());
-    const int width = std::clamp(requested.width(), minWidth, available.width());
-    const int height = std::clamp(requested.height(), minHeight, available.height());
-    const int x = std::clamp(requested.x(), available.left(),
-                             std::max(available.left(), available.right() - width + 1));
-    const int y = std::clamp(requested.y(), available.top(),
-                             std::max(available.top(), available.bottom() - height + 1));
-    return QRect(x, y, width, height);
-}
-
-void AssistiveOverlay::SubmitQuestion()
-{
-    const QString question = questionEdit_->text().trimmed();
-    if (question.isEmpty() || !questionEdit_->isEnabled()) {
-        questionEdit_->setFocus();
-        return;
-    }
-    questionEdit_->clear();
-    emit QuestionSubmitted(question);
-}
-
-JoystickOverlay::JoystickOverlay(QWidget* parent)
-    : QWidget(parent)
-{
-    setAttribute(Qt::WA_TransparentForMouseEvents, false);
-    setAttribute(Qt::WA_NoSystemBackground, true);
-    setAttribute(Qt::WA_TranslucentBackground, true);
-    setVisible(false);
-    if (parent) {
-        parent->installEventFilter(this);
-    }
-    setFixedSize(160, 160);
-    UpdateMask();
-    ResetKnob();
-}
-
-void JoystickOverlay::ResetKnob()
-{
-    knobPos_ = QPointF(width() / 2.0, height() / 2.0);
-    update();
-}
-
-bool JoystickOverlay::eventFilter(QObject* watched, QEvent* event)
-{
-    if (watched == parentWidget()) {
-        if (event->type() == QEvent::Resize) {
-            UpdatePlacement();
-        }
-    }
-    return QWidget::eventFilter(watched, event);
-}
-
-void JoystickOverlay::showEvent(QShowEvent* event)
-{
-    QWidget::showEvent(event);
-    UpdatePlacement();
-}
-
-void JoystickOverlay::paintEvent(QPaintEvent*)
-{
-    QPainter painter(this);
-    painter.setRenderHint(QPainter::Antialiasing, true);
-
-    painter.setCompositionMode(QPainter::CompositionMode_Source);
-    painter.fillRect(rect(), Qt::transparent);
-    painter.setCompositionMode(QPainter::CompositionMode_SourceOver);
-
-    painter.setBrush(QColor(60, 60, 60, 180));
-    painter.setPen(Qt::NoPen);
-    painter.drawEllipse(rect());
-
-    painter.setBrush(QColor(230, 230, 230, 230));
-    painter.setPen(Qt::NoPen);
-    painter.drawEllipse(KnobRect());
-}
-
-void JoystickOverlay::mousePressEvent(QMouseEvent* event)
-{
-    if (event->button() == Qt::LeftButton) {
-        dragging_ = true;
-        UpdateFromPosition(event->position());
-    }
-}
-
-void JoystickOverlay::mouseMoveEvent(QMouseEvent* event)
-{
-    if (dragging_) {
-        UpdateFromPosition(event->position());
-    }
-}
-
-void JoystickOverlay::mouseReleaseEvent(QMouseEvent* event)
-{
-    if (dragging_ && event->button() == Qt::LeftButton) {
-        dragging_ = false;
-        ResetKnob();
-        emit JoystickChanged(0.0f, 0.0f);
-        update();
-    }
-}
-
-void JoystickOverlay::resizeEvent(QResizeEvent* event)
-{
-    QWidget::resizeEvent(event);
-    UpdateMask();
-}
-
-QRectF JoystickOverlay::KnobRect() const
-{
-    constexpr qreal knobRadius = 24.0;
-    return QRectF(knobPos_.x() - knobRadius,
-                  knobPos_.y() - knobRadius,
-                  knobRadius * 2.0,
-                  knobRadius * 2.0);
-}
-
-void JoystickOverlay::UpdatePlacement()
-{
-    if (!parentWidget()) {
-        return;
-    }
-    const int margin = 20;
-    const int x = parentWidget()->width() - width() - margin;
-    const int y = parentWidget()->height() - height() - margin;
-    move(std::max(0, x), std::max(0, y));
-}
-
-void JoystickOverlay::UpdateFromPosition(const QPointF& pos)
-{
-    const QPointF center(width() / 2.0, height() / 2.0);
-    QPointF delta = pos - center;
-    const qreal maxRadius = width() / 2.0;
-    if (delta.manhattanLength() < 0.0001) {
-        delta = QPointF(0, 0);
-    }
-    const qreal distance = std::sqrt(delta.x() * delta.x() + delta.y() * delta.y());
-    if (distance > maxRadius) {
-        delta *= maxRadius / distance;
-    }
-    knobPos_ = center + delta;
-    update();
-
-    float normX = static_cast<float>(delta.x() / maxRadius);
-    float normY = static_cast<float>(delta.y() / maxRadius);
-    normX = std::clamp(normX, -1.0f, 1.0f);
-    normY = std::clamp(normY, -1.0f, 1.0f);
-
-    emit JoystickChanged(normX, -normY);
-}
-
-void JoystickOverlay::UpdateMask()
-{
-    if (width() <= 0 || height() <= 0) {
-        clearMask();
-        return;
-    }
-    QRegion region(rect(), QRegion::Ellipse);
-    setMask(region);
-}
 
 MainWindow::MainWindow()
 {
@@ -776,13 +173,14 @@ MainWindow::MainWindow()
             border-top-left-radius: 0;
             border-bottom-left-radius: 0;
         }
-        QWidget#topLeftPanel, QWidget#bottomLeftPanel, QWidget#bottomRightPanel,
+        QWidget#topLeftPanel, QWidget#bottomLeftPanel, QWidget#keystoneTrackingPanel, QWidget#bottomRightPanel,
         QWidget#modeGridPopup, QWidget#modeToast {
             background: #111111;
             border: 3px solid #f4f4f4;
         }
         QWidget#topLeftPanel { border-top: 0; border-left: 0; border-bottom-right-radius: 8px; }
         QWidget#bottomLeftPanel { border-bottom: 0; border-left: 0; border-top-right-radius: 8px; }
+        QWidget#keystoneTrackingPanel { border-bottom: 0; border-top-left-radius: 8px; border-top-right-radius: 8px; }
         QWidget#bottomRightPanel { border-bottom: 0; border-right: 0; border-top-left-radius: 8px; }
         QWidget#modeGridPopup {
             border-left: 0;
@@ -799,6 +197,7 @@ MainWindow::MainWindow()
         QPushButton#currentModeButton { font-size: 15pt; font-weight: 700; min-width: 220px; }
         QPushButton#previousModeButton, QPushButton#nextModeButton,
         QToolButton#modeGridButton { min-width: 52px; min-height: 52px; padding: 2px; }
+        QWidget#keystoneTrackingPanel QPushButton { min-width: 52px; min-height: 52px; padding: 2px; }
         QWidget#bottomRightPanel QPushButton { min-width: 88px; min-height: 58px; font-size: 11pt; }
         QToolButton#advancedTabArrow {
             min-width: 40px;
@@ -846,6 +245,21 @@ MainWindow::MainWindow()
             font-weight: 600;
             padding: 8px 0 4px 0;
             color: palette(highlight);
+        }
+        QLabel#featureStatusLabel {
+            font-size: 10pt;
+            font-weight: 600;
+            padding: 2px 0 4px 30px;
+        }
+        QSplitter#advancedContentSplitter::handle:horizontal {
+            width: 10px;
+            background: palette(mid);
+            border-left: 2px solid palette(dark);
+            border-right: 2px solid palette(light);
+        }
+        QSplitter#advancedContentSplitter::handle:horizontal:hover,
+        QSplitter#advancedContentSplitter::handle:horizontal:pressed {
+            background: palette(highlight);
         }
     )"));
 
@@ -903,8 +317,8 @@ MainWindow::MainWindow()
     recordButton_->setCheckable(true);
     explainNowButton_ = new QPushButton("Explain");
     readTextButton_ = new QPushButton("Read");
-    capturePhotoButton_->setToolTip("Capture processed photo");
-    recordButton_->setToolTip("Start or stop recording");
+    capturePhotoButton_->setToolTip("Capture original and processed photos");
+    recordButton_->setToolTip("Record original and processed videos");
     explainNowButton_->setToolTip("Explain the current view");
     readTextButton_->setToolTip("Read text in the current view");
 
@@ -924,7 +338,7 @@ MainWindow::MainWindow()
 
     advancedLayout->addWidget(makeSectionLabel("Global device"));
     auto* cameraLabel = new QLabel("Camera");
-    cameraCombo_ = new QComboBox();
+    cameraCombo_ = new WheelSafeComboBox();
     cameraCombo_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
     cameraCombo_->setMinimumContentsLength(20);
     cameraLabel->setBuddy(cameraCombo_);
@@ -932,7 +346,7 @@ MainWindow::MainWindow()
     advancedLayout->addWidget(cameraCombo_);
 
     auto* rotationLabel = new QLabel("Orientation");
-    rotationCombo_ = new QComboBox();
+    rotationCombo_ = new WheelSafeComboBox();
     rotationCombo_->addItem("0°");
     rotationCombo_->addItem("90°");
     rotationCombo_->addItem("180°");
@@ -945,6 +359,29 @@ MainWindow::MainWindow()
     advancedLayout->addWidget(rotationLabel);
     advancedLayout->addWidget(rotationCombo_);
 
+    auto* viewportRateLabel = new QLabel("Viewport motion rate");
+    viewportRateCombo_ = new WheelSafeComboBox();
+    viewportRateCombo_->addItem("Auto (up to 120 FPS)", 0);
+    viewportRateCombo_->addItem("60 FPS", 1);
+    viewportRateCombo_->addItem("90 FPS", 2);
+    viewportRateCombo_->addItem("120 FPS", 3);
+    viewportRateCombo_->addItem("Match display", 4);
+    viewportRateCombo_->setToolTip(
+        "Controls smooth pan and zoom presentation; camera frame rate is unchanged");
+    viewportRateLabel->setBuddy(viewportRateCombo_);
+    advancedLayout->addWidget(viewportRateLabel);
+    advancedLayout->addWidget(viewportRateCombo_);
+
+    auto* viewportFitLabel = new QLabel("Viewport framing");
+    viewportFitCombo_ = new WheelSafeComboBox();
+    viewportFitCombo_->addItem("Fill (crop)", 0);
+    viewportFitCombo_->addItem("Fit (show all)", 1);
+    viewportFitCombo_->setToolTip(
+        "Fill uses the full viewport without stretching; Fit preserves the entire image with bars");
+    viewportFitLabel->setBuddy(viewportFitCombo_);
+    advancedLayout->addWidget(viewportFitLabel);
+    advancedLayout->addWidget(viewportFitCombo_);
+
     controlsToggleButton_ = new QToolButton();
     controlsToggleButton_->setText("Advanced Tuning");
     controlsToggleButton_->setCheckable(true);
@@ -953,6 +390,9 @@ MainWindow::MainWindow()
     controlsToggleButton_->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     promotePresetButton_ = new QPushButton("Save As Quick Option");
     joystickCheckbox_ = new QCheckBox("Virtual Joystick");
+    joystickCheckbox_->setToolTip(
+        QStringLiteral("Show an on-screen control for moving the zoomed view"));
+    advancedLayout->addWidget(joystickCheckbox_);
 
     auto* modesLabel = new QLabel("Available modes");
     cameraModesList_ = new QListWidget();
@@ -974,9 +414,21 @@ MainWindow::MainWindow()
     advancedHeaderLayout->setSpacing(6);
     controlsToggleButton_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     promotePresetButton_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    resetProfileButton_ = new QPushButton(QStringLiteral("Reset Tuning"));
+    resetProfileButton_->setIcon(style()->standardIcon(QStyle::SP_DialogResetButton));
+    resetProfileButton_->setToolTip(
+        QStringLiteral("Reset profile-owned image and assistive tuning to defaults"));
+    resetProfileButton_->setAccessibleName(QStringLiteral("Reset current profile tuning"));
+    resetProfileButton_->setAccessibleDescription(
+        QStringLiteral("Reset profile-owned settings while keeping the camera, orientation, "
+                       "viewport rate, framing, and virtual joystick unchanged"));
+    resetProfileButton_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     advancedHeaderLayout->addWidget(controlsToggleButton_);
     advancedHeaderLayout->addWidget(promotePresetButton_);
+    advancedHeaderLayout->addWidget(resetProfileButton_);
     advancedLayout->addLayout(advancedHeaderLayout);
+    connect(resetProfileButton_, &QPushButton::clicked,
+            this, &MainWindow::resetCurrentProfileRequested);
 
     controlsContainer_ = new QWidget();
     auto* controlsLayout = new QVBoxLayout(controlsContainer_);
@@ -988,7 +440,7 @@ MainWindow::MainWindow()
     auto* bwLayout = new QHBoxLayout();
     bwLayout->setSpacing(8);
     bwCheckbox_ = new QCheckBox("Black && White");
-    bwSlider_ = new QSlider(Qt::Horizontal);
+    bwSlider_ = new WheelSafeSlider(Qt::Horizontal);
     bwSlider_->setRange(0, 255);
     bwSlider_->setPageStep(8);
     bwSlider_->setValue(128);
@@ -1000,7 +452,7 @@ MainWindow::MainWindow()
     auto* zoomLayout = new QHBoxLayout();
     zoomLayout->setSpacing(8);
     zoomCheckbox_ = new QCheckBox("Zoom");
-    zoomSlider_ = new QSlider(Qt::Horizontal);
+    zoomSlider_ = new WheelSafeSlider(Qt::Horizontal);
     zoomSlider_->setRange(kZoomSliderScale, kZoomSliderMaxMultiplier * kZoomSliderScale);
     zoomSlider_->setPageStep(10);
     zoomSlider_->setValue(kZoomSliderScale);
@@ -1012,7 +464,7 @@ MainWindow::MainWindow()
     auto* blurLayout = new QVBoxLayout();
     blurLayout->setSpacing(8);
     blurCheckbox_ = new QCheckBox("Gaussian Blur");
-    blurSigmaSlider_ = new QSlider(Qt::Horizontal);
+    blurSigmaSlider_ = new WheelSafeSlider(Qt::Horizontal);
     blurSigmaSlider_->setRange(kBlurSigmaSliderMin, kBlurSigmaSliderMax);
     blurSigmaSlider_->setPageStep(2);
     blurSigmaSlider_->setSingleStep(1);
@@ -1021,7 +473,7 @@ MainWindow::MainWindow()
     blurSigmaValueLabel_ = new QLabel("1.0");
     blurSigmaValueLabel_->setMinimumWidth(40);
 
-    blurRadiusSlider_ = new QSlider(Qt::Horizontal);
+    blurRadiusSlider_ = new WheelSafeSlider(Qt::Horizontal);
     blurRadiusSlider_->setRange(kSupportedBlurRadii.front(), kSupportedBlurRadii.back());
     blurRadiusSlider_->setPageStep(1);
     blurRadiusSlider_->setSingleStep(1);
@@ -1050,7 +502,7 @@ MainWindow::MainWindow()
     temporalLayout->setSpacing(8);
     temporalSmoothCheckbox_ = new QCheckBox("Temporal Smooth");
     temporalSmoothCheckbox_->setChecked(false);
-    temporalSmoothSlider_ = new QSlider(Qt::Horizontal);
+    temporalSmoothSlider_ = new WheelSafeSlider(Qt::Horizontal);
     temporalSmoothSlider_->setRange(5, 100);
     temporalSmoothSlider_->setPageStep(5);
     temporalSmoothSlider_->setValue(25);
@@ -1067,7 +519,7 @@ MainWindow::MainWindow()
     auto* stabilizationLayout = new QHBoxLayout();
     stabilizationLayout->setSpacing(8);
     stabilizationCheckbox_ = new QCheckBox("Stabilize Image");
-    stabilizationStrengthSlider_ = new QSlider(Qt::Horizontal);
+    stabilizationStrengthSlider_ = new WheelSafeSlider(Qt::Horizontal);
     stabilizationStrengthSlider_->setRange(0, 98);
     stabilizationStrengthSlider_->setPageStep(5);
     stabilizationStrengthSlider_->setValue(85);
@@ -1086,10 +538,30 @@ MainWindow::MainWindow()
     keystoneLayout->addStretch(1);
     controlsLayout->addLayout(keystoneLayout);
 
+    advancedKeystoneTrackingRow_ = new QWidget();
+    auto* advancedTrackingLayout = new QHBoxLayout(advancedKeystoneTrackingRow_);
+    advancedTrackingLayout->setContentsMargins(0, 0, 0, 0);
+    advancedTrackingLayout->setSpacing(8);
+    advancedTrackingLayout->addWidget(new QLabel("Correction tracking:"));
+    advancedKeystoneBackButton_ = new QPushButton("Back");
+    advancedKeystonePauseButton_ = new QPushButton("Stop");
+    advancedKeystoneNextButton_ = new QPushButton("Next");
+    advancedKeystoneBackButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/step-back.svg")));
+    advancedKeystonePauseButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/pause.svg")));
+    advancedKeystoneNextButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/step-forward.svg")));
+    for (QPushButton* button : {advancedKeystoneBackButton_, advancedKeystonePauseButton_,
+                                advancedKeystoneNextButton_}) {
+        button->setIconSize(QSize(22, 22));
+        advancedTrackingLayout->addWidget(button);
+    }
+    advancedTrackingLayout->addStretch(1);
+    advancedKeystoneTrackingRow_->setEnabled(false);
+    controlsLayout->addWidget(advancedKeystoneTrackingRow_);
+
     auto* autoContrastLayout = new QHBoxLayout();
     autoContrastLayout->setSpacing(8);
     autoContrastCheckbox_ = new QCheckBox("Auto Contrast");
-    autoContrastStrengthSlider_ = new QSlider(Qt::Horizontal);
+    autoContrastStrengthSlider_ = new WheelSafeSlider(Qt::Horizontal);
     autoContrastStrengthSlider_->setRange(0, 100);
     autoContrastStrengthSlider_->setPageStep(5);
     autoContrastStrengthSlider_->setValue(70);
@@ -1100,33 +572,141 @@ MainWindow::MainWindow()
     autoContrastLayout->addWidget(autoContrastStrengthSlider_, 1);
     controlsLayout->addLayout(autoContrastLayout);
 
+    controlsLayout->addWidget(makeSectionLabel("Text clarity"));
+    auto* textClarityLayout = new QVBoxLayout();
+    textClarityLayout->setSpacing(8);
+    textClarityCheckbox_ = new QCheckBox("Auto Text Clarity");
+    textClarityLayout->addWidget(textClarityCheckbox_);
+
+    auto addTextSliderRow = [textClarityLayout](QCheckBox*& checkbox,
+                                                const QString& label,
+                                                QSlider*& slider,
+                                                int minimum, int maximum, int value) {
+        checkbox = new QCheckBox(label);
+        slider = new WheelSafeSlider(Qt::Horizontal);
+        slider->setRange(minimum, maximum);
+        slider->setPageStep(std::max(1, (maximum - minimum) / 10));
+        slider->setValue(value);
+        textClarityLayout->addWidget(new ResponsiveSliderRow(checkbox, slider));
+    };
+    addTextSliderRow(backgroundFlattenCheckbox_, "Flatten Background",
+                     backgroundFlattenStrengthSlider_, 0, 100, 80);
+    addTextSliderRow(adaptiveBinarizationCheckbox_, "Adaptive Text",
+                     sauvolaStrengthSlider_, 10, 50, 28);
+
+    auto* softRow = new QHBoxLayout();
+    softRow->addWidget(new QLabel("Edge softness"));
+    binarizationSoftnessSlider_ = new WheelSafeSlider(Qt::Horizontal);
+    binarizationSoftnessSlider_->setRange(0, 25);
+    binarizationSoftnessSlider_->setValue(6);
+    softRow->addWidget(binarizationSoftnessSlider_, 1);
+    textClarityLayout->addLayout(softRow);
+
+    auto* polarityRow = new QHBoxLayout();
+    polarityRow->addWidget(new QLabel("Text polarity"));
+    textPolarityCombo_ = new WheelSafeComboBox();
+    textPolarityCombo_->addItems({"Auto", "Dark on light", "Light on dark"});
+    polarityRow->addWidget(textPolarityCombo_, 1);
+    textClarityLayout->addLayout(polarityRow);
+
+    auto* strokeRow = new QHBoxLayout();
+    strokeRow->addWidget(new QLabel("Stroke weight"));
+    strokeWeightSlider_ = new WheelSafeSlider(Qt::Horizontal);
+    strokeWeightSlider_->setRange(-3, 3);
+    strokeWeightSlider_->setValue(0);
+    strokeWeightSlider_->setTickInterval(1);
+    strokeWeightSlider_->setTickPosition(QSlider::TicksBelow);
+    strokeRow->addWidget(strokeWeightSlider_, 1);
+    textClarityLayout->addLayout(strokeRow);
+
+    addTextSliderRow(smartSharpenCheckbox_, "Smart Sharpen",
+                     smartSharpenStrengthSlider_, 0, 100, 45);
+    addTextSliderRow(claheCheckbox_, "Local Contrast (CLAHE)",
+                     claheClipLimitSlider_, 10, 80, 20);
+    twoColorTextCheckbox_ = new QCheckBox("Two-Color Reading");
+    textClarityLayout->addWidget(twoColorTextCheckbox_);
+    addTextSliderRow(textHysteresisCheckbox_, "Steady Text Edges",
+                     textHysteresisStrengthSlider_, 0, 25, 8);
+    selectiveSharpenCheckbox_ = new QCheckBox("Sharpen Text Only");
+    textClarityLayout->addWidget(selectiveSharpenCheckbox_);
+    addTextSliderRow(focusDetectionCheckbox_, "Warn When Out of Focus",
+                     focusThresholdSlider_, 1, 100, 12);
+    addTextSliderRow(glareSuppressionCheckbox_, "Suppress Glare",
+                     glareSuppressionStrengthSlider_, 0, 100, 50);
+    addTextSliderRow(mlTextSuperResolutionCheckbox_, "NVIDIA Super Resolution",
+                     mlTextSuperResolutionStrengthSlider_, 0, 100, 65);
+    mlTextSuperResolutionUltra1440pCheckbox_ =
+        new QCheckBox(QStringLiteral("Ultra quality (full frame, up to 1440p)"));
+    mlTextSuperResolutionUltra1440pCheckbox_->setToolTip(
+        QStringLiteral("Build a separate high-resolution AI scene from the full "
+                       "camera frame, then apply viewport zoom and cropping. "
+                       "720p cameras upscale 2x to 1440p; 1080p cameras upscale "
+                       "4/3x to 1440p; 1440p cameras remain native."));
+    textClarityLayout->addWidget(mlTextSuperResolutionUltra1440pCheckbox_);
+    mlTextSuperResolutionPrefer2xCheckbox_ =
+        new QCheckBox(QStringLiteral("Faster 2x mode (narrower view)"));
+    mlTextSuperResolutionPrefer2xCheckbox_->setToolTip(
+        QStringLiteral("Optional speed mode. Raises magnification to at least "
+                       "2x, narrowing the visible source crop from 960x540 to "
+                       "640x360 for a 1280x720 target. Leave off for maximum "
+                       "source detail and a wider view."));
+    textClarityLayout->addWidget(mlTextSuperResolutionPrefer2xCheckbox_);
+    mlTextSuperResolutionStatusLabel_ = new QLabel(QStringLiteral("Off"));
+    mlTextSuperResolutionStatusLabel_->setObjectName(QStringLiteral("featureStatusLabel"));
+    mlTextSuperResolutionStatusLabel_->setWordWrap(true);
+    mlTextSuperResolutionStatusLabel_->setMinimumWidth(0);
+    mlTextSuperResolutionStatusLabel_->setSizePolicy(QSizePolicy::Ignored,
+                                                     QSizePolicy::Preferred);
+    mlTextSuperResolutionStatusLabel_->setAccessibleName(
+        QStringLiteral("NVIDIA Super Resolution status"));
+    textClarityLayout->addWidget(mlTextSuperResolutionStatusLabel_);
+    mlTextSuperResolutionOverrideCheckbox_ =
+        new QCheckBox(QStringLiteral("Ignore 24 ms performance limit"));
+    mlTextSuperResolutionOverrideCheckbox_->setVisible(false);
+    mlTextSuperResolutionOverrideCheckbox_->setAccessibleName(
+        QStringLiteral("Ignore NVIDIA Super Resolution performance limit"));
+    mlTextSuperResolutionOverrideCheckbox_->setAccessibleDescription(
+        QStringLiteral("Keep NVIDIA Super Resolution active when its measured "
+                       "latency exceeds 24 milliseconds. This can reduce camera frame rate."));
+    mlTextSuperResolutionOverrideCheckbox_->setToolTip(
+        QStringLiteral("Keep SuperRes active even when its average GPU time exceeds 24 ms"));
+    connect(mlTextSuperResolutionOverrideCheckbox_,
+            &QCheckBox::toggled,
+            this,
+            &MainWindow::superResPerformanceOverrideChanged);
+    textClarityLayout->addWidget(mlTextSuperResolutionOverrideCheckbox_);
+#if OPENZOOM_ENABLE_TEXT_SR
+    mlTextSuperResolutionCheckbox_->setToolTip(
+        "Use NVIDIA Video Effects SuperRes at 1.33x zoom and above; falls back to NIS automatically");
+    mlTextSuperResolutionStrengthSlider_->setToolTip(
+        "Set the NVIDIA SuperRes enhancement strength for this preset");
+#else
+    mlTextSuperResolutionCheckbox_->setEnabled(false);
+    mlTextSuperResolutionStrengthSlider_->setEnabled(false);
+    mlTextSuperResolutionUltra1440pCheckbox_->setEnabled(false);
+    mlTextSuperResolutionPrefer2xCheckbox_->setEnabled(false);
+    mlTextSuperResolutionCheckbox_->setToolTip(
+        "Unavailable in this build; requires OPENZOOM_ENABLE_TEXT_SR");
+#endif
+    controlsLayout->addLayout(textClarityLayout);
+
     auto* displayColorLayout = new QVBoxLayout();
     displayColorLayout->setSpacing(8);
     displayColorLayout->addWidget(new QLabel("Display colors"));
-    displayColorCombo_ = new QComboBox();
-    displayColorCombo_->addItem("Normal Colors");
-    displayColorCombo_->addItem("Inverted");
-    displayColorCombo_->addItem("White on Black");
-    displayColorCombo_->addItem("Yellow on Black");
-    displayColorCombo_->addItem("Black on Yellow");
-    displayColorCombo_->setCurrentIndex(0);
-    displayColorLayout->addWidget(displayColorCombo_);
-    contrastSlider_ = new QSlider(Qt::Horizontal);
+    displayColorPicker_ = new ColorSchemePicker();
+    displayColorLayout->addWidget(displayColorPicker_);
+    contrastSlider_ = new WheelSafeSlider(Qt::Horizontal);
     contrastSlider_->setRange(25, 400);
     contrastSlider_->setPageStep(25);
     contrastSlider_->setValue(100);
-    auto* contrastLayout = new QHBoxLayout();
-    contrastLayout->addWidget(new QLabel("Contrast"));
-    contrastLayout->addWidget(contrastSlider_, 1);
-    displayColorLayout->addLayout(contrastLayout);
-    brightnessSlider_ = new QSlider(Qt::Horizontal);
+    displayColorLayout->addWidget(
+        new ResponsiveSliderRow(new QLabel("Contrast"), contrastSlider_));
+    brightnessSlider_ = new WheelSafeSlider(Qt::Horizontal);
     brightnessSlider_->setRange(-100, 100);
     brightnessSlider_->setPageStep(10);
     brightnessSlider_->setValue(0);
-    auto* brightnessLayout = new QHBoxLayout();
-    brightnessLayout->addWidget(new QLabel("Brightness"));
-    brightnessLayout->addWidget(brightnessSlider_, 1);
-    displayColorLayout->addLayout(brightnessLayout);
+    displayColorLayout->addWidget(
+        new ResponsiveSliderRow(new QLabel("Brightness"), brightnessSlider_));
     controlsLayout->addLayout(displayColorLayout);
 
     controlsLayout->addWidget(makeSectionLabel("Assistive"));
@@ -1141,11 +721,16 @@ MainWindow::MainWindow()
     aiSettingsButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/open-settings.svg")));
     aiSettingsButton_->setIconSize(QSize(26, 26));
     aiSettingsButton_->setToolTip(QStringLiteral("Open AI Settings dialog"));
+    aiSettingsButton_->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
     openNotesButton_ = new QPushButton("Open Notes");
+    setupAssistantButton_ = new QPushButton(QStringLiteral("Setup & Downloads..."));
+    setupAssistantButton_->setToolTip(
+        QStringLiteral("Install or remove optional OCR and NVIDIA Video Effects tools"));
     assistiveLayout->addWidget(ocrAssistCheckbox_);
     assistiveLayout->addWidget(vlmAssistCheckbox_);
     assistiveLayout->addWidget(assistiveOverlayCheckbox_);
     assistiveLayout->addWidget(openNotesButton_);
+    assistiveLayout->addWidget(setupAssistantButton_);
     controlsLayout->addLayout(assistiveLayout);
 
     controlsLayout->addWidget(makeSectionLabel("Sharpen and focus"));
@@ -1153,11 +738,11 @@ MainWindow::MainWindow()
     spatialLayout->setSpacing(6);
     spatialSharpenCheckbox_ = new QCheckBox("Spatial Sharpen");
     spatialSharpenCheckbox_->setChecked(false);
-    spatialBackendCombo_ = new QComboBox();
+    spatialBackendCombo_ = new WheelSafeComboBox();
     spatialBackendCombo_->addItem("AMD FSR 1.0 (EASU + RCAS)");
     spatialBackendCombo_->addItem("NVIDIA Image Scaling (default)");
     spatialBackendCombo_->setEnabled(false);
-    spatialSharpnessSlider_ = new QSlider(Qt::Horizontal);
+    spatialSharpnessSlider_ = new WheelSafeSlider(Qt::Horizontal);
     spatialSharpnessSlider_->setRange(0, 100);
     spatialSharpnessSlider_->setPageStep(5);
     spatialSharpnessSlider_->setValue(25);
@@ -1178,7 +763,7 @@ MainWindow::MainWindow()
     auto* focusLayout = new QVBoxLayout();
     focusLayout->setSpacing(8);
     auto* focusXLabel = new QLabel("Focus X:");
-    zoomCenterXSlider_ = new QSlider(Qt::Horizontal);
+    zoomCenterXSlider_ = new WheelSafeSlider(Qt::Horizontal);
     zoomCenterXSlider_->setRange(0, kZoomFocusSliderScale);
     zoomCenterXSlider_->setPageStep(5);
     zoomCenterXSlider_->setValue(kZoomFocusSliderScale / 2);
@@ -1188,7 +773,7 @@ MainWindow::MainWindow()
     focusLayout->addLayout(focusXLayout);
 
     auto* focusYLabel = new QLabel("Focus Y:");
-    zoomCenterYSlider_ = new QSlider(Qt::Horizontal);
+    zoomCenterYSlider_ = new WheelSafeSlider(Qt::Horizontal);
     zoomCenterYSlider_->setRange(0, kZoomFocusSliderScale);
     zoomCenterYSlider_->setPageStep(5);
     zoomCenterYSlider_->setValue(kZoomFocusSliderScale / 2);
@@ -1209,7 +794,6 @@ MainWindow::MainWindow()
     focusMarkerCheckbox_->setChecked(false);
     focusMarkerCheckbox_->setToolTip("Overlay a red marker at the current zoom focus");
     debugLayout->addWidget(focusMarkerCheckbox_);
-    debugLayout->addWidget(joystickCheckbox_);
     debugLayout->addStretch(1);
     controlsLayout->addLayout(debugLayout);
     auto* processingStatusLayout = new QVBoxLayout();
@@ -1217,22 +801,50 @@ MainWindow::MainWindow()
     processingStatusLayout->addWidget(new QLabel(QStringLiteral("Pipeline status")));
     processingStatusLayout->addWidget(processingStatusLabel_);
     controlsLayout->addLayout(processingStatusLayout);
-
+#if OPENZOOM_ENABLE_TEXT_SR
+    maxineAttribution_ = new QLabel(QStringLiteral("SuperRes powered by NVIDIA Maxine\u2122"));
+    maxineAttribution_->setWordWrap(true);
+    maxineAttribution_->setObjectName(QStringLiteral("vendorAttribution"));
+    maxineAttribution_->setAccessibleName(QStringLiteral("NVIDIA Maxine attribution"));
+    controlsLayout->addWidget(maxineAttribution_);
+#endif
     advancedLayout->addWidget(controlsContainer_);
+    // QScrollArea expands short content to the viewport. Keep all inspector
+    // rows packed at the top when Advanced Tuning is collapsed.
+    advancedLayout->addStretch(1);
 
     auto* advancedScroll = new QScrollArea();
     advancedScroll->setWidget(advancedPage);
     advancedScroll->setWidgetResizable(true);
     advancedScroll->setFrameShape(QFrame::NoFrame);
     advancedScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
-    advancedScroll->setMinimumWidth(380);
-    advancedScroll->setMaximumWidth(520);
-    advancedScroll->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+    advancedScroll->setMinimumWidth(0);
+    advancedScroll->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+
+    auto* imageTabPage = new QWidget();
+    auto* imageTabLayout = new QVBoxLayout(imageTabPage);
+    imageTabLayout->setContentsMargins(8, 8, 8, 0);
+    imageTabLayout->setSpacing(8);
+    imageTabLayout->addWidget(aiSettingsButton_);
+    imageTabLayout->addWidget(advancedScroll, 1);
 
     auto* assistantPage = new QWidget();
     auto* assistantLayout = new QVBoxLayout(assistantPage);
     assistantLayout->setContentsMargins(10, 8, 10, 10);
     assistantLayout->setSpacing(8);
+
+    auto* assistantAiSettingsButton = new QPushButton(QStringLiteral("AI Settings"));
+    assistantAiSettingsButton->setObjectName(QStringLiteral("advancedNavButton"));
+    assistantAiSettingsButton->setIcon(QIcon(QStringLiteral(":/openzoom/icons/open-settings.svg")));
+    assistantAiSettingsButton->setIconSize(QSize(26, 26));
+    assistantAiSettingsButton->setToolTip(QStringLiteral("Open AI Settings dialog"));
+    assistantAiSettingsButton->setAccessibleName(QStringLiteral("AI Settings"));
+    assistantAiSettingsButton->setAccessibleDescription(
+        QStringLiteral("Configure the AI vision server, OCR engine, and speech output"));
+    assistantAiSettingsButton->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    connect(assistantAiSettingsButton, &QPushButton::clicked,
+            aiSettingsButton_, &QPushButton::click);
+    assistantLayout->addWidget(assistantAiSettingsButton);
 
     assistantConnectionLabel_ = new QLabel("Starting Codex...");
     assistantConnectionLabel_->setWordWrap(true);
@@ -1296,7 +908,7 @@ MainWindow::MainWindow()
     assistantLayout->addWidget(assistantTabs, 1);
 
     auto* advancedTabs = new QTabWidget();
-    advancedTabs->addTab(advancedScroll, "Image");
+    advancedTabs->addTab(imageTabPage, "Image");
     advancedTabs->addTab(assistantPage, "Assistant");
     auto* previousAdvancedTabButton = new QToolButton();
     previousAdvancedTabButton->setObjectName(QStringLiteral("advancedTabArrow"));
@@ -1317,8 +929,15 @@ MainWindow::MainWindow()
     auto* rightTabCorner = new QWidget();
     auto* rightTabCornerLayout = new QHBoxLayout(rightTabCorner);
     rightTabCornerLayout->setContentsMargins(4, 0, 0, 0);
-    rightTabCornerLayout->setSpacing(4);
-    rightTabCornerLayout->addWidget(aiSettingsButton_);
+    helpButton_ = new QToolButton();
+    helpButton_->setObjectName(QStringLiteral("advancedTabArrow"));
+    helpButton_->setIcon(style()->standardIcon(QStyle::SP_MessageBoxQuestion));
+    helpButton_->setIconSize(QSize(26, 26));
+    helpButton_->setToolTip(QStringLiteral("Open controls and features help"));
+    helpButton_->setAccessibleName(QStringLiteral("Open help"));
+    helpButton_->setAccessibleDescription(
+        QStringLiteral("Show a guide to OpenZoom controls and features"));
+    rightTabCornerLayout->addWidget(helpButton_);
     rightTabCornerLayout->addWidget(nextAdvancedTabButton);
     advancedTabs->setCornerWidget(leftTabCorner, Qt::TopLeftCorner);
     advancedTabs->setCornerWidget(rightTabCorner, Qt::TopRightCorner);
@@ -1330,21 +949,35 @@ MainWindow::MainWindow()
         const int count = advancedTabs->count();
         if (count > 0) advancedTabs->setCurrentIndex((advancedTabs->currentIndex() + 1) % count);
     });
-    advancedTabs->setMinimumWidth(420);
-    advancedTabs->setMaximumWidth(580);
-    advancedTabs->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+    connect(helpButton_, &QToolButton::clicked, this, &MainWindow::ShowHelpDialog);
+    advancedTabs->setMinimumWidth(kAdvancedPanelMinimumWidth);
+    advancedTabs->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
     advancedPanel_ = advancedTabs;
 
     renderWidget_ = new RenderWidget();
     renderWidget_->installEventFilter(this);
     renderWidget_->setMouseTracking(true);
     renderWidget_->setMinimumSize(320, 240);
-    auto* contentLayout = new QHBoxLayout();
-    contentLayout->setContentsMargins(0, 0, 0, 0);
-    contentLayout->setSpacing(0);
-    contentLayout->addWidget(renderWidget_, 1);
-    contentLayout->addWidget(advancedPanel_, 0);
-    rootLayout->addLayout(contentLayout, 1);
+    contentSplitter_ = new QSplitter(Qt::Horizontal);
+    contentSplitter_->setObjectName(QStringLiteral("advancedContentSplitter"));
+    contentSplitter_->setChildrenCollapsible(false);
+    contentSplitter_->setHandleWidth(10);
+    contentSplitter_->addWidget(renderWidget_);
+    contentSplitter_->addWidget(advancedPanel_);
+    contentSplitter_->setStretchFactor(0, 1);
+    contentSplitter_->setStretchFactor(1, 0);
+    contentSplitter_->setSizes({width() - kAdvancedPanelDefaultWidth,
+                                kAdvancedPanelDefaultWidth});
+    if (QSplitterHandle* handle = contentSplitter_->handle(1)) {
+        handle->setToolTip(QStringLiteral("Drag to resize Advanced settings"));
+        handle->setAccessibleName(QStringLiteral("Resize Advanced settings"));
+    }
+    connect(contentSplitter_, &QSplitter::splitterMoved, this, [this](int, int) {
+        if (advancedPanel_ && advancedPanel_->isVisible() && advancedPanel_->width() > 0) {
+            advancedPanelPreferredWidth_ = advancedPanel_->width();
+        }
+    });
+    rootLayout->addWidget(contentSplitter_, 1);
 
     // D3D presents directly into a native window, so frameless owned tool
     // windows provide predictable stacking and opacity above the swap chain.
@@ -1389,6 +1022,27 @@ MainWindow::MainWindow()
     bottomLeftLayout->addWidget(previousModeButton_);
     bottomLeftLayout->addWidget(currentModeButton_);
     bottomLeftLayout->addWidget(nextModeButton_);
+    simpleTextClarityCheckbox_ = new QCheckBox("Text Clarity");
+    simpleTextClarityCheckbox_->setToolTip("Automatically clarify text in the camera view");
+    topLeftLayout->addWidget(simpleTextClarityCheckbox_);
+
+    keystoneTrackingPanel_ = new QWidget(this, chromeFlags);
+    keystoneTrackingPanel_->setObjectName("keystoneTrackingPanel");
+    auto* simpleTrackingLayout = new QHBoxLayout(keystoneTrackingPanel_);
+    simpleTrackingLayout->setContentsMargins(8, 8, 8, 10);
+    simpleTrackingLayout->setSpacing(6);
+    simpleKeystoneBackButton_ = new QPushButton();
+    simpleKeystonePauseButton_ = new QPushButton();
+    simpleKeystoneNextButton_ = new QPushButton();
+    simpleKeystoneBackButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/step-back.svg")));
+    simpleKeystonePauseButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/pause.svg")));
+    simpleKeystoneNextButton_->setIcon(QIcon(QStringLiteral(":/openzoom/icons/step-forward.svg")));
+    for (QPushButton* button : {simpleKeystoneBackButton_, simpleKeystonePauseButton_,
+                                simpleKeystoneNextButton_}) {
+        button->setIconSize(QSize(30, 30));
+        simpleTrackingLayout->addWidget(button);
+    }
+    keystoneTrackingPanel_->hide();
 
     bottomRightPanel_ = new QWidget(this, chromeFlags);
     bottomRightPanel_->setObjectName("bottomRightPanel");
@@ -1433,7 +1087,7 @@ MainWindow::MainWindow()
     modeToast_->setAttribute(Qt::WA_ShowWithoutActivating);
     modeToast_->setAttribute(Qt::WA_TransparentForMouseEvents);
     modeToast_->hide();
-    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, bottomRightPanel_}) {
+    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, keystoneTrackingPanel_, bottomRightPanel_}) {
         panel->setAttribute(Qt::WA_ShowWithoutActivating);
     }
 
@@ -1452,6 +1106,15 @@ MainWindow::MainWindow()
     connect(currentModeButton_, &QPushButton::clicked, this, &MainWindow::ToggleModeGrid);
     connect(previousModeButton_, &QPushButton::clicked, this, [this]() { ActivateRelativePreset(-1); });
     connect(nextModeButton_, &QPushButton::clicked, this, [this]() { ActivateRelativePreset(1); });
+    for (QPushButton* button : {simpleKeystoneBackButton_, advancedKeystoneBackButton_}) {
+        connect(button, &QPushButton::clicked, this, &MainWindow::keystoneStepBackRequested);
+    }
+    for (QPushButton* button : {simpleKeystonePauseButton_, advancedKeystonePauseButton_}) {
+        connect(button, &QPushButton::clicked, this, &MainWindow::keystonePauseResumeRequested);
+    }
+    for (QPushButton* button : {simpleKeystoneNextButton_, advancedKeystoneNextButton_}) {
+        connect(button, &QPushButton::clicked, this, &MainWindow::keystoneStepForwardRequested);
+    }
     connect(presetList_, &QListWidget::currentItemChanged,
             this, &MainWindow::UpdateCurrentPresetUi);
     connect(presetList_, &QListWidget::itemClicked, this, [this]() {
@@ -1511,13 +1174,17 @@ MainWindow::MainWindow()
     setA11y(promotePresetButton_, "Save As Quick Option",
             "Save the current advanced settings as a reusable quick mode");
     setA11y(capturePhotoButton_, "Capture Photo",
-            "Save the current processed frame as an image file");
+            "Save synchronized original and processed camera photos");
     setA11y(recordButton_, "Record Video",
-            "Start or stop recording the processed video to an MP4 file");
+            "Start or stop synchronized original and processed MP4 recordings");
     setA11y(joystickCheckbox_, "Virtual Joystick",
             "Show an on-screen joystick overlay for panning the zoom focus");
     setA11y(rotationCombo_, "Rotation",
             "Rotate the camera image clockwise in 90 degree steps");
+    setA11y(viewportRateCombo_, "Viewport motion rate",
+            "Choose how smoothly pan and zoom move without changing the camera frame rate");
+    setA11y(viewportFitCombo_, "Viewport framing",
+            "Choose Fill to crop without stretching or Fit to show the entire camera image");
     setA11y(cameraCombo_, "Camera",
             "Select the active camera device");
     setA11y(cameraModesList_, "Camera Modes",
@@ -1578,11 +1245,57 @@ MainWindow::MainWindow()
             "How strongly the camera image is stabilized");
     setA11y(keystoneCheckbox_, "Straighten Screen (Keystone)",
             "Automatically straighten a projected screen viewed at an angle");
+    for (QPushButton* button : {simpleKeystoneBackButton_, advancedKeystoneBackButton_}) {
+        setA11y(button, "Previous Screen Correction",
+                "Freeze automatic screen correction and return to the previous accepted correction");
+    }
+    for (QPushButton* button : {simpleKeystonePauseButton_, advancedKeystonePauseButton_}) {
+        setA11y(button, "Stop Automatic Screen Correction",
+                "Freeze the current screen correction");
+    }
+    for (QPushButton* button : {simpleKeystoneNextButton_, advancedKeystoneNextButton_}) {
+        setA11y(button, "Next Screen Correction",
+                "Use the next saved correction or find one new correction while stopped");
+    }
     setA11y(autoContrastCheckbox_, "Auto Contrast",
             "Automatically stretch washed-out colors for better readability");
     setA11y(autoContrastStrengthSlider_, "Auto Contrast Strength",
             "How strongly the automatic contrast correction is applied");
-    setA11y(displayColorCombo_, "Display Colors",
+    setA11y(simpleTextClarityCheckbox_, "Text Clarity",
+            "Automatically select the text clarity processing stack");
+    setA11y(textClarityCheckbox_, "Auto Text Clarity",
+            "Automatically clarify text using local document analysis");
+    setA11y(backgroundFlattenCheckbox_, "Flatten Background",
+            "Remove shadows and uneven page lighting");
+    setA11y(adaptiveBinarizationCheckbox_, "Adaptive Text",
+            "Separate text from its local background using a Sauvola threshold");
+    setA11y(textPolarityCombo_, "Text Polarity",
+            "Choose automatic, dark on light, or light on dark text");
+    setA11y(strokeWeightSlider_, "Stroke Weight",
+            "Make text strokes thinner or bolder");
+    setA11y(smartSharpenCheckbox_, "Smart Sharpen",
+            "Denoise and sharpen text without bright edge halos");
+    setA11y(claheCheckbox_, "Local Contrast",
+            "Equalize contrast in separate image regions");
+    setA11y(twoColorTextCheckbox_, "Two Color Reading",
+            "Map detected ink and paper to the selected display colors");
+    setA11y(textHysteresisCheckbox_, "Steady Text Edges",
+            "Keep thresholded letter edges from flickering between frames");
+    setA11y(selectiveSharpenCheckbox_, "Sharpen Text Only",
+            "Apply sharpening near detected text strokes and preserve pictures");
+    setA11y(focusDetectionCheckbox_, "Warn When Out of Focus",
+            "Warn and pause OCR when the camera image is too blurry");
+    setA11y(glareSuppressionCheckbox_, "Suppress Glare",
+            "Reduce small blown highlights on glossy pages and boards");
+    setA11y(mlTextSuperResolutionCheckbox_, "ML Text Super Resolution",
+            "Use NVIDIA Video Effects SuperRes when zoom is one point three three times or greater");
+    setA11y(mlTextSuperResolutionStrengthSlider_, "Super Resolution Strength",
+            "Set NVIDIA SuperRes enhancement strength for this preset");
+    setA11y(mlTextSuperResolutionUltra1440pCheckbox_, "Ultra 1440p Super Resolution",
+            "Use the full camera frame to build a separate high-resolution scene up to 1440p");
+    setA11y(mlTextSuperResolutionPrefer2xCheckbox_, "Faster 2x Mode",
+            "Optional speed mode with a narrower view. Leave off for maximum source detail");
+    setA11y(displayColorPicker_, "Display Colors",
             "Choose a high contrast color scheme such as white on black");
     setA11y(contrastSlider_, "Contrast",
             "Contrast of the displayed image");
@@ -1592,6 +1305,8 @@ MainWindow::MainWindow()
             "Configure the AI vision server, OCR engine, and speech output");
     setA11y(openNotesButton_, "Open Notes",
             "Open the lecture notes file written by the assistive features");
+    setA11y(setupAssistantButton_, "Setup and Downloads",
+            "Install or remove optional OCR and NVIDIA Video Effects tools");
     setA11y(assistantConnectionLabel_, "Codex Connection Status",
             "Current Codex app-server and ChatGPT account status");
     setA11y(assistantUsageLabel_, "Codex Usage",
@@ -1630,9 +1345,14 @@ MainWindow::MainWindow()
     // Tab order is local to each frameless overlay window. The application
     // event filter below bridges those groups while Simple mode is active.
     QWidget::setTabOrder(simpleModeButton_, advancedModeButton_);
+    QWidget::setTabOrder(advancedModeButton_, simpleTextClarityCheckbox_);
     QWidget::setTabOrder(modeGridButton_, previousModeButton_);
     QWidget::setTabOrder(previousModeButton_, currentModeButton_);
     QWidget::setTabOrder(currentModeButton_, nextModeButton_);
+    QWidget::setTabOrder(simpleKeystoneBackButton_, simpleKeystonePauseButton_);
+    QWidget::setTabOrder(simpleKeystonePauseButton_, simpleKeystoneNextButton_);
+    QWidget::setTabOrder(advancedKeystoneBackButton_, advancedKeystonePauseButton_);
+    QWidget::setTabOrder(advancedKeystonePauseButton_, advancedKeystoneNextButton_);
     QWidget::setTabOrder(capturePhotoButton_, recordButton_);
     QWidget::setTabOrder(recordButton_, explainNowButton_);
     QWidget::setTabOrder(explainNowButton_, readTextButton_);
@@ -1648,11 +1368,6 @@ MainWindow::~MainWindow()
         qApp->removeNativeEventFilter(this);
         qApp->removeEventFilter(this);
     }
-}
-
-std::array<QWidget*, 5> AssistiveOverlay::FocusTargets() const
-{
-    return {bodyView_, questionEdit_, askButton_, readAloudButton_, closeButton_};
 }
 
 void MainWindow::setApp(OpenZoomApp* app)
@@ -1675,6 +1390,8 @@ QCheckBox* MainWindow::zoomCheckbox() const { return zoomCheckbox_; }
 QSlider* MainWindow::zoomSlider() const { return zoomSlider_; }
 QPushButton* MainWindow::debugButton() const { return debugButton_; }
 QComboBox* MainWindow::rotationCombo() const { return rotationCombo_; }
+QComboBox* MainWindow::viewportRateCombo() const { return viewportRateCombo_; }
+QComboBox* MainWindow::viewportFitCombo() const { return viewportFitCombo_; }
 QCheckBox* MainWindow::focusMarkerCheckbox() const { return focusMarkerCheckbox_; }
 QSlider* MainWindow::zoomCenterXSlider() const { return zoomCenterXSlider_; }
 QSlider* MainWindow::zoomCenterYSlider() const { return zoomCenterYSlider_; }
@@ -1709,11 +1426,187 @@ QSlider* MainWindow::stabilizationStrengthSlider() const { return stabilizationS
 QCheckBox* MainWindow::keystoneCheckbox() const { return keystoneCheckbox_; }
 QCheckBox* MainWindow::autoContrastCheckbox() const { return autoContrastCheckbox_; }
 QSlider* MainWindow::autoContrastStrengthSlider() const { return autoContrastStrengthSlider_; }
-QComboBox* MainWindow::displayColorCombo() const { return displayColorCombo_; }
+QCheckBox* MainWindow::simpleTextClarityCheckbox() const { return simpleTextClarityCheckbox_; }
+QCheckBox* MainWindow::textClarityCheckbox() const { return textClarityCheckbox_; }
+QCheckBox* MainWindow::backgroundFlattenCheckbox() const { return backgroundFlattenCheckbox_; }
+QSlider* MainWindow::backgroundFlattenStrengthSlider() const { return backgroundFlattenStrengthSlider_; }
+QCheckBox* MainWindow::adaptiveBinarizationCheckbox() const { return adaptiveBinarizationCheckbox_; }
+QSlider* MainWindow::sauvolaStrengthSlider() const { return sauvolaStrengthSlider_; }
+QSlider* MainWindow::binarizationSoftnessSlider() const { return binarizationSoftnessSlider_; }
+QComboBox* MainWindow::textPolarityCombo() const { return textPolarityCombo_; }
+QSlider* MainWindow::strokeWeightSlider() const { return strokeWeightSlider_; }
+QCheckBox* MainWindow::smartSharpenCheckbox() const { return smartSharpenCheckbox_; }
+QSlider* MainWindow::smartSharpenStrengthSlider() const { return smartSharpenStrengthSlider_; }
+QCheckBox* MainWindow::claheCheckbox() const { return claheCheckbox_; }
+QSlider* MainWindow::claheClipLimitSlider() const { return claheClipLimitSlider_; }
+QCheckBox* MainWindow::twoColorTextCheckbox() const { return twoColorTextCheckbox_; }
+QCheckBox* MainWindow::textHysteresisCheckbox() const { return textHysteresisCheckbox_; }
+QSlider* MainWindow::textHysteresisStrengthSlider() const { return textHysteresisStrengthSlider_; }
+QCheckBox* MainWindow::selectiveSharpenCheckbox() const { return selectiveSharpenCheckbox_; }
+QCheckBox* MainWindow::focusDetectionCheckbox() const { return focusDetectionCheckbox_; }
+QSlider* MainWindow::focusThresholdSlider() const { return focusThresholdSlider_; }
+QCheckBox* MainWindow::glareSuppressionCheckbox() const { return glareSuppressionCheckbox_; }
+QSlider* MainWindow::glareSuppressionStrengthSlider() const { return glareSuppressionStrengthSlider_; }
+QCheckBox* MainWindow::mlTextSuperResolutionCheckbox() const { return mlTextSuperResolutionCheckbox_; }
+QSlider* MainWindow::mlTextSuperResolutionStrengthSlider() const { return mlTextSuperResolutionStrengthSlider_; }
+QCheckBox* MainWindow::mlTextSuperResolutionPrefer2xCheckbox() const {
+    return mlTextSuperResolutionPrefer2xCheckbox_;
+}
+QCheckBox* MainWindow::mlTextSuperResolutionUltra1440pCheckbox() const {
+    return mlTextSuperResolutionUltra1440pCheckbox_;
+}
+ColorSchemePicker* MainWindow::displayColorPicker() const { return displayColorPicker_; }
 QSlider* MainWindow::contrastSlider() const { return contrastSlider_; }
 QSlider* MainWindow::brightnessSlider() const { return brightnessSlider_; }
 QPushButton* MainWindow::aiSettingsButton() const { return aiSettingsButton_; }
 QPushButton* MainWindow::openNotesButton() const { return openNotesButton_; }
+QPushButton* MainWindow::setupAssistantButton() const { return setupAssistantButton_; }
+
+void MainWindow::setMaxineRuntimeInstalled(bool installed)
+{
+    maxineRuntimeInstalled_ = installed;
+#if OPENZOOM_ENABLE_TEXT_SR
+    if (mlTextSuperResolutionCheckbox_) {
+        mlTextSuperResolutionCheckbox_->setEnabled(installed);
+        mlTextSuperResolutionCheckbox_->setToolTip(
+            installed
+                ? QStringLiteral("Use NVIDIA Video Effects SuperRes at 1.33x zoom and above; "
+                                 "falls back to NIS automatically")
+                : QStringLiteral("NVIDIA Video Effects runtime is not installed; "
+                                 "open Setup & Downloads"));
+    }
+    if (mlTextSuperResolutionStrengthSlider_) {
+        mlTextSuperResolutionStrengthSlider_->setEnabled(
+            installed && mlTextSuperResolutionCheckbox_ &&
+            mlTextSuperResolutionCheckbox_->isChecked());
+    }
+    if (mlTextSuperResolutionPrefer2xCheckbox_) {
+        mlTextSuperResolutionPrefer2xCheckbox_->setEnabled(
+            installed && mlTextSuperResolutionCheckbox_ &&
+            mlTextSuperResolutionCheckbox_->isChecked());
+    }
+    if (mlTextSuperResolutionUltra1440pCheckbox_) {
+        mlTextSuperResolutionUltra1440pCheckbox_->setEnabled(
+            installed && mlTextSuperResolutionCheckbox_ &&
+            mlTextSuperResolutionCheckbox_->isChecked());
+    }
+    if (!installed && mlTextSuperResolutionStatusLabel_) {
+        setSuperResStatus(QStringLiteral("Runtime not installed; use Setup & Downloads"),
+                          false);
+    }
+#else
+    Q_UNUSED(installed);
+    if (mlTextSuperResolutionCheckbox_) {
+        mlTextSuperResolutionCheckbox_->setEnabled(false);
+        mlTextSuperResolutionCheckbox_->setToolTip(
+            QStringLiteral("Unavailable in this build; NVIDIA Super Resolution "
+                           "support was not compiled"));
+    }
+    if (mlTextSuperResolutionStrengthSlider_) {
+        mlTextSuperResolutionStrengthSlider_->setEnabled(false);
+    }
+    if (mlTextSuperResolutionPrefer2xCheckbox_) {
+        mlTextSuperResolutionPrefer2xCheckbox_->setEnabled(false);
+    }
+    if (mlTextSuperResolutionUltra1440pCheckbox_) {
+        mlTextSuperResolutionUltra1440pCheckbox_->setEnabled(false);
+    }
+    if (mlTextSuperResolutionStatusLabel_) {
+        setSuperResStatus(QStringLiteral("Unavailable in this build"), false);
+    }
+#endif
+
+    if (!maxineAttribution_) {
+        return;
+    }
+    const QString status = installed
+                               ? QStringLiteral("NVIDIA Video Effects runtime installed")
+                               : QStringLiteral("NVIDIA Video Effects runtime not installed; use Setup & Downloads");
+    maxineAttribution_->setToolTip(status);
+    maxineAttribution_->setAccessibleDescription(status);
+}
+
+bool MainWindow::isMaxineRuntimeInstalled() const
+{
+    return maxineRuntimeInstalled_;
+}
+
+void MainWindow::ShowHelpDialog()
+{
+    QDialog dialog(this);
+    dialog.setWindowTitle(QStringLiteral("OpenZoom Help"));
+    dialog.setWindowIcon(windowIcon());
+    dialog.setModal(true);
+    dialog.setMinimumSize(520, 420);
+
+    auto* layout = new QVBoxLayout(&dialog);
+    layout->setContentsMargins(14, 14, 14, 14);
+    layout->setSpacing(10);
+
+    auto* guide = new QTextBrowser(&dialog);
+    guide->setAccessibleName(QStringLiteral("OpenZoom controls and features guide"));
+    guide->setOpenExternalLinks(false);
+    guide->setHtml(QStringLiteral(
+        "<h2>Controls</h2>"
+        "<p><b>Simple</b> maximizes the camera view. Use the corner carousel "
+        "or number keys 1 through 9 to change quick modes.</p>"
+        "<p><b>Advanced</b> opens detailed image and Assistant settings. Drag "
+        "the divider at the panel edge to resize it.</p>"
+        "<p>Drag the camera view to pan. Use Ctrl plus the mouse wheel to zoom. "
+        "Enable <b>Virtual Joystick</b> at the top of the Image panel for an "
+        "on-screen movement control.</p>"
+        "<p>Photo and Record save both original and processed versions. Explain "
+        "describes the scene; Read recognizes text.</p>"
+        "<h2>Features</h2>"
+        "<p><b>Text Clarity</b> combines document cleanup, local contrast, "
+        "sharpening, and stable text edges. <b>Display Colors</b> provides "
+        "reading palettes and custom color schemes.</p>"
+        "<p><b>NVIDIA Super Resolution</b> improves zoomed detail when the "
+        "optional NVIDIA Video Effects runtime is installed.</p>"
+        "<p><b>OCR and Assistant</b> can read text, explain the view, answer "
+        "follow-up questions, and add results to lecture notes.</p>"));
+    layout->addWidget(guide, 1);
+
+    auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+    connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
+    layout->addWidget(buttons);
+    dialog.exec();
+}
+
+void MainWindow::setSuperResStatus(const QString& status,
+                                   bool active,
+                                   bool performanceLimited)
+{
+    if (!mlTextSuperResolutionStatusLabel_) {
+        return;
+    }
+    mlTextSuperResolutionStatusLabel_->setText(status);
+    mlTextSuperResolutionStatusLabel_->setToolTip(status);
+    mlTextSuperResolutionStatusLabel_->setAccessibleDescription(status);
+    const QString color = status == QStringLiteral("Off")
+                              ? QStringLiteral("#cfcfcf")
+                              : active ? QStringLiteral("#33d17a")
+                                       : QStringLiteral("#f6c85f");
+    mlTextSuperResolutionStatusLabel_->setStyleSheet(
+        QStringLiteral("color: %1;").arg(color));
+    if (mlTextSuperResolutionOverrideCheckbox_) {
+        mlTextSuperResolutionOverrideCheckbox_->setVisible(
+            maxineRuntimeInstalled_ &&
+            (performanceLimited || mlTextSuperResolutionOverrideCheckbox_->isChecked()));
+    }
+}
+
+void MainWindow::setSuperResPerformanceOverrideChecked(bool checked)
+{
+    if (!mlTextSuperResolutionOverrideCheckbox_) {
+        return;
+    }
+    const QSignalBlocker blocker(mlTextSuperResolutionOverrideCheckbox_);
+    mlTextSuperResolutionOverrideCheckbox_->setChecked(checked);
+    if (!checked) {
+        mlTextSuperResolutionOverrideCheckbox_->setVisible(false);
+    }
+}
 QLabel* MainWindow::assistantConnectionLabel() const { return assistantConnectionLabel_; }
 QLabel* MainWindow::assistantUsageLabel() const { return assistantUsageLabel_; }
 QPushButton* MainWindow::assistantConnectButton() const { return assistantConnectButton_; }
@@ -1727,6 +1620,76 @@ QListWidget* MainWindow::assistantHistoryList() const { return assistantHistoryL
 QPushButton* MainWindow::assistantRenameButton() const { return assistantRenameButton_; }
 QPushButton* MainWindow::assistantExportButton() const { return assistantExportButton_; }
 QPushButton* MainWindow::assistantDeleteButton() const { return assistantDeleteButton_; }
+
+void MainWindow::setKeystoneTrackingControls(bool active,
+                                              bool available,
+                                              bool paused,
+                                              bool canStepBack,
+                                              bool canStepForward,
+                                              bool stepPending,
+                                              int position,
+                                              int count)
+{
+    const bool wasActive = keystoneTrackingActive_;
+    const QString pauseText = paused ? QStringLiteral("Continue") : QStringLiteral("Stop");
+    const bool geometryChanged = wasActive != active ||
+                                 advancedKeystonePauseButton_->text() != pauseText;
+    keystoneTrackingActive_ = active;
+
+    const QString positionText = count > 0
+                                     ? QStringLiteral(" Correction %1 of %2.")
+                                           .arg(std::clamp(position, 1, count))
+                                           .arg(count)
+                                     : QString();
+    const QString unavailable = QStringLiteral("GPU screen correction is unavailable.");
+    const QString backTip = available
+                                ? QStringLiteral("Previous screen correction.%1").arg(positionText)
+                                : unavailable;
+    const QString pauseTip = available
+                                 ? (paused ? QStringLiteral("Continue automatic screen correction.%1")
+                                           : QStringLiteral("Stop and hold the current screen correction.%1"))
+                                       .arg(positionText)
+                                 : unavailable;
+    const QString nextTip = !available
+                                ? unavailable
+                                : stepPending
+                                      ? QStringLiteral("Finding one new screen correction...")
+                                      : QStringLiteral("Next screen correction, or find one new correction.%1")
+                                            .arg(positionText);
+
+    advancedKeystonePauseButton_->setText(pauseText);
+    const QIcon pauseIcon(paused ? QStringLiteral(":/openzoom/icons/play.svg")
+                                 : QStringLiteral(":/openzoom/icons/pause.svg"));
+    advancedKeystonePauseButton_->setIcon(pauseIcon);
+    simpleKeystonePauseButton_->setIcon(pauseIcon);
+
+    const bool controlsEnabled = active && available;
+    advancedKeystoneTrackingRow_->setEnabled(controlsEnabled);
+    for (QPushButton* button : {simpleKeystoneBackButton_, advancedKeystoneBackButton_}) {
+        button->setEnabled(controlsEnabled && canStepBack);
+        button->setToolTip(backTip);
+    }
+    for (QPushButton* button : {simpleKeystonePauseButton_, advancedKeystonePauseButton_}) {
+        button->setEnabled(controlsEnabled);
+        button->setToolTip(pauseTip);
+        button->setAccessibleName(paused ? QStringLiteral("Continue Automatic Screen Correction")
+                                         : QStringLiteral("Stop Automatic Screen Correction"));
+    }
+    for (QPushButton* button : {simpleKeystoneNextButton_, advancedKeystoneNextButton_}) {
+        button->setEnabled(controlsEnabled && paused && canStepForward && !stepPending);
+        button->setToolTip(nextTip);
+    }
+
+    if (!active || !isSimpleMode()) {
+        keystoneTrackingPanel_->hide();
+    } else if (simpleChromeVisible_) {
+        keystoneTrackingPanel_->show();
+        keystoneTrackingPanel_->raise();
+    }
+    if (geometryChanged) {
+        UpdateSimpleChromeGeometry();
+    }
+}
 
 void MainWindow::ActivatePresetRow(int row)
 {
@@ -1763,12 +1726,18 @@ void MainWindow::ActivateRelativePreset(int offset)
 
 void MainWindow::ToggleModeGrid()
 {
-    if (!modeGridPopup_ || !isSimpleMode()) {
+    if (!modeGridPopup_) {
         return;
     }
     const bool show = !modeGridPopup_->isVisible();
     if (show) {
-        RevealSimpleChrome();
+        if (isSimpleMode()) {
+            RevealSimpleChrome();
+        } else if (bottomLeftPanel_) {
+            bottomLeftPanel_->setWindowOpacity(1.0);
+            bottomLeftPanel_->show();
+            bottomLeftPanel_->raise();
+        }
         simpleChromeIdleTimer_->stop();
         UpdateSimpleChromeGeometry();
         modeGridPopup_->show();
@@ -1779,7 +1748,9 @@ void MainWindow::ToggleModeGrid()
         }
     } else {
         modeGridPopup_->hide();
-        RevealSimpleChrome();
+        if (isSimpleMode()) {
+            RevealSimpleChrome();
+        }
         if (currentModeButton_) {
             currentModeButton_->setFocus(Qt::PopupFocusReason);
         }
@@ -1844,16 +1815,35 @@ void MainWindow::UpdateSimpleChromeGeometry()
     const int viewWidth = renderWidget_->width();
     const int viewHeight = renderWidget_->height();
     const QPoint viewOrigin = renderWidget_->mapToGlobal(QPoint(0, 0));
-    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, bottomRightPanel_}) {
+    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, keystoneTrackingPanel_, bottomRightPanel_}) {
         panel->adjustSize();
     }
 
     topLeftPanel_->move(viewOrigin);
     bottomLeftPanel_->move(viewOrigin.x(),
                            viewOrigin.y() + std::max(0, viewHeight - bottomLeftPanel_->height()));
-    const bool bottomPanelsOverlap = bottomLeftPanel_->width() + bottomRightPanel_->width() > viewWidth;
+    const bool trackingInline = keystoneTrackingActive_ &&
+                                bottomLeftPanel_->width() + keystoneTrackingPanel_->width() +
+                                        bottomRightPanel_->width() <= viewWidth;
+    const int leftChromeHeight = bottomLeftPanel_->height() +
+                                 (keystoneTrackingActive_ && !trackingInline
+                                      ? keystoneTrackingPanel_->height()
+                                      : 0);
+    const int leftChromeWidth = trackingInline
+                                    ? bottomLeftPanel_->width() + keystoneTrackingPanel_->width()
+                                    : std::max(bottomLeftPanel_->width(),
+                                               keystoneTrackingActive_ ? keystoneTrackingPanel_->width() : 0);
+    if (keystoneTrackingActive_) {
+        const int trackingX = trackingInline ? bottomLeftPanel_->width() : 0;
+        const int trackingY = trackingInline
+                                  ? viewHeight - keystoneTrackingPanel_->height()
+                                  : viewHeight - bottomLeftPanel_->height() - keystoneTrackingPanel_->height();
+        keystoneTrackingPanel_->move(viewOrigin.x() + trackingX,
+                                     viewOrigin.y() + std::max(0, trackingY));
+    }
+    const bool bottomPanelsOverlap = leftChromeWidth + bottomRightPanel_->width() > viewWidth;
     const int bottomRightY = bottomPanelsOverlap
-                                 ? viewHeight - bottomLeftPanel_->height() - bottomRightPanel_->height()
+                                 ? viewHeight - leftChromeHeight - bottomRightPanel_->height()
                                  : viewHeight - bottomRightPanel_->height();
     bottomRightPanel_->move(viewOrigin.x() + std::max(0, viewWidth - bottomRightPanel_->width()),
                             viewOrigin.y() + std::max(0, bottomRightY));
@@ -1863,7 +1853,7 @@ void MainWindow::UpdateSimpleChromeGeometry()
         const int columns = std::max(2, (popupWidth - 28) / 220);
         const int rows = std::max(1, (presetList_->count() + columns - 1) / columns);
         const int popupHeight = std::min(std::max(126, rows * 106 + 16),
-                                        std::max(126, viewHeight - bottomLeftPanel_->height()));
+                                        std::max(126, viewHeight - leftChromeHeight));
         const QSize gridSize(std::max(150, (popupWidth - 32) / columns), 102);
         presetList_->setGridSize(gridSize);
         for (int row = 0; row < presetList_->count(); ++row) {
@@ -1872,7 +1862,7 @@ void MainWindow::UpdateSimpleChromeGeometry()
             }
         }
         modeGridPopup_->setGeometry(viewOrigin.x(),
-                                    viewOrigin.y() + std::max(0, viewHeight - bottomLeftPanel_->height() - popupHeight),
+                                    viewOrigin.y() + std::max(0, viewHeight - leftChromeHeight - popupHeight),
                                     popupWidth,
                                     popupHeight);
     }
@@ -1896,8 +1886,12 @@ void MainWindow::SetChromeOpacity(qreal opacity, int durationMs, bool hideWhenFi
     }
 
     chromeAnimation_ = new QParallelAnimationGroup(this);
-    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, bottomRightPanel_}) {
+    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, keystoneTrackingPanel_, bottomRightPanel_}) {
         if (!panel) {
+            continue;
+        }
+        if (panel == keystoneTrackingPanel_ && !keystoneTrackingActive_) {
+            panel->hide();
             continue;
         }
         if (opacity > 0.0) {
@@ -1915,7 +1909,7 @@ void MainWindow::SetChromeOpacity(qreal opacity, int durationMs, bool hideWhenFi
     connect(animationGroup, &QParallelAnimationGroup::finished, this,
             [this, animationGroup, hideWhenFinished]() {
                 if (hideWhenFinished && !simpleChromeVisible_ && isSimpleMode()) {
-                    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, bottomRightPanel_}) {
+                    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, keystoneTrackingPanel_, bottomRightPanel_}) {
                         if (panel) {
                             panel->hide();
                         }
@@ -1935,7 +1929,7 @@ bool MainWindow::SimpleChromeHasFocus() const
     if (!focus) {
         return false;
     }
-    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, bottomRightPanel_, modeGridPopup_}) {
+    for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, keystoneTrackingPanel_, bottomRightPanel_, modeGridPopup_}) {
         if (panel && (focus == panel || panel->isAncestorOf(focus))) {
             return true;
         }
@@ -1948,6 +1942,25 @@ void MainWindow::RevealSimpleChrome()
     if (!isSimpleMode()) {
         return;
     }
+    const bool alreadyVisible =
+        simpleChromeVisible_ &&
+        topLeftPanel_ && topLeftPanel_->isVisible() &&
+        bottomLeftPanel_ && bottomLeftPanel_->isVisible() &&
+        bottomRightPanel_ && bottomRightPanel_->isVisible();
+    if (alreadyVisible) {
+        // Mouse movement reaches both Qt's event filter and the native event
+        // filter. While the chrome is already visible, activity should only
+        // extend its idle deadline; moving/raising four native tool windows on
+        // every pointer sample starves the high-refresh viewport clock.
+        if (!chromePinned_ && modeGridPopup_ && !modeGridPopup_->isVisible()) {
+            const int remainingMs = simpleChromeIdleTimer_->remainingTime();
+            if (remainingMs < 0 ||
+                remainingMs <= kSimpleChromeIdleMs - 100) {
+                simpleChromeIdleTimer_->start();
+            }
+        }
+        return;
+    }
     const bool needsAnimation = !simpleChromeVisible_ ||
                                 (topLeftPanel_ && !topLeftPanel_->isVisible());
     simpleChromeVisible_ = true;
@@ -1955,8 +1968,12 @@ void MainWindow::RevealSimpleChrome()
     if (needsAnimation) {
         SetChromeOpacity(1.0, 120, false);
     } else {
-        for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, bottomRightPanel_}) {
+        for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, keystoneTrackingPanel_, bottomRightPanel_}) {
             if (panel) {
+                if (panel == keystoneTrackingPanel_ && !keystoneTrackingActive_) {
+                    panel->hide();
+                    continue;
+                }
                 panel->show();
                 panel->raise();
             }
@@ -1991,19 +2008,32 @@ void MainWindow::setSimpleMode(bool simple)
     if (simple && simpleModeButton_) {
         simpleModeButton_->setChecked(true);
         bottomLeftPanel_->show();
+        if (keystoneTrackingActive_) {
+            keystoneTrackingPanel_->show();
+        }
         bottomRightPanel_->show();
         UpdateSimpleChromeGeometry();
         RevealSimpleChrome();
     } else if (!simple && advancedModeButton_) {
         advancedModeButton_->setChecked(true);
+        QTimer::singleShot(0, this, [this]() { ApplyAdvancedPanelWidth(); });
         simpleChromeIdleTimer_->stop();
         modeToastTimer_->stop();
         modeGridPopup_->hide();
         modeToast_->hide();
         simpleChromeVisible_ = true;
-        SetChromeOpacity(1.0, 0, false);
+        if (chromeAnimation_) {
+            chromeAnimation_->stop();
+        }
+        topLeftPanel_->setWindowOpacity(1.0);
         topLeftPanel_->show();
-        bottomLeftPanel_->hide();
+        topLeftPanel_->raise();
+        // Keep the quick-mode carousel available in Advanced as a compact
+        // camera-corner control instead of duplicating the preset model.
+        bottomLeftPanel_->setWindowOpacity(1.0);
+        bottomLeftPanel_->show();
+        bottomLeftPanel_->raise();
+        keystoneTrackingPanel_->hide();
         bottomRightPanel_->hide();
         UpdateSimpleChromeGeometry();
     }
@@ -2012,6 +2042,38 @@ void MainWindow::setSimpleMode(bool simple)
 bool MainWindow::isSimpleMode() const
 {
     return !advancedPanel_ || !advancedPanel_->isVisible();
+}
+
+int MainWindow::advancedPanelWidth() const
+{
+    if (advancedPanel_ && advancedPanel_->isVisible() && advancedPanel_->width() > 0) {
+        return advancedPanel_->width();
+    }
+    return advancedPanelPreferredWidth_;
+}
+
+void MainWindow::setAdvancedPanelWidth(int width)
+{
+    advancedPanelPreferredWidth_ = std::clamp(width, kAdvancedPanelMinimumWidth, 1200);
+    QTimer::singleShot(0, this, [this]() { ApplyAdvancedPanelWidth(); });
+}
+
+void MainWindow::ApplyAdvancedPanelWidth()
+{
+    if (!contentSplitter_ || !advancedPanel_ || !advancedPanel_->isVisible()) {
+        return;
+    }
+    const int totalWidth = contentSplitter_->width();
+    if (totalWidth <= 0) {
+        return;
+    }
+    const int maximumPanelWidth = std::max(kAdvancedPanelMinimumWidth,
+                                           totalWidth - renderWidget_->minimumWidth());
+    const int panelWidth = std::clamp(advancedPanelPreferredWidth_,
+                                      kAdvancedPanelMinimumWidth,
+                                      maximumPanelWidth);
+    contentSplitter_->setSizes({std::max(renderWidget_->minimumWidth(), totalWidth - panelWidth),
+                                panelWidth});
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event)
@@ -2046,6 +2108,16 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event)
     if (isSimpleMode() && userActivity) {
         RevealSimpleChrome();
     }
+    if (!isSimpleMode() && type == QEvent::ApplicationActivate) {
+        simpleChromeVisible_ = true;
+        topLeftPanel_->setWindowOpacity(1.0);
+        bottomLeftPanel_->setWindowOpacity(1.0);
+        UpdateSimpleChromeGeometry();
+        topLeftPanel_->show();
+        topLeftPanel_->raise();
+        bottomLeftPanel_->show();
+        bottomLeftPanel_->raise();
+    }
 
     if (type == QEvent::ApplicationDeactivate) {
         // The chrome panels, grid popup, and toast are top-level tool windows,
@@ -2062,7 +2134,7 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event)
         if (modeGridPopup_) {
             modeGridPopup_->hide();
         }
-        for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, bottomRightPanel_}) {
+        for (QWidget* panel : {topLeftPanel_, bottomLeftPanel_, keystoneTrackingPanel_, bottomRightPanel_}) {
             if (panel) {
                 panel->hide();
             }
@@ -2070,17 +2142,23 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event)
         simpleChromeVisible_ = false;
     }
 
-    if (isSimpleMode() && type == QEvent::KeyPress) {
+    if (type == QEvent::KeyPress) {
         auto* key = static_cast<QKeyEvent*>(event);
         if (key->key() == Qt::Key_Escape && modeGridPopup_->isVisible()) {
             modeGridPopup_->hide();
-            RevealSimpleChrome();
+            if (isSimpleMode()) {
+                RevealSimpleChrome();
+            }
             if (currentModeButton_) {
                 currentModeButton_->setFocus(Qt::PopupFocusReason);
             }
             event->accept();
             return true;
         }
+    }
+
+    if (isSimpleMode() && type == QEvent::KeyPress) {
+        auto* key = static_cast<QKeyEvent*>(event);
         if (key->key() == Qt::Key_H && key->modifiers() == Qt::ControlModifier) {
             chromePinned_ = !chromePinned_;
             RevealSimpleChrome();
@@ -2100,8 +2178,9 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event)
             !(key->modifiers() & (Qt::ControlModifier | Qt::AltModifier)) &&
             !modeGridPopup_->isVisible()) {
             std::vector<QWidget*> focusOrder{
-                simpleModeButton_, advancedModeButton_, modeGridButton_,
+                simpleModeButton_, advancedModeButton_, simpleTextClarityCheckbox_, modeGridButton_,
                 previousModeButton_, currentModeButton_, nextModeButton_,
+                simpleKeystoneBackButton_, simpleKeystonePauseButton_, simpleKeystoneNextButton_,
                 capturePhotoButton_, recordButton_, explainNowButton_, readTextButton_};
             if (auto* overlay = renderWidget_->findChild<AssistiveOverlay*>();
                 overlay && overlay->isVisible()) {
@@ -2134,7 +2213,8 @@ bool MainWindow::eventFilter(QObject* watched, QEvent* event)
             }
         }
         const bool plainKey = key->modifiers() == Qt::NoModifier || key->modifiers() == Qt::KeypadModifier;
-        if (plainKey && key->key() >= Qt::Key_1 && key->key() <= Qt::Key_9) {
+        if (plainKey && !HasEditableTextFocus() &&
+            key->key() >= Qt::Key_1 && key->key() <= Qt::Key_9) {
             ActivatePresetRow(key->key() - Qt::Key_1);
             event->accept();
             return true;

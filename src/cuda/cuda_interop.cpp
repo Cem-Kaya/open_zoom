@@ -7,11 +7,13 @@
 #if OPENZOOM_HAS_CUDA_EXT_MEMORY
 
 #include "openzoom/cuda/cuda_kernels.hpp"
+#include "openzoom/common/maxine_superres.hpp"
 
 #include <windows.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -28,6 +30,21 @@ namespace openzoom {
 namespace {
 
 bool gWarnedFp16Unsupported = false;
+constexpr unsigned int kSuperResWarmupFrames = 10u;
+constexpr unsigned int kSuperResTimingFrames = 60u;
+constexpr float kSuperResLatencyTargetMs = 24.0f;
+
+std::string SuperResTimingStatus(const char* prefix, float averageMs)
+{
+    char buffer[160]{};
+    std::snprintf(buffer,
+                  sizeof(buffer),
+                  "%s %.1f ms average (%.1f ms target)",
+                  prefix,
+                  static_cast<double>(averageMs),
+                  static_cast<double>(kSuperResLatencyTargetMs));
+    return buffer;
+}
 
 void ThrowIfFailed(HRESULT hr, const char* message) {
     if (FAILED(hr)) {
@@ -90,6 +107,7 @@ constexpr float kKeystoneIdentityReturnLerp = 0.03f; // per frame once stale
 constexpr float kKeystoneThresholdSigmaK = 0.5f;
 constexpr float kKeystoneMinAreaFraction = 0.15f;
 constexpr float kKeystoneIdentityEpsilonPx = 0.75f;
+constexpr size_t kKeystoneHistoryLimit = 32;
 
 bool gWarnedBgraRotationIgnored = false;
 bool gWarnedInvalidInput = false;
@@ -366,9 +384,11 @@ bool QueryDeviceLuid(int deviceId, LUID& luidOut)
 
 } // namespace
 
-CudaInteropSurface::CudaInteropSurface(ID3D12Resource* texture, ID3D12Fence* sharedFence) {
+CudaInteropSurface::CudaInteropSurface(ID3D12Resource* texture,
+                                       ID3D12Resource* superResTexture,
+                                       ID3D12Fence* sharedFence) {
     try {
-        Initialize(texture, sharedFence);
+        Initialize(texture, superResTexture, sharedFence);
         valid_ = true;
         lastError_.clear();
     } catch (const std::exception& e) {
@@ -384,12 +404,22 @@ CudaInteropSurface::CudaInteropSurface(ID3D12Resource* texture, ID3D12Fence* sha
             cudaDestroyExternalMemory(externalMemory_);
             externalMemory_ = nullptr;
         }
+        if (superResSurfaceObject_ != 0) {
+            cudaDestroySurfaceObject(superResSurfaceObject_);
+            superResSurfaceObject_ = 0;
+        }
+        if (superResExternalMemory_ != nullptr) {
+            cudaDestroyExternalMemory(superResExternalMemory_);
+            superResExternalMemory_ = nullptr;
+        }
         if (externalSemaphore_ != nullptr) {
             cudaDestroyExternalSemaphore(externalSemaphore_);
             externalSemaphore_ = nullptr;
         }
         mipArray_ = nullptr;
         level0Array_ = nullptr;
+        superResMipArray_ = nullptr;
+        superResLevel0Array_ = nullptr;
         if (stream_ != nullptr) {
             cudaStreamDestroy(stream_);
             stream_ = nullptr;
@@ -413,6 +443,19 @@ void CudaInteropSurface::SynchronizeStream() noexcept {
 CudaInteropSurface::~CudaInteropSurface() {
     SynchronizeStream();
 
+    ReleaseSuperRes();
+    ReleasePinnedUploadRing();
+
+    if (processTimingStartEvent_) {
+        cudaEventDestroy(processTimingStartEvent_);
+        processTimingStartEvent_ = nullptr;
+    }
+    if (processTimingStopEvent_) {
+        cudaEventDestroy(processTimingStopEvent_);
+        processTimingStopEvent_ = nullptr;
+    }
+    processTimingPending_ = false;
+
     if (surfaceObject_ != 0) {
         cudaDestroySurfaceObject(surfaceObject_);
         surfaceObject_ = 0;
@@ -421,6 +464,16 @@ CudaInteropSurface::~CudaInteropSurface() {
     if (externalMemory_ != nullptr) {
         cudaDestroyExternalMemory(externalMemory_);
         externalMemory_ = nullptr;
+    }
+
+    if (superResSurfaceObject_ != 0) {
+        cudaDestroySurfaceObject(superResSurfaceObject_);
+        superResSurfaceObject_ = 0;
+    }
+
+    if (superResExternalMemory_ != nullptr) {
+        cudaDestroyExternalMemory(superResExternalMemory_);
+        superResExternalMemory_ = nullptr;
     }
 
     if (externalSemaphore_ != nullptr) {
@@ -551,7 +604,86 @@ bool CudaInteropSurface::CreateSurfaceFromResource(ID3D12Device* device, ID3D12R
     return true;
 }
 
-void CudaInteropSurface::Initialize(ID3D12Resource* texture, ID3D12Fence* sharedFence) {
+bool CudaInteropSurface::CreateSuperResSurfaceFromResource(
+    ID3D12Device* device,
+    ID3D12Resource* texture) {
+    if (!texture) {
+        return true;
+    }
+
+    const D3D12_RESOURCE_DESC desc = texture->GetDesc();
+    if (desc.Format != format_) {
+        throw std::invalid_argument(
+            "SuperRes cache texture format must match the primary CUDA surface");
+    }
+    superResWidth_ = static_cast<UINT>(desc.Width);
+    superResHeight_ = desc.Height;
+
+    WindowsSecurityAttributes securityAttributes;
+    HANDLE sharedHandle = nullptr;
+    ThrowIfFailed(device->CreateSharedHandle(texture,
+                                             securityAttributes.get(),
+                                             GENERIC_ALL,
+                                             nullptr,
+                                             &sharedHandle),
+                  "Failed to create shared handle for SuperRes cache");
+    const D3D12_RESOURCE_ALLOCATION_INFO allocationInfo =
+        device->GetResourceAllocationInfo(0, 1, &desc);
+
+    cudaExternalMemoryHandleDesc memoryDesc{};
+    memoryDesc.type = cudaExternalMemoryHandleTypeD3D12Resource;
+    memoryDesc.handle.win32.handle = sharedHandle;
+    memoryDesc.size = allocationInfo.SizeInBytes;
+    memoryDesc.flags = cudaExternalMemoryDedicated;
+
+    const auto closeHandle = [&sharedHandle]() {
+        if (sharedHandle) {
+            CloseHandle(sharedHandle);
+            sharedHandle = nullptr;
+        }
+    };
+
+    try {
+        ThrowIfCudaFailed(
+            cudaImportExternalMemory(&superResExternalMemory_, &memoryDesc),
+            "cudaImportExternalMemory for SuperRes cache failed");
+        closeHandle();
+
+        cudaExternalMemoryMipmappedArrayDesc arrayDesc{};
+        arrayDesc.offset = 0;
+        arrayDesc.numLevels = 1;
+        arrayDesc.extent = make_cudaExtent(superResWidth_, superResHeight_, 1);
+        arrayDesc.formatDesc = MakeChannelDescForFormat(format_);
+        arrayDesc.flags =
+            cudaArraySurfaceLoadStore | cudaArrayColorAttachment;
+        ThrowIfCudaFailed(
+            cudaExternalMemoryGetMappedMipmappedArray(
+                &superResMipArray_, superResExternalMemory_, &arrayDesc),
+            "cudaExternalMemoryGetMappedMipmappedArray for SuperRes cache failed");
+        ThrowIfCudaFailed(
+            cudaGetMipmappedArrayLevel(
+                &superResLevel0Array_, superResMipArray_, 0),
+            "cudaGetMipmappedArrayLevel for SuperRes cache failed");
+
+        cudaResourceDesc resourceDesc{};
+        resourceDesc.resType = cudaResourceTypeArray;
+        resourceDesc.res.array.array = superResLevel0Array_;
+        ThrowIfCudaFailed(
+            cudaCreateSurfaceObject(&superResSurfaceObject_, &resourceDesc),
+            "cudaCreateSurfaceObject for SuperRes cache failed");
+    } catch (...) {
+        closeHandle();
+        throw;
+    }
+
+    qInfo() << "CUDA SuperRes cache surface imported successfully ("
+            << superResWidth_ << "x" << superResHeight_ << ")";
+    return true;
+}
+
+void CudaInteropSurface::Initialize(ID3D12Resource* texture,
+                                    ID3D12Resource* superResTexture,
+                                    ID3D12Fence* sharedFence) {
     if (!texture) {
         throw std::invalid_argument("Cannot initialize CUDA interop with null resource");
     }
@@ -565,6 +697,7 @@ void CudaInteropSurface::Initialize(ID3D12Resource* texture, ID3D12Fence* shared
     }
 
     CreateSurfaceFromResource(device.Get(), texture);
+    CreateSuperResSurfaceFromResource(device.Get(), superResTexture);
 
     if (sharedFence != nullptr) {
         ImportFenceSemaphore(device.Get(), sharedFence);
@@ -675,6 +808,8 @@ void CudaInteropSurface::ReleaseDeviceBuffers() {
     ReleaseRawInput();
     ReleaseKeystone();
     ReleaseAutoContrast();
+    ReleaseTextClarity();
+    ReleaseSuperRes();
     kernelUploaded_ = false;
 }
 
@@ -843,6 +978,53 @@ bool CudaInteropSurface::EnsureRawInputBuffers(unsigned int width, unsigned int 
     return true;
 }
 
+bool CudaInteropSurface::EnsurePinnedUploadRing(size_t requiredBytes) {
+    if (requiredBytes == 0) {
+        return false;
+    }
+    if (pinnedUploadCapacity_ >= requiredBytes &&
+        std::all_of(pinnedUploadSlots_.begin(), pinnedUploadSlots_.end(),
+                    [](const PinnedUploadSlot& slot) { return slot.data != nullptr; })) {
+        return true;
+    }
+
+    // Reallocation is resolution/format-change work, never steady-state work.
+    // Drain the stream because a queued H2D copy may still reference a slot.
+    SynchronizeStream();
+    ReleasePinnedUploadRing();
+
+    try {
+        for (PinnedUploadSlot& slot : pinnedUploadSlots_) {
+            ThrowIfCudaFailed(cudaMallocHost(reinterpret_cast<void**>(&slot.data), requiredBytes),
+                              "cudaMallocHost upload staging slot failed");
+            ThrowIfCudaFailed(cudaEventCreateWithFlags(&slot.uploadComplete, cudaEventDisableTiming),
+                              "cudaEventCreate upload staging slot failed");
+        }
+    } catch (...) {
+        ReleasePinnedUploadRing();
+        throw;
+    }
+    pinnedUploadCapacity_ = requiredBytes;
+    pinnedUploadNextSlot_ = 0;
+    return true;
+}
+
+void CudaInteropSurface::ReleasePinnedUploadRing() {
+    for (PinnedUploadSlot& slot : pinnedUploadSlots_) {
+        if (slot.uploadComplete) {
+            cudaEventDestroy(slot.uploadComplete);
+            slot.uploadComplete = nullptr;
+        }
+        if (slot.data) {
+            cudaFreeHost(slot.data);
+            slot.data = nullptr;
+        }
+        slot.uploadPending = false;
+    }
+    pinnedUploadCapacity_ = 0;
+    pinnedUploadNextSlot_ = 0;
+}
+
 // Conversion target at pre-rotation extent; only allocated when the GPU also
 // rotates (for turns == 0 the converter writes straight into buffer A).
 bool CudaInteropSurface::EnsurePreRotateBuffer(unsigned int width, unsigned int height) {
@@ -926,11 +1108,409 @@ bool CudaInteropSurface::EnsureKeystoneResources(unsigned int width, unsigned in
     keystoneFactorY_ = factorY;
     keystoneFullWidth_ = width;
     keystoneFullHeight_ = height;
-    keystoneCopyPending_ = false;
-    keystoneFrameCounter_ = 0;
-    keystoneFramesSinceDetection_ = 0;
-    ResetKeystoneCornersToIdentity();
+    ResetKeystone();
     return true;
+}
+
+void CudaInteropSurface::ReleaseSuperRes() {
+    if (deviceSuperResOutput_) {
+        cudaFree(deviceSuperResOutput_);
+        deviceSuperResOutput_ = nullptr;
+    }
+    devicePitchSuperResOutput_ = 0;
+    deviceSuperResOutputWidth_ = 0;
+    deviceSuperResOutputHeight_ = 0;
+    if (maxineSuperRes_) {
+        maxineSuperRes_->Teardown();
+        maxineSuperRes_.reset();
+    }
+    if (superResStartEvent_) {
+        cudaEventDestroy(superResStartEvent_);
+        superResStartEvent_ = nullptr;
+    }
+    if (superResStopEvent_) {
+        cudaEventDestroy(superResStopEvent_);
+        superResStopEvent_ = nullptr;
+    }
+    superResTimingPending_ = false;
+    superResAutoDisabled_ = false;
+    superResFailureLatched_ = false;
+    superResFailSrcWidth_ = 0;
+    superResFailSrcHeight_ = 0;
+    superResFailFactorNum_ = 0;
+    superResFailFactorDen_ = 0;
+    superResRequestedLastFrame_ = false;
+    superResActive_ = false;
+    superResSourceWidth_ = 0;
+    superResSourceHeight_ = 0;
+    superResFactorValue_ = 0.0f;
+    superResRoi_ = {};
+    superResWarmupSamples_ = 0;
+    superResTimingSamples_ = 0;
+    superResTimingTotalMs_ = 0.0f;
+    superResLastAverageMs_ = -1.0f;
+    superResStatus_.clear();
+}
+
+bool CudaInteropSurface::EnsureSuperResOutputBuffer(unsigned int width,
+                                                   unsigned int height) {
+    if (deviceSuperResOutput_ &&
+        deviceSuperResOutputWidth_ == width &&
+        deviceSuperResOutputHeight_ == height) {
+        return true;
+    }
+    if (deviceSuperResOutput_) {
+        cudaFree(deviceSuperResOutput_);
+        deviceSuperResOutput_ = nullptr;
+    }
+    devicePitchSuperResOutput_ = 0;
+    deviceSuperResOutputWidth_ = 0;
+    deviceSuperResOutputHeight_ = 0;
+    ThrowIfCudaFailed(
+        cudaMallocPitch(
+            reinterpret_cast<void**>(&deviceSuperResOutput_),
+            &devicePitchSuperResOutput_,
+            static_cast<size_t>(width) * sizeof(uchar4),
+            height),
+        "cudaMallocPitch SuperRes output failed");
+    deviceSuperResOutputWidth_ = width;
+    deviceSuperResOutputHeight_ = height;
+    return true;
+}
+
+void CudaInteropSurface::SetSuperResPerformanceOverride(bool enabled) {
+    superResPerformanceOverride_ = enabled;
+    if (enabled) {
+        superResAutoDisabled_ = false;
+        superResWarmupSamples_ = 0;
+        superResTimingSamples_ = 0;
+        superResTimingTotalMs_ = 0.0f;
+        superResStatus_ = "SuperRes performance guard overridden by user";
+    } else if (superResLastAverageMs_ > kSuperResLatencyTargetMs) {
+        superResAutoDisabled_ = true;
+        superResStatus_ = SuperResTimingStatus(
+            "SuperRes exceeded the performance target - using NIS;",
+            superResLastAverageMs_);
+    }
+}
+
+void CudaInteropSurface::ResetSuperRes() {
+    SynchronizeStream();
+    ReleaseSuperRes();
+}
+
+void CudaInteropSurface::ConsumeSuperResTiming() {
+    if (!superResTimingPending_ || !superResStopEvent_) {
+        return;
+    }
+    const cudaError_t query = cudaEventQuery(superResStopEvent_);
+    if (query == cudaErrorNotReady) {
+        return;
+    }
+    if (query != cudaSuccess) {
+        superResTimingPending_ = false;
+        return;
+    }
+    float elapsedMs = 0.0f;
+    if (cudaEventElapsedTime(&elapsedMs, superResStartEvent_, superResStopEvent_) == cudaSuccess) {
+        if (superResWarmupSamples_ < kSuperResWarmupFrames) {
+            ++superResWarmupSamples_;
+        } else {
+            superResTimingTotalMs_ += elapsedMs;
+            ++superResTimingSamples_;
+        }
+        if (superResTimingSamples_ >= kSuperResTimingFrames) {
+            const float averageMs = superResTimingTotalMs_ / static_cast<float>(superResTimingSamples_);
+            superResLastAverageMs_ = averageMs;
+            if (averageMs > kSuperResLatencyTargetMs && !superResPerformanceOverride_) {
+                superResAutoDisabled_ = true;
+                superResStatus_ = SuperResTimingStatus(
+                    "SuperRes exceeded the performance target - using NIS;", averageMs);
+            } else {
+                superResStatus_ = averageMs > kSuperResLatencyTargetMs
+                                      ? SuperResTimingStatus(
+                                            "SuperRes active by user override;", averageMs)
+                                      : SuperResTimingStatus("SuperRes active;", averageMs);
+            }
+            superResTimingSamples_ = 0;
+            superResTimingTotalMs_ = 0.0f;
+        }
+    }
+    superResTimingPending_ = false;
+}
+
+void CudaInteropSurface::UpdateSuperResCache(
+    const uchar4* source,
+    size_t sourcePitch,
+    uchar4* destination,
+    size_t destinationPitch,
+    unsigned int width,
+    unsigned int height,
+    const ProcessingSettings& settings) {
+    ConsumeSuperResTiming();
+    superResActive_ = false;
+    superResRoi_.valid = false;
+
+    // SuperRes is a camera-clock cache, not the viewport transform itself.
+    // settings.zoomAmount/center describe the requested viewport ROI even
+    // though settings.enableZoom remains false for the full-scene pipeline.
+    const bool ultraNeedsUpscale =
+        settings.mlSuperResUltra1440p &&
+        (superResWidth_ > width || superResHeight_ > height);
+    const bool requested =
+        settings.enableMlSuperRes && superResLevel0Array_ != nullptr &&
+        (ultraNeedsUpscale ||
+         (!settings.mlSuperResUltra1440p &&
+          settings.zoomAmount >= 1.33f));
+    if (!requested && superResRequestedLastFrame_) {
+        superResAutoDisabled_ = false;
+        superResFailureLatched_ = false;
+        superResWarmupSamples_ = 0;
+        superResTimingSamples_ = 0;
+        superResTimingTotalMs_ = 0.0f;
+        superResLastAverageMs_ = -1.0f;
+        superResStatus_.clear();
+    }
+    superResRequestedLastFrame_ = requested;
+    if (!requested) {
+        if (settings.enableMlSuperRes && settings.mlSuperResUltra1440p) {
+            superResStatus_ =
+                "Ultra uses the native full frame; the camera is already 1440p or higher";
+        }
+        return;
+    }
+    if (superResAutoDisabled_) {
+        return;
+    }
+
+#if OPENZOOM_ENABLE_TEXT_SR
+    struct SuperResScale {
+        unsigned int numerator;
+        unsigned int denominator;
+    };
+    // In viewport-target mode, descending order selects the strongest
+    // supported factor that does not exceed the user's requested
+    // magnification. Ultra mode instead matches the separately allocated
+    // full-frame cache exactly (720p -> 1440p at 2x, 1080p -> 1440p at 4/3x).
+    constexpr SuperResScale kSupportedScales[] = {
+        {4u, 1u}, {3u, 1u}, {2u, 1u}, {3u, 2u}, {4u, 3u}};
+    unsigned int factorNum = 0;
+    unsigned int factorDen = 0;
+    unsigned int sourceWidth = 0;
+    unsigned int sourceHeight = 0;
+    const unsigned int outputWidth = superResWidth_;
+    const unsigned int outputHeight = superResHeight_;
+    for (const SuperResScale& scale : kSupportedScales) {
+        const float factor =
+            static_cast<float>(scale.numerator) /
+            static_cast<float>(scale.denominator);
+        unsigned int candidateWidth = 0;
+        unsigned int candidateHeight = 0;
+        if (settings.mlSuperResUltra1440p) {
+            if (static_cast<std::uint64_t>(width) * scale.numerator !=
+                    static_cast<std::uint64_t>(outputWidth) *
+                        scale.denominator ||
+                static_cast<std::uint64_t>(height) * scale.numerator !=
+                    static_cast<std::uint64_t>(outputHeight) *
+                        scale.denominator) {
+                continue;
+            }
+            candidateWidth = width;
+            candidateHeight = height;
+        } else {
+            if (settings.zoomAmount + 0.005f < factor ||
+                (outputWidth * scale.denominator) % scale.numerator != 0u ||
+                (outputHeight * scale.denominator) % scale.numerator != 0u) {
+                continue;
+            }
+            candidateWidth =
+                outputWidth * scale.denominator / scale.numerator;
+            candidateHeight =
+                outputHeight * scale.denominator / scale.numerator;
+        }
+        if (candidateWidth > width || candidateHeight > height) {
+            continue;
+        }
+        if ((candidateWidth & 1u) != 0u ||
+            (candidateHeight & 1u) != 0u ||
+            candidateWidth < 160u || candidateHeight < 90u) {
+            continue;
+        }
+        factorNum = scale.numerator;
+        factorDen = scale.denominator;
+        sourceWidth = candidateWidth;
+        sourceHeight = candidateHeight;
+        break;
+    }
+
+    if (superResFailureLatched_ &&
+        (superResFailSrcWidth_ != sourceWidth ||
+         superResFailSrcHeight_ != sourceHeight ||
+         superResFailFactorNum_ != factorNum ||
+         superResFailFactorDen_ != factorDen)) {
+        superResFailureLatched_ = false;
+    }
+    const auto latchFailure = [&]() {
+        superResFailureLatched_ = true;
+        superResFailSrcWidth_ = sourceWidth;
+        superResFailSrcHeight_ = sourceHeight;
+        superResFailFactorNum_ = factorNum;
+        superResFailFactorDen_ = factorDen;
+    };
+    if (superResFailureLatched_) {
+        return;
+    }
+    if (factorNum == 0u) {
+        superResStatus_ =
+            "Scene dimensions do not support an exact NVIDIA SuperRes scale - using NIS";
+        latchFailure();
+        return;
+    }
+
+    const float centerX =
+        std::clamp(settings.zoomCenterX, 0.0f, 1.0f) *
+        static_cast<float>(width - 1u);
+    const float centerY =
+        std::clamp(settings.zoomCenterY, 0.0f, 1.0f) *
+        static_cast<float>(height - 1u);
+    const unsigned int sourceX = settings.mlSuperResUltra1440p
+        ? 0u
+        : static_cast<unsigned int>(std::clamp(
+              static_cast<int>(std::lround(
+                  centerX -
+                  (static_cast<float>(sourceWidth) - 1.0f) * 0.5f)),
+              0,
+              static_cast<int>(width - sourceWidth)));
+    const unsigned int sourceY = settings.mlSuperResUltra1440p
+        ? 0u
+        : static_cast<unsigned int>(std::clamp(
+              static_cast<int>(std::lround(
+                  centerY -
+                  (static_cast<float>(sourceHeight) - 1.0f) * 0.5f)),
+              0,
+              static_cast<int>(height - sourceHeight)));
+    const auto* sourceRoi =
+        reinterpret_cast<const unsigned char*>(source) +
+        static_cast<size_t>(sourceY) * sourcePitch +
+        static_cast<size_t>(sourceX) * sizeof(uchar4);
+
+    if (!maxineSuperRes_) {
+        maxineSuperRes_ = std::make_unique<MaxineSuperRes>();
+    }
+    maxineSuperRes_->SetStrength(
+        std::clamp(settings.mlSuperResStrength, 0.0f, 1.0f));
+    if (!maxineSuperRes_->Ensure(sourceWidth,
+                                 sourceHeight,
+                                 outputWidth,
+                                 outputHeight,
+                                 reinterpret_cast<void*>(stream_))) {
+        superResStatus_ =
+            maxineSuperRes_->LastError() + " - using NIS";
+        latchFailure();
+        return;
+    }
+
+    if (!superResStartEvent_) {
+        ThrowIfCudaFailed(cudaEventCreate(&superResStartEvent_),
+                          "cudaEventCreate SuperRes start failed");
+        ThrowIfCudaFailed(cudaEventCreate(&superResStopEvent_),
+                          "cudaEventCreate SuperRes stop failed");
+    }
+    const bool measure = !superResTimingPending_;
+    if (measure) {
+        ThrowIfCudaFailed(cudaEventRecord(superResStartEvent_, stream_),
+                          "cudaEventRecord SuperRes start failed");
+    }
+    uchar4* superResDestination = destination;
+    size_t superResDestinationPitch = destinationPitch;
+    if (outputWidth != width || outputHeight != height) {
+        EnsureSuperResOutputBuffer(outputWidth, outputHeight);
+        superResDestination = deviceSuperResOutput_;
+        superResDestinationPitch = devicePitchSuperResOutput_;
+    }
+    // NvCVImage_Transfer writes the complete BGRA destination after inference,
+    // so clearing the destination first only consumes bandwidth.
+    if (!maxineSuperRes_->Run(
+            sourceRoi,
+            sourcePitch,
+            superResDestination,
+            superResDestinationPitch)) {
+        superResStatus_ =
+            maxineSuperRes_->LastError() + " - using NIS";
+        latchFailure();
+        return;
+    }
+    if (measure) {
+        ThrowIfCudaFailed(cudaEventRecord(superResStopEvent_, stream_),
+                          "cudaEventRecord SuperRes stop failed");
+        superResTimingPending_ = true;
+    }
+    ThrowIfCudaFailed(
+        cudaMemcpy2DToArrayAsync(superResLevel0Array_,
+                                 0,
+                                 0,
+                                 superResDestination,
+                                 superResDestinationPitch,
+                                 static_cast<size_t>(outputWidth) * sizeof(uchar4),
+                                 outputHeight,
+                                 cudaMemcpyDeviceToDevice,
+                                 stream_),
+        "cudaMemcpy2DToArrayAsync SuperRes cache failed");
+
+    const float factorValue =
+        static_cast<float>(factorNum) / static_cast<float>(factorDen);
+    superResActive_ = true;
+    superResSourceWidth_ = sourceWidth;
+    superResSourceHeight_ = sourceHeight;
+    superResFactorValue_ = factorValue;
+    superResRoi_ = {
+        true,
+        ++superResGeneration_,
+        static_cast<float>(sourceX) / static_cast<float>(width),
+        static_cast<float>(sourceY) / static_cast<float>(height),
+        static_cast<float>(sourceWidth) / static_cast<float>(width),
+        static_cast<float>(sourceHeight) / static_cast<float>(height),
+        outputWidth,
+        outputHeight,
+        factorValue,
+    };
+    if (superResLastAverageMs_ < 0.0f) {
+        superResStatus_ = superResWarmupSamples_ < kSuperResWarmupFrames
+                              ? "NVIDIA Video Effects SuperRes warming up"
+                              : "NVIDIA Video Effects SuperRes measuring performance";
+    } else if (superResPerformanceOverride_ &&
+               superResLastAverageMs_ > kSuperResLatencyTargetMs) {
+        superResStatus_ = SuperResTimingStatus(
+            "SuperRes active by user override;", superResLastAverageMs_);
+    } else {
+        superResStatus_ = SuperResTimingStatus(
+            "NVIDIA Video Effects SuperRes active;", superResLastAverageMs_);
+    }
+#else
+    superResStatus_ =
+        "SuperRes support is disabled in this build - using NIS";
+#endif
+}
+
+// P8 GPU timing consumer: polls (never waits on) the stop event recorded by a
+// previous sampled frame and folds the elapsed time into lastGpuFrameMs_.
+void CudaInteropSurface::ConsumeProcessTiming() {
+    if (!processTimingPending_ || !processTimingStopEvent_) {
+        return;
+    }
+    const cudaError_t query = cudaEventQuery(processTimingStopEvent_);
+    if (query == cudaErrorNotReady) {
+        return;
+    }
+    processTimingPending_ = false;
+    if (query != cudaSuccess) {
+        return;
+    }
+    float elapsedMs = 0.0f;
+    if (cudaEventElapsedTime(&elapsedMs, processTimingStartEvent_,
+                             processTimingStopEvent_) == cudaSuccess) {
+        lastGpuFrameMs_ = elapsedMs;
+    }
 }
 
 void CudaInteropSurface::ReleaseKeystone() {
@@ -959,6 +1539,11 @@ void CudaInteropSurface::ReleaseKeystone() {
     keystoneFullHeight_ = 0;
     keystoneFrameCounter_ = 0;
     keystoneFramesSinceDetection_ = 0;
+    keystoneHistory_.clear();
+    keystoneHistoryIndex_ = -1;
+    keystoneTrackingPaused_ = false;
+    keystoneSingleStepRequested_ = false;
+    keystoneSingleStepInFlight_ = false;
 }
 
 void CudaInteropSurface::ResetKeystoneCornersToIdentity() {
@@ -981,7 +1566,113 @@ void CudaInteropSurface::ResetKeystone() {
     keystoneCopyPending_ = false;
     keystoneFrameCounter_ = 0;
     keystoneFramesSinceDetection_ = 0;
+    keystoneTrackingPaused_ = false;
+    keystoneSingleStepRequested_ = false;
+    keystoneSingleStepInFlight_ = false;
+    keystoneHistory_.clear();
+    keystoneHistoryIndex_ = -1;
     ResetKeystoneCornersToIdentity();
+    RememberKeystoneCorrection();
+}
+
+void CudaInteropSurface::RememberKeystoneCorrection() {
+    if (keystoneFullWidth_ == 0 || keystoneFullHeight_ == 0) {
+        return;
+    }
+
+    std::array<float2, 4> correction{};
+    for (int i = 0; i < 4; ++i) {
+        correction[static_cast<size_t>(i)] = keystoneCorners_[i];
+    }
+
+    if (keystoneHistoryIndex_ >= 0 &&
+        keystoneHistoryIndex_ < static_cast<int>(keystoneHistory_.size())) {
+        float maxDelta = 0.0f;
+        const auto& current = keystoneHistory_[static_cast<size_t>(keystoneHistoryIndex_)];
+        for (int i = 0; i < 4; ++i) {
+            maxDelta = std::max(maxDelta,
+                                PointDistance(current[static_cast<size_t>(i)],
+                                              correction[static_cast<size_t>(i)]));
+        }
+        if (maxDelta < kKeystoneIdentityEpsilonPx) {
+            return;
+        }
+    }
+
+    const size_t next = static_cast<size_t>(std::max(keystoneHistoryIndex_ + 1, 0));
+    if (next < keystoneHistory_.size()) {
+        keystoneHistory_.erase(keystoneHistory_.begin() + static_cast<ptrdiff_t>(next),
+                               keystoneHistory_.end());
+    }
+    keystoneHistory_.push_back(correction);
+    if (keystoneHistory_.size() > kKeystoneHistoryLimit) {
+        keystoneHistory_.erase(keystoneHistory_.begin());
+    }
+    keystoneHistoryIndex_ = static_cast<int>(keystoneHistory_.size()) - 1;
+}
+
+void CudaInteropSurface::RestoreKeystoneCorrection() {
+    if (keystoneHistoryIndex_ < 0 ||
+        keystoneHistoryIndex_ >= static_cast<int>(keystoneHistory_.size())) {
+        return;
+    }
+    const auto& correction = keystoneHistory_[static_cast<size_t>(keystoneHistoryIndex_)];
+    for (int i = 0; i < 4; ++i) {
+        keystoneCorners_[i] = correction[static_cast<size_t>(i)];
+    }
+    keystoneFramesSinceDetection_ = 0;
+}
+
+void CudaInteropSurface::SetKeystoneTrackingPaused(bool paused) {
+    if (paused && !keystoneTrackingPaused_) {
+        RememberKeystoneCorrection();
+    }
+    keystoneTrackingPaused_ = paused;
+    keystoneSingleStepRequested_ = false;
+}
+
+bool CudaInteropSurface::StepKeystoneCorrection(int direction) {
+    if (direction == 0 || keystoneFullWidth_ == 0 || keystoneFullHeight_ == 0) {
+        return false;
+    }
+    if (!keystoneTrackingPaused_) {
+        RememberKeystoneCorrection();
+        keystoneTrackingPaused_ = true;
+    }
+
+    if (direction < 0) {
+        keystoneSingleStepRequested_ = false;
+        if (keystoneHistoryIndex_ <= 0) {
+            return false;
+        }
+        --keystoneHistoryIndex_;
+        RestoreKeystoneCorrection();
+        return true;
+    }
+
+    if (keystoneHistoryIndex_ + 1 < static_cast<int>(keystoneHistory_.size())) {
+        ++keystoneHistoryIndex_;
+        RestoreKeystoneCorrection();
+        return true;
+    }
+    if (keystoneCopyPending_ || keystoneSingleStepRequested_ || keystoneSingleStepInFlight_) {
+        return false;
+    }
+    keystoneSingleStepRequested_ = true;
+    return true;
+}
+
+KeystoneTrackingState CudaInteropSurface::GetKeystoneTrackingState() const {
+    KeystoneTrackingState state{};
+    state.paused = keystoneTrackingPaused_;
+    state.canStepBack = keystoneHistoryIndex_ > 0;
+    state.stepPending = keystoneSingleStepRequested_ || keystoneSingleStepInFlight_;
+    state.canStepForward = keystoneTrackingPaused_ &&
+                           (keystoneHistoryIndex_ + 1 < static_cast<int>(keystoneHistory_.size()) ||
+                            (!keystoneCopyPending_ && !state.stepPending && keystoneFullWidth_ != 0));
+    state.position = keystoneHistoryIndex_ + 1;
+    state.count = static_cast<int>(keystoneHistory_.size());
+    return state;
 }
 
 bool CudaInteropSurface::EnsureAutoContrastBuffers() {
@@ -1019,6 +1710,105 @@ void CudaInteropSurface::ReleaseAutoContrast() {
     autoLevelsValid_ = false;
 }
 
+bool CudaInteropSurface::EnsureTextClarityBuffers(unsigned int width, unsigned int height) {
+    if (deviceTextLuma_ && textWidth_ == width && textHeight_ == height) {
+        return true;
+    }
+
+    ReleaseTextClarity();
+    if (cudaDeviceId_ >= 0) {
+        ThrowIfCudaFailed(cudaSetDevice(cudaDeviceId_), "cudaSetDevice failed");
+    }
+
+    // Allocate the five float planes and three mask planes as two pitched
+    // slabs. Every plane in a slab consequently has exactly the same pitch.
+    ThrowIfCudaFailed(cudaMallocPitch(reinterpret_cast<void**>(&deviceTextLuma_),
+                                      &deviceTextFloatPitch_,
+                                      static_cast<size_t>(width) * sizeof(float),
+                                      static_cast<size_t>(height) * 5),
+                      "cudaMallocPitch text statistics failed");
+    auto* floatBase = reinterpret_cast<unsigned char*>(deviceTextLuma_);
+    const size_t floatPlaneBytes = deviceTextFloatPitch_ * height;
+    deviceTextHorizontal_ = reinterpret_cast<float*>(floatBase + floatPlaneBytes);
+    deviceTextMean_ = reinterpret_cast<float*>(floatBase + floatPlaneBytes * 2);
+    deviceTextSqHorizontal_ = reinterpret_cast<float*>(floatBase + floatPlaneBytes * 3);
+    deviceTextSqMean_ = reinterpret_cast<float*>(floatBase + floatPlaneBytes * 4);
+
+    ThrowIfCudaFailed(cudaMallocPitch(reinterpret_cast<void**>(&deviceTextMaskA_),
+                                      &deviceTextMaskPitch_, width,
+                                      static_cast<size_t>(height) * 3),
+                      "cudaMallocPitch text masks failed");
+    const size_t maskPlaneBytes = deviceTextMaskPitch_ * height;
+    deviceTextMaskB_ = deviceTextMaskA_ + maskPlaneBytes;
+    deviceTextMaskHistory_ = deviceTextMaskA_ + maskPlaneBytes * 2;
+
+    ThrowIfCudaFailed(cudaMalloc(reinterpret_cast<void**>(&deviceClaheHistogram_),
+                                 64 * 256 * sizeof(unsigned int)),
+                      "cudaMalloc CLAHE histograms failed");
+    ThrowIfCudaFailed(cudaMalloc(reinterpret_cast<void**>(&deviceClaheMap_),
+                                 64 * 256 * sizeof(float)),
+                      "cudaMalloc CLAHE maps failed");
+    ThrowIfCudaFailed(cudaMalloc(reinterpret_cast<void**>(&deviceTextAnalysis_), sizeof(int4)),
+                      "cudaMalloc text analysis failed");
+    ThrowIfCudaFailed(cudaMalloc(reinterpret_cast<void**>(&deviceFocusStats_), sizeof(float2)),
+                      "cudaMalloc focus statistics failed");
+    ThrowIfCudaFailed(cudaMallocHost(reinterpret_cast<void**>(&hostFocusStats_), sizeof(float2)),
+                      "cudaMallocHost focus statistics failed");
+    ThrowIfCudaFailed(cudaEventCreateWithFlags(&focusCopyEvent_, cudaEventDisableTiming),
+                      "cudaEventCreate focus statistics failed");
+
+    textWidth_ = width;
+    textHeight_ = height;
+    focusFrameCounter_ = 0;
+    textMaskHistoryValid_ = false;
+    focusCopyPending_ = false;
+    focusScoreValid_ = false;
+    latestFocusScore_ = 0.0f;
+    return true;
+}
+
+void CudaInteropSurface::ReleaseTextClarity() {
+    if (deviceTextLuma_ || deviceTextMaskA_ || deviceClaheHistogram_ ||
+        deviceClaheMap_ || deviceTextAnalysis_ || deviceFocusStats_) {
+        SynchronizeStream();
+    }
+    if (focusCopyEvent_) cudaEventDestroy(focusCopyEvent_);
+    if (hostFocusStats_) cudaFreeHost(hostFocusStats_);
+    if (deviceFocusStats_) cudaFree(deviceFocusStats_);
+    if (deviceTextAnalysis_) cudaFree(deviceTextAnalysis_);
+    if (deviceClaheMap_) cudaFree(deviceClaheMap_);
+    if (deviceClaheHistogram_) cudaFree(deviceClaheHistogram_);
+    if (deviceTextMaskA_) cudaFree(deviceTextMaskA_);
+    if (deviceTextLuma_) cudaFree(deviceTextLuma_);
+    deviceTextLuma_ = nullptr;
+    deviceTextHorizontal_ = nullptr;
+    deviceTextMean_ = nullptr;
+    deviceTextSqHorizontal_ = nullptr;
+    deviceTextSqMean_ = nullptr;
+    deviceTextMaskA_ = nullptr;
+    deviceTextMaskB_ = nullptr;
+    deviceTextMaskHistory_ = nullptr;
+    deviceClaheHistogram_ = nullptr;
+    deviceClaheMap_ = nullptr;
+    deviceTextAnalysis_ = nullptr;
+    deviceFocusStats_ = nullptr;
+    hostFocusStats_ = nullptr;
+    focusCopyEvent_ = nullptr;
+    deviceTextFloatPitch_ = 0;
+    deviceTextMaskPitch_ = 0;
+    textWidth_ = 0;
+    textHeight_ = 0;
+    focusFrameCounter_ = 0;
+    textMaskHistoryValid_ = false;
+    focusCopyPending_ = false;
+    focusScoreValid_ = false;
+    latestFocusScore_ = 0.0f;
+}
+
+void CudaInteropSurface::ResetTextClarityHistory() {
+    textMaskHistoryValid_ = false;
+}
+
 // Folds a finished small-luma snapshot into the smoothed corner state. Runs on
 // the host, on a frame captured a few frames ago — never blocks the stream.
 void CudaInteropSurface::ConsumeKeystoneDetection() {
@@ -1039,6 +1829,7 @@ void CudaInteropSurface::ConsumeKeystoneDetection() {
         keystoneCorners_[i] = LerpPoint(keystoneCorners_[i], full, kKeystoneCornerLerp);
     }
     keystoneFramesSinceDetection_ = 0;
+    RememberKeystoneCorrection();
 }
 
 // Keystone stage body. Ordering guarantees the render loop never stalls:
@@ -1054,13 +1845,18 @@ void CudaInteropSurface::RunKeystoneStage(uchar4*& current, uchar4*& alternate,
         const cudaError_t status = cudaEventQuery(keystoneCopyEvent_);
         if (status == cudaSuccess) {
             keystoneCopyPending_ = false;
-            ConsumeKeystoneDetection();
+            if (!keystoneTrackingPaused_ || keystoneSingleStepInFlight_) {
+                ConsumeKeystoneDetection();
+            }
+            keystoneSingleStepInFlight_ = false;
         } else if (status != cudaErrorNotReady) {
             ThrowIfCudaFailed(status, "cudaEventQuery keystone snapshot failed");
         }
     }
 
-    if (!keystoneCopyPending_ && (keystoneFrameCounter_ % kKeystoneSnapshotPeriod) == 0) {
+    const bool periodicCapture = !keystoneTrackingPaused_ &&
+                                 (keystoneFrameCounter_ % kKeystoneSnapshotPeriod) == 0;
+    if (!keystoneCopyPending_ && (periodicCapture || keystoneSingleStepRequested_)) {
         // Snapshot the *stabilized* frame so detection sees the same image the
         // warp will run on.
         LaunchStabilizationLumaDownsample(deviceKeystoneLuma_,
@@ -1080,10 +1876,14 @@ void CudaInteropSurface::RunKeystoneStage(uchar4*& current, uchar4*& alternate,
         ThrowIfCudaFailed(cudaEventRecord(keystoneCopyEvent_, stream_),
                           "cudaEventRecord keystone snapshot failed");
         keystoneCopyPending_ = true;
+        keystoneSingleStepInFlight_ = keystoneSingleStepRequested_;
+        keystoneSingleStepRequested_ = false;
     }
 
-    ++keystoneFramesSinceDetection_;
-    if (keystoneFramesSinceDetection_ > kKeystoneStaleFrames) {
+    if (!keystoneTrackingPaused_) {
+        ++keystoneFramesSinceDetection_;
+    }
+    if (!keystoneTrackingPaused_ && keystoneFramesSinceDetection_ > kKeystoneStaleFrames) {
         // Detection has been failing (scene changed, lights on, ...): ease the
         // warp back to identity instead of holding a stale perspective.
         const float w = static_cast<float>(keystoneFullWidth_);
@@ -1146,6 +1946,25 @@ bool CudaInteropSurface::EnsureGaussianKernel(int radius, float sigma) {
     cachedKernelRadius_ = clampedRadius;
     cachedKernelSigma_ = clampedSigma;
     kernelUploaded_ = true;
+    return true;
+}
+
+bool CudaInteropSurface::EnsureDisplayColorLut(const std::uint32_t* lut,
+                                                std::uint64_t generation) {
+    if (!lut || generation == 0) {
+        return false;
+    }
+    if (cachedDisplayColorLutGeneration_ == generation) {
+        return true;
+    }
+    if (cudaDeviceId_ >= 0) {
+        ThrowIfCudaFailed(cudaSetDevice(cudaDeviceId_), "cudaSetDevice failed");
+    }
+    if (!UploadDisplayColorLut(lut, stream_)) {
+        return false;
+    }
+    cachedDisplayColorLutGeneration_ = generation;
+    qInfo() << "Display color LUT uploaded for generation" << generation;
     return true;
 }
 
@@ -1262,9 +2081,61 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
                               "cudaWaitExternalSemaphoresAsync failed");
         }
 
+        // P8 GPU timing (plan 11 Wave 1): bracket the kernel chain with a
+        // cudaEvent pair on every 30th frame. The start event is enqueued
+        // after the fence wait so the measurement covers upload + kernels,
+        // not time spent waiting for the graphics queue. Results are polled
+        // by ConsumeProcessTiming() on later frames; nothing here blocks.
+        ConsumeProcessTiming();
+        bool sampleGpuTiming = false;
+        if (!processTimingPending_ && ++processTimingFrameCounter_ >= 30u) {
+            processTimingFrameCounter_ = 0;
+            if (!processTimingStartEvent_) {
+                ThrowIfCudaFailed(cudaEventCreate(&processTimingStartEvent_),
+                                  "cudaEventCreate frame timing start failed");
+                ThrowIfCudaFailed(cudaEventCreate(&processTimingStopEvent_),
+                                  "cudaEventCreate frame timing stop failed");
+            }
+            ThrowIfCudaFailed(cudaEventRecord(processTimingStartEvent_, stream_),
+                              "cudaEventRecord frame timing start failed");
+            sampleGpuTiming = true;
+        }
+
         if (!EnsureDeviceBuffers(procWidth, procHeight, resolvedFormat)) {
             return false;
         }
+        if (settings.displayColorTransform == DisplayColorTransform::kLumaLut &&
+            !EnsureDisplayColorLut(settings.displayColorLut,
+                                   settings.displayColorLutGeneration)) {
+            lastError_ = "Could not upload display-color LUT";
+            return false;
+        }
+
+        PinnedUploadSlot* uploadSlot = nullptr;
+        auto acquireUploadSlot = [&](size_t requiredBytes) -> PinnedUploadSlot& {
+            if (!EnsurePinnedUploadRing(requiredBytes)) {
+                throw std::runtime_error("Could not allocate pinned upload staging ring");
+            }
+            PinnedUploadSlot& slot = pinnedUploadSlots_[pinnedUploadNextSlot_];
+            pinnedUploadNextSlot_ = (pinnedUploadNextSlot_ + 1) % pinnedUploadSlots_.size();
+            if (slot.uploadPending) {
+                ThrowIfCudaFailed(cudaEventSynchronize(slot.uploadComplete),
+                                  "cudaEventSynchronize upload staging slot failed");
+                slot.uploadPending = false;
+            }
+            uploadSlot = &slot;
+            return slot;
+        };
+        auto copyRows = [](unsigned char* destination, size_t destinationStride,
+                           const void* source, size_t sourceStride,
+                           size_t rowBytes, size_t rows) {
+            const auto* sourceBytes = static_cast<const unsigned char*>(source);
+            for (size_t row = 0; row < rows; ++row) {
+                std::memcpy(destination + row * destinationStride,
+                            sourceBytes + row * sourceStride,
+                            rowBytes);
+            }
+        };
 
         if (format == 0) {
             // BGRA path: identical to the historical behavior.
@@ -1275,9 +2146,13 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
                 }
             }
 
+            const size_t rowBytes = static_cast<size_t>(input.width) * sizeof(uchar4);
+            PinnedUploadSlot& slot = acquireUploadSlot(rowBytes * input.height);
+            copyRows(slot.data, rowBytes, input.hostPixels, input.hostStrideBytes,
+                     rowBytes, input.height);
             ThrowIfCudaFailed(cudaMemcpy2DAsync(deviceBufferA_, devicePitchA_,
-                                                static_cast<const uint8_t*>(input.hostPixels), input.hostStrideBytes,
-                                                static_cast<size_t>(input.width) * sizeof(uchar4), input.height,
+                                                slot.data, rowBytes,
+                                                rowBytes, input.height,
                                                 cudaMemcpyHostToDevice, stream_),
                               "cudaMemcpy2DAsync host->device failed");
         } else {
@@ -1299,18 +2174,29 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
             }
 
             if (format == 1) {
-                ThrowIfCudaFailed(cudaMemcpy2DAsync(deviceRawPlane1_, rawPlane1Pitch_,
-                                                    input.hostPixels, input.hostStrideBytes,
-                                                    static_cast<size_t>(input.width), input.height,
-                                                    cudaMemcpyHostToDevice, stream_),
-                                  "cudaMemcpy2DAsync NV12 Y plane failed");
+                const size_t yRowBytes = static_cast<size_t>(input.width);
+                const size_t yBytes = yRowBytes * input.height;
                 const size_t uvRowBytes = (static_cast<size_t>(input.width) + 1) / 2 * 2;
                 const size_t uvRows = (static_cast<size_t>(input.height) + 1) / 2;
+                PinnedUploadSlot& slot = acquireUploadSlot(yBytes + uvRowBytes * uvRows);
+                copyRows(slot.data, yRowBytes, input.hostPixels, input.hostStrideBytes,
+                         yRowBytes, input.height);
+                unsigned char* uvStaging = slot.data + yBytes;
+                copyRows(uvStaging, uvRowBytes, input.hostPlane2, input.hostPlane2StrideBytes,
+                         uvRowBytes, uvRows);
+                ThrowIfCudaFailed(cudaMemcpy2DAsync(deviceRawPlane1_, rawPlane1Pitch_,
+                                                    slot.data, yRowBytes,
+                                                    yRowBytes, input.height,
+                                                    cudaMemcpyHostToDevice, stream_),
+                                  "cudaMemcpy2DAsync NV12 Y plane failed");
                 ThrowIfCudaFailed(cudaMemcpy2DAsync(deviceRawPlane2_, rawPlane2Pitch_,
-                                                    input.hostPlane2, input.hostPlane2StrideBytes,
+                                                    uvStaging, uvRowBytes,
                                                     uvRowBytes, uvRows,
                                                     cudaMemcpyHostToDevice, stream_),
                                   "cudaMemcpy2DAsync NV12 UV plane failed");
+                ThrowIfCudaFailed(cudaEventRecord(uploadSlot->uploadComplete, stream_),
+                                  "cudaEventRecord NV12 upload staging slot failed");
+                uploadSlot->uploadPending = true;
                 LaunchNv12ToBgraLinear(convertTarget, convertPitch,
                                        deviceRawPlane1_, rawPlane1Pitch_,
                                        deviceRawPlane2_, rawPlane2Pitch_,
@@ -1318,11 +2204,17 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
                                        stream_);
             } else {
                 const size_t rowBytes = (static_cast<size_t>(input.width) + 1) / 2 * 4;
+                PinnedUploadSlot& slot = acquireUploadSlot(rowBytes * input.height);
+                copyRows(slot.data, rowBytes, input.hostPixels, input.hostStrideBytes,
+                         rowBytes, input.height);
                 ThrowIfCudaFailed(cudaMemcpy2DAsync(deviceRawPlane1_, rawPlane1Pitch_,
-                                                    input.hostPixels, input.hostStrideBytes,
+                                                    slot.data, rowBytes,
                                                     rowBytes, input.height,
                                                     cudaMemcpyHostToDevice, stream_),
                                   "cudaMemcpy2DAsync YUY2 failed");
+                ThrowIfCudaFailed(cudaEventRecord(uploadSlot->uploadComplete, stream_),
+                                  "cudaEventRecord YUY2 upload staging slot failed");
+                uploadSlot->uploadPending = true;
                 LaunchYuy2ToBgraLinear(convertTarget, convertPitch,
                                        deviceRawPlane1_, rawPlane1Pitch_,
                                        static_cast<int>(input.width), static_cast<int>(input.height),
@@ -1335,6 +2227,12 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
                                           static_cast<int>(input.width), static_cast<int>(input.height),
                                           turns, stream_);
             }
+        }
+
+        if (format == 0) {
+            ThrowIfCudaFailed(cudaEventRecord(uploadSlot->uploadComplete, stream_),
+                              "cudaEventRecord upload staging slot failed");
+            uploadSlot->uploadPending = true;
         }
 
         uchar4* current = deviceBufferA_;
@@ -1402,7 +2300,158 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
             ResetKeystone();
         }
 
-        if (settings.enableBlackWhite) {
+        const bool textMaster = settings.enableAutoTextClarity;
+        const bool backgroundActive = settings.enableBackgroundFlatten || textMaster;
+        const bool binarizationActive = settings.enableAdaptiveBinarization || textMaster;
+        const bool smartSharpenActive = settings.enableSmartSharpen || textMaster;
+        const bool hysteresisActive = settings.enableTextHysteresis || textMaster;
+        const bool focusActive = settings.enableFocusDetection || textMaster;
+        const bool glareActive = settings.enableGlareSuppression || textMaster;
+        const bool textPipelineActive = backgroundActive || binarizationActive ||
+                                        smartSharpenActive || settings.enableClahe ||
+                                        focusActive || glareActive;
+        const unsigned char* activeTextMask = nullptr;
+
+        if (textPipelineActive) {
+            if (!EnsureTextClarityBuffers(procWidth, procHeight) ||
+                !EnsureAutoContrastBuffers()) {
+                return false;
+            }
+
+            LaunchAutoContrastHistogram(deviceHistogram_, current, currentPitch,
+                                        static_cast<int>(procWidth), static_cast<int>(procHeight), stream_);
+            LaunchTextSceneAnalysis(deviceHistogram_, static_cast<int>(procWidth * procHeight),
+                                    deviceTextAnalysis_, stream_);
+            const int localRadius = std::clamp(static_cast<int>(procWidth / 32u), 8, 128);
+            LaunchTextLocalStatistics(deviceTextLuma_, deviceTextFloatPitch_,
+                                      deviceTextHorizontal_, deviceTextMean_,
+                                      deviceTextSqHorizontal_, deviceTextSqMean_,
+                                      current, currentPitch,
+                                      static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                      localRadius, stream_);
+
+            // Focus is reduced on-device every frame but copied as two floats
+            // only about twice per second. Event polling never stalls rendering.
+            if (focusCopyPending_ && cudaEventQuery(focusCopyEvent_) == cudaSuccess) {
+                const int sampleWidth = static_cast<int>(procWidth / 4u);
+                const int sampleHeight = static_cast<int>(procHeight / 4u);
+                const float count = static_cast<float>(std::max(sampleWidth * sampleHeight, 1));
+                const float meanLap = hostFocusStats_->x / count;
+                latestFocusScore_ = std::max(hostFocusStats_->y / count - meanLap * meanLap, 0.0f);
+                focusScoreValid_ = true;
+                focusCopyPending_ = false;
+            }
+            if (focusActive && !focusCopyPending_ && (++focusFrameCounter_ % 15u) == 0u) {
+                LaunchFocusMetric(deviceTextLuma_, deviceTextFloatPitch_,
+                                  static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                  deviceFocusStats_, stream_);
+                ThrowIfCudaFailed(cudaMemcpyAsync(hostFocusStats_, deviceFocusStats_, sizeof(float2),
+                                                   cudaMemcpyDeviceToHost, stream_),
+                                  "cudaMemcpyAsync focus statistics failed");
+                ThrowIfCudaFailed(cudaEventRecord(focusCopyEvent_, stream_),
+                                  "cudaEventRecord focus statistics failed");
+                focusCopyPending_ = true;
+            }
+
+            if (backgroundActive || glareActive) {
+                LaunchBackgroundFlattenLinear(alternate, alternatePitch, current, currentPitch,
+                                              deviceTextLuma_, deviceTextMean_, deviceTextFloatPitch_,
+                                              static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                              std::clamp(settings.backgroundFlattenStrength, 0.0f, 1.0f),
+                                              glareActive,
+                                              std::clamp(settings.glareSuppressionStrength, 0.0f, 1.0f),
+                                              deviceTextAnalysis_,
+                                              stream_);
+                swapBuffers();
+            }
+
+            if (settings.enableClahe) {
+                LaunchClaheLinear(alternate, alternatePitch, current, currentPitch,
+                                  deviceClaheHistogram_, deviceClaheMap_,
+                                  static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                  std::clamp(settings.claheClipLimit, 1.0f, 8.0f), stream_);
+                swapBuffers();
+            }
+
+            if (backgroundActive || glareActive || settings.enableClahe) {
+                LaunchTextLocalStatistics(deviceTextLuma_, deviceTextFloatPitch_,
+                                          deviceTextHorizontal_, deviceTextMean_,
+                                          deviceTextSqHorizontal_, deviceTextSqMean_,
+                                          current, currentPitch,
+                                          static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                          localRadius, stream_);
+            }
+
+            if (binarizationActive || settings.enableSelectiveSharpen) {
+                LaunchSauvolaMask(deviceTextMaskA_, deviceTextMaskPitch_,
+                                  deviceTextLuma_, deviceTextMean_, deviceTextSqMean_,
+                                  deviceTextFloatPitch_,
+                                  static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                  std::clamp(settings.sauvolaStrength, 0.1f, 0.5f),
+                                  std::clamp(settings.binarizationSoftness, 0.0f, 0.25f),
+                                  std::clamp(settings.textPolarityMode, 0, 2),
+                                  deviceTextAnalysis_, stream_);
+                activeTextMask = deviceTextMaskA_;
+                if (settings.strokeWeight != 0) {
+                    LaunchStrokeWeight(deviceTextMaskB_, deviceTextMaskPitch_,
+                                       deviceTextMaskA_, deviceTextMaskPitch_,
+                                       static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                       std::clamp(settings.strokeWeight, -3, 3), stream_);
+                    activeTextMask = deviceTextMaskB_;
+                }
+                if (hysteresisActive) {
+                    // Normalize the active mask into A before in-place temporal
+                    // hysteresis when morphology produced B.
+                    if (activeTextMask == deviceTextMaskB_) {
+                        ThrowIfCudaFailed(cudaMemcpy2DAsync(deviceTextMaskA_, deviceTextMaskPitch_,
+                                                           deviceTextMaskB_, deviceTextMaskPitch_,
+                                                           procWidth, procHeight,
+                                                           cudaMemcpyDeviceToDevice, stream_),
+                                          "cudaMemcpy2DAsync text mask failed");
+                        activeTextMask = deviceTextMaskA_;
+                    }
+                    LaunchTextMaskHysteresis(deviceTextMaskA_, deviceTextMaskPitch_,
+                                             deviceTextMaskHistory_,
+                                             static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                             std::clamp(settings.textHysteresisStrength, 0.0f, 0.25f),
+                                             textMaskHistoryValid_, stream_);
+                    textMaskHistoryValid_ = true;
+                } else {
+                    textMaskHistoryValid_ = false;
+                }
+            } else {
+                textMaskHistoryValid_ = false;
+            }
+
+            if (smartSharpenActive) {
+                LaunchSmartSharpenLinear(alternate, alternatePitch,
+                                         deviceScratch_, devicePitchScratch_,
+                                         current, currentPitch,
+                                         activeTextMask, deviceTextMaskPitch_,
+                                         static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                         std::clamp(settings.smartSharpenStrength, 0.0f, 1.0f),
+                                         settings.enableSelectiveSharpen || textMaster,
+                                         stream_);
+                swapBuffers();
+            }
+
+            if (binarizationActive && activeTextMask) {
+                LaunchTextMaskComposite(alternate, alternatePitch, current, currentPitch,
+                                        activeTextMask, deviceTextMaskPitch_,
+                                        static_cast<int>(procWidth), static_cast<int>(procHeight),
+                                        settings.enableTwoColorText
+                                            ? settings.textForegroundBgra : 0xff000000u,
+                                        settings.enableTwoColorText
+                                            ? settings.textBackgroundBgra : 0xffffffffu,
+                                        settings.enableAdaptiveBinarization ? 1 : 2,
+                                        deviceTextAnalysis_, stream_);
+                swapBuffers();
+            }
+        } else {
+            textMaskHistoryValid_ = false;
+        }
+
+        if (settings.enableBlackWhite && !binarizationActive) {
             LaunchBlackWhiteLinear(alternate, alternatePitch, current, currentPitch,
                                    static_cast<int>(procWidth), static_cast<int>(procHeight),
                                    settings.blackWhiteThreshold, stream_);
@@ -1493,7 +2542,11 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
             autoLevelsValid_ = false;
         }
 
-        if (settings.displayColorMode != 0 ||
+        const DisplayColorTransform gradeColorTransform =
+            (binarizationActive && settings.enableTwoColorText)
+                ? DisplayColorTransform::kNone
+                : settings.displayColorTransform;
+        if (gradeColorTransform != DisplayColorTransform::kNone ||
             settings.contrast != 1.0f ||
             settings.brightness != 0.0f ||
             autoContrastActive) {
@@ -1502,7 +2555,7 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
             // In place: the kernel touches only its own pixel, so no swap needed.
             LaunchDisplayColorGradeLinear(current, currentPitch,
                                           static_cast<int>(procWidth), static_cast<int>(procHeight),
-                                          settings.displayColorMode, contrast, brightness,
+                                          static_cast<int>(gradeColorTransform), contrast, brightness,
                                           autoContrastActive ? deviceAutoLevels_ : nullptr,
                                           std::clamp(settings.autoContrastStrength, 0.0f, 1.0f),
                                           stream_);
@@ -1519,6 +2572,20 @@ bool CudaInteropSurface::ProcessFrame(const ProcessingInput& input,
                                                    static_cast<size_t>(procWidth) * sizeof(uchar4), procHeight,
                                                    cudaMemcpyDeviceToDevice, stream_),
                           "cudaMemcpy2DToArrayAsync failed");
+
+        UpdateSuperResCache(current,
+                            currentPitch,
+                            alternate,
+                            alternatePitch,
+                            procWidth,
+                            procHeight,
+                            settings);
+
+        if (sampleGpuTiming) {
+            ThrowIfCudaFailed(cudaEventRecord(processTimingStopEvent_, stream_),
+                              "cudaEventRecord frame timing stop failed");
+            processTimingPending_ = true;
+        }
 
         if (fenceSync.enable && externalSemaphore_ != nullptr) {
             cudaExternalSemaphoreSignalParams signalParams{};

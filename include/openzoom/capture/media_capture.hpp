@@ -25,7 +25,10 @@ struct MediaFrame {
     size_t dataSize{0};
 };
 
-using FrameCallback = std::function<void(const MediaFrame& frame)>;
+// Ownership moves from the capture thread into the consumer. This avoids two
+// full-frame vector copies before the CUDA upload path stages the frame into
+// page-locked memory.
+using FrameCallback = std::function<void(MediaFrame&& frame)>;
 using CaptureErrorCallback = std::function<void(const std::string& message)>;
 
 struct CameraDescriptor {
@@ -73,6 +76,7 @@ public:
     // device loss and StopCapture so the app can re-enumerate and find the same
     // physical camera again when reconnecting.
     const std::wstring& LastSymbolicLink() const { return lastSymbolicLink_; }
+    double CurrentFrameRate() const;
 
 private:
     struct FrameFormat {
@@ -80,6 +84,8 @@ private:
         UINT width{0};
         UINT height{0};
         UINT stride{0};
+        UINT frameRateNumerator{0};
+        UINT frameRateDenominator{0};
     };
 
     bool ConfigureReader(IMFSourceReader* reader,
@@ -101,6 +107,8 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<bool> deviceLost_{false};
     std::atomic<CameraFailureKind> lastFailureKind_{CameraFailureKind::None};
+    std::atomic<UINT> frameRateNumerator_{0};
+    std::atomic<UINT> frameRateDenominator_{0};
     FrameFormat currentFormat_{};
     std::wstring lastSymbolicLink_;
     std::string lastError_;

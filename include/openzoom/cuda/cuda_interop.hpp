@@ -3,9 +3,11 @@
 #ifdef _WIN32
 
 #include <wrl/client.h>
+#include <array>
 #include <d3d12.h>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -37,10 +39,33 @@ struct ID3D12Fence;
 
 namespace openzoom {
 
+class MaxineSuperRes;
+
 struct FenceSyncParams {
     bool enable{false};
     uint64_t waitValue{0};
     uint64_t signalValue{0};
+};
+
+struct KeystoneTrackingState {
+    bool paused{false};
+    bool canStepBack{false};
+    bool canStepForward{false};
+    bool stepPending{false};
+    int position{0};
+    int count{0};
+};
+
+struct SuperResRoiMetadata {
+    bool valid{false};
+    std::uint64_t generation{};
+    float sourceX{};
+    float sourceY{};
+    float sourceWidth{};
+    float sourceHeight{};
+    unsigned int outputWidth{};
+    unsigned int outputHeight{};
+    float scaleFactor{};
 };
 
 enum class SpatialUpscaler : int {
@@ -51,6 +76,12 @@ enum class SpatialUpscaler : int {
 enum class CudaBufferFormat : int {
     kRgba8 = 0,
     kRgba16F = 1,
+};
+
+enum class DisplayColorTransform : int {
+    kNone = 0,
+    kInvert = 1,
+    kLumaLut = 2,
 };
 
 struct ProcessingSettings {
@@ -72,12 +103,39 @@ struct ProcessingSettings {
     float temporalSmoothingAlpha{0.25f};
     bool enableStabilization{false};
     float stabilizationStrength{0.85f};  // 0..1, higher = stronger smoothing
-    int displayColorMode{0};             // 0=Normal,1=Inverted,2=WhiteOnBlack,3=YellowOnBlack,4=BlackOnYellow
+    DisplayColorTransform displayColorTransform{DisplayColorTransform::kNone};
+    const std::uint32_t* displayColorLut{}; // host-owned 256-entry BGRA LUT
+    std::uint64_t displayColorLutGeneration{};
+    std::uint32_t textForegroundBgra{0xffffffffu};
+    std::uint32_t textBackgroundBgra{0xff000000u};
     float contrast{1.0f};                // 0.25..4.0, 1 = neutral
     float brightness{0.0f};              // -1..1, 0 = neutral
     bool enableKeystone{false};          // auto-detect projected slide quad, warp fronto-parallel
     bool enableAutoContrast{false};      // percentile-based level stretch before contrast/brightness
     float autoContrastStrength{0.7f};    // 0..1, blend toward full stretch
+    bool enableAutoTextClarity{false};
+    bool enableBackgroundFlatten{false};
+    float backgroundFlattenStrength{0.8f};
+    bool enableAdaptiveBinarization{false};
+    float sauvolaStrength{0.28f};
+    float binarizationSoftness{0.06f};
+    int textPolarityMode{0};             // 0=auto, 1=dark-on-light, 2=light-on-dark
+    int strokeWeight{0};                 // -3=thin through +3=bold
+    bool enableSmartSharpen{false};
+    float smartSharpenStrength{0.45f};
+    bool enableClahe{false};
+    float claheClipLimit{2.0f};
+    bool enableTwoColorText{false};
+    bool enableTextHysteresis{false};
+    float textHysteresisStrength{0.08f};
+    bool enableSelectiveSharpen{false};
+    bool enableFocusDetection{false};
+    float focusThreshold{0.012f};
+    bool enableGlareSuppression{false};
+    float glareSuppressionStrength{0.5f};
+    bool enableMlSuperRes{false};
+    float mlSuperResStrength{0.65f};
+    bool mlSuperResUltra1440p{false};
 };
 
 // Input frame description.
@@ -106,7 +164,9 @@ struct StabilizationState;
 
 class CudaInteropSurface {
 public:
-    explicit CudaInteropSurface(ID3D12Resource* texture, ID3D12Fence* sharedFence = nullptr);
+    explicit CudaInteropSurface(ID3D12Resource* texture,
+                                ID3D12Resource* superResTexture = nullptr,
+                                ID3D12Fence* sharedFence = nullptr);
     ~CudaInteropSurface();
 
     bool IsValid() const { return valid_; }
@@ -121,33 +181,81 @@ public:
     void ResetTemporalHistory();
     void ResetStabilization();
     void ResetKeystone();
+    void SetKeystoneTrackingPaused(bool paused);
+    bool StepKeystoneCorrection(int direction);
+    KeystoneTrackingState GetKeystoneTrackingState() const;
+    void ResetTextClarityHistory();
+    bool HasFocusScore() const { return focusScoreValid_; }
+    float LatestFocusScore() const { return latestFocusScore_; }
+    bool IsFocusAcceptable(float threshold) const {
+        return !focusScoreValid_ || latestFocusScore_ >= threshold;
+    }
+    const std::string& SuperResStatus() const { return superResStatus_; }
+    bool IsSuperResActive() const { return superResActive_; }
+    // Valid while IsSuperResActive(): the crop fed to the AI stage and the
+    // fixed scale factor it runs at (residual zoom is applied by the sampler).
+    unsigned int SuperResSourceWidth() const { return superResSourceWidth_; }
+    unsigned int SuperResSourceHeight() const { return superResSourceHeight_; }
+    float SuperResFactor() const { return superResFactorValue_; }
+    SuperResRoiMetadata SuperResRoi() const { return superResRoi_; }
+    bool IsSuperResPerformanceLimited() const { return superResAutoDisabled_; }
+    float SuperResAverageMs() const { return superResLastAverageMs_; }
+    void SetSuperResPerformanceOverride(bool enabled);
+    void ResetSuperRes();
+
+    // P8 GPU timing (plan 11 Wave 1): duration of the last sampled ProcessFrame
+    // kernel chain in milliseconds, or a negative value while no sample exists.
+    // Sampled every 30th frame with cudaEvents; queries never block.
+    float LastGpuFrameMs() const { return lastGpuFrameMs_; }
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;
 
 private:
-    void Initialize(ID3D12Resource* texture, ID3D12Fence* sharedFence);
+    void Initialize(ID3D12Resource* texture,
+                    ID3D12Resource* superResTexture,
+                    ID3D12Fence* sharedFence);
 
     bool SelectCudaDeviceMatching(LUID adapterLuid);
     bool CreateSurfaceFromResource(ID3D12Device* device, ID3D12Resource* texture);
+    bool CreateSuperResSurfaceFromResource(ID3D12Device* device,
+                                           ID3D12Resource* texture);
+    bool EnsureSuperResOutputBuffer(unsigned int width, unsigned int height);
     void ImportFenceSemaphore(ID3D12Device* device, ID3D12Fence* fence);
     bool EnsureDeviceBuffers(unsigned int width, unsigned int height, CudaBufferFormat format);
     bool EnsureTemporalHistory(unsigned int width, unsigned int height);
     bool EnsureStabilizationBuffers(unsigned int width, unsigned int height);
     bool EnsureRawInputBuffers(unsigned int width, unsigned int height, int format);
+    bool EnsurePinnedUploadRing(size_t requiredBytes);
     bool EnsurePreRotateBuffer(unsigned int width, unsigned int height);
     bool EnsureKeystoneResources(unsigned int width, unsigned int height);
     bool EnsureAutoContrastBuffers();
+    bool EnsureTextClarityBuffers(unsigned int width, unsigned int height);
     void ReleaseDeviceBuffers();
     void ReleaseTemporalHistory();
     void ReleaseStabilization();
     void ReleaseRawInput();
+    void ReleasePinnedUploadRing();
     void ReleaseKeystone();
     void ReleaseAutoContrast();
+    void ReleaseTextClarity();
+    void ReleaseSuperRes();
+    void ConsumeSuperResTiming();
+    void UpdateSuperResCache(const uchar4* source,
+                             size_t sourcePitch,
+                             uchar4* destination,
+                             size_t destinationPitch,
+                             unsigned int width,
+                             unsigned int height,
+                             const ProcessingSettings& settings);
+    void ConsumeProcessTiming();
     bool EnsureGaussianKernel(int radius, float sigma);
+    bool EnsureDisplayColorLut(const std::uint32_t* lut, std::uint64_t generation);
     void RunKeystoneStage(uchar4*& current, uchar4*& alternate,
                           size_t& currentPitch, size_t& alternatePitch);
     void ConsumeKeystoneDetection();
+    void RememberKeystoneCorrection();
+    void RestoreKeystoneCorrection();
     void ResetKeystoneCornersToIdentity();
     void SynchronizeStream() noexcept;
 
@@ -155,11 +263,17 @@ private:
     cudaMipmappedArray_t mipArray_{};
     cudaArray_t level0Array_{};
     cudaSurfaceObject_t surfaceObject_{0};
+    cudaExternalMemory_t superResExternalMemory_{};
+    cudaMipmappedArray_t superResMipArray_{};
+    cudaArray_t superResLevel0Array_{};
+    cudaSurfaceObject_t superResSurfaceObject_{0};
     cudaStream_t stream_{};
     cudaExternalSemaphore_t externalSemaphore_{};
 
     UINT width_{};
     UINT height_{};
+    UINT superResWidth_{};
+    UINT superResHeight_{};
     DXGI_FORMAT format_{DXGI_FORMAT_UNKNOWN};
     int cudaDeviceId_{-1};
     bool valid_{false};
@@ -167,9 +281,13 @@ private:
     uchar4* deviceBufferA_{};
     uchar4* deviceBufferB_{};
     uchar4* deviceScratch_{};
+    uchar4* deviceSuperResOutput_{};
     size_t devicePitchA_{};
     size_t devicePitchB_{};
     size_t devicePitchScratch_{};
+    size_t devicePitchSuperResOutput_{};
+    unsigned int deviceSuperResOutputWidth_{};
+    unsigned int deviceSuperResOutputHeight_{};
     unsigned int deviceWidth_{};
     unsigned int deviceHeight_{};
     CudaBufferFormat bufferFormat_{CudaBufferFormat::kRgba8};
@@ -205,6 +323,24 @@ private:
     unsigned int preRotateWidth_{};
     unsigned int preRotateHeight_{};
 
+    // P11 host-upload ring. The MF callback thread moves each pageable frame
+    // into latestFrame_ under cameraMutex_; the Qt tick moves it out, and ONLY
+    // the Qt thread writes these page-locked slots or advances the slot index.
+    // ProcessFrame's CUDA stream reads the active slot. Shared D3D/CUDA fence
+    // values order GPU work only and cannot guard a host memcpy, so each slot
+    // has a CUDA event recorded immediately after its final H2D copy; the Qt
+    // thread waits for that event before overwriting the slot. The event is
+    // ordered before the same frame's FenceSyncParams::signalValue but permits
+    // reuse before the rest of that frame's kernels finish.
+    struct PinnedUploadSlot {
+        unsigned char* data{};
+        cudaEvent_t uploadComplete{};
+        bool uploadPending{};
+    };
+    std::array<PinnedUploadSlot, 2> pinnedUploadSlots_{};
+    size_t pinnedUploadCapacity_{};
+    size_t pinnedUploadNextSlot_{};
+
     // Keystone: async small-luma snapshot (device -> pinned host) + CPU quad
     // detection. Corners are the temporally smoothed source-quad corners in
     // full-resolution pixels, order TL, TR, BR, BL.
@@ -221,21 +357,94 @@ private:
     float2 keystoneCorners_[4]{};
     unsigned int keystoneFrameCounter_{};
     unsigned int keystoneFramesSinceDetection_{};
+    std::vector<std::array<float2, 4>> keystoneHistory_;
+    int keystoneHistoryIndex_{-1};
+    bool keystoneTrackingPaused_{};
+    bool keystoneSingleStepRequested_{};
+    bool keystoneSingleStepInFlight_{};
 
     // Auto contrast: 256-bin histogram + smoothed lo/hi levels, all device-resident.
     unsigned int* deviceHistogram_{};
     float2* deviceAutoLevels_{};
     bool autoLevelsValid_{};
 
+    // Text clarity: shared luma/statistics workspace, masks, CLAHE maps, and
+    // an infrequent asynchronous focus-score readback. No image is read back.
+    float* deviceTextLuma_{};
+    float* deviceTextHorizontal_{};
+    float* deviceTextMean_{};
+    float* deviceTextSqHorizontal_{};
+    float* deviceTextSqMean_{};
+    size_t deviceTextFloatPitch_{};
+    unsigned char* deviceTextMaskA_{};
+    unsigned char* deviceTextMaskB_{};
+    unsigned char* deviceTextMaskHistory_{};
+    size_t deviceTextMaskPitch_{};
+    unsigned int* deviceClaheHistogram_{};
+    float* deviceClaheMap_{};
+    int4* deviceTextAnalysis_{};
+    float2* deviceFocusStats_{};
+    float2* hostFocusStats_{};
+    cudaEvent_t focusCopyEvent_{};
+    unsigned int textWidth_{};
+    unsigned int textHeight_{};
+    unsigned int focusFrameCounter_{};
+    bool textMaskHistoryValid_{};
+    bool focusCopyPending_{};
+    bool focusScoreValid_{};
+    float latestFocusScore_{};
+
+    // NVIDIA Video Effects is loaded only when requested. Timing uses CUDA
+    // events on the existing interop stream, so the latency guard never stalls
+    // the render loop with a host-side synchronization.
+    std::unique_ptr<MaxineSuperRes> maxineSuperRes_;
+    cudaEvent_t superResStartEvent_{};
+    cudaEvent_t superResStopEvent_{};
+    bool superResTimingPending_{};
+    bool superResAutoDisabled_{};
+    bool superResPerformanceOverride_{};
+    // Setup/Load failures latch on the (source extent, factor) key so a broken
+    // configuration is attempted once, not once per frame. The latch clears
+    // when the key changes (zoom crossed a factor boundary, viewport resized)
+    // or when the feature toggle is re-enabled.
+    bool superResFailureLatched_{};
+    unsigned int superResFailSrcWidth_{};
+    unsigned int superResFailSrcHeight_{};
+    unsigned int superResFailFactorNum_{};
+    unsigned int superResFailFactorDen_{};
+    bool superResRequestedLastFrame_{};
+    bool superResActive_{};
+    unsigned int superResSourceWidth_{};
+    unsigned int superResSourceHeight_{};
+    float superResFactorValue_{};
+    SuperResRoiMetadata superResRoi_{};
+    std::uint64_t superResGeneration_{};
+    unsigned int superResWarmupSamples_{};
+    unsigned int superResTimingSamples_{};
+    float superResTimingTotalMs_{};
+    float superResLastAverageMs_{-1.0f};
+    std::string superResStatus_;
+
+    // P8 GPU timing: cudaEvent pair around the ProcessFrame kernel chain,
+    // recorded every 30th frame and polled (never waited on) the next frames.
+    cudaEvent_t processTimingStartEvent_{};
+    cudaEvent_t processTimingStopEvent_{};
+    bool processTimingPending_{};
+    unsigned int processTimingFrameCounter_{};
+    float lastGpuFrameMs_{-1.0f};
+
     int cachedKernelRadius_{-1};
     float cachedKernelSigma_{0.0f};
     bool kernelUploaded_{};
+    std::uint64_t cachedDisplayColorLutGeneration_{};
     std::string lastError_;
 };
 #else
 class CudaInteropSurface {
 public:
-    explicit CudaInteropSurface(ID3D12Resource* /*texture*/, ID3D12Fence* /*sharedFence*/ = nullptr) {}
+    explicit CudaInteropSurface(ID3D12Resource* /*texture*/,
+                                ID3D12Resource* /*superResTexture*/ = nullptr,
+                                ID3D12Fence* /*sharedFence*/ = nullptr) {}
     ~CudaInteropSurface() = default;
 
     bool IsValid() const { return false; }
@@ -251,6 +460,24 @@ public:
     void ResetTemporalHistory() {}
     void ResetStabilization() {}
     void ResetKeystone() {}
+    void SetKeystoneTrackingPaused(bool /*paused*/) {}
+    bool StepKeystoneCorrection(int /*direction*/) { return false; }
+    KeystoneTrackingState GetKeystoneTrackingState() const { return {}; }
+    void ResetTextClarityHistory() {}
+    bool HasFocusScore() const { return false; }
+    float LatestFocusScore() const { return 0.0f; }
+    bool IsFocusAcceptable(float /*threshold*/) const { return true; }
+    const std::string& SuperResStatus() const { static std::string dummy; return dummy; }
+    bool IsSuperResActive() const { return false; }
+    unsigned int SuperResSourceWidth() const { return 0; }
+    unsigned int SuperResSourceHeight() const { return 0; }
+    float SuperResFactor() const { return 0.0f; }
+    SuperResRoiMetadata SuperResRoi() const { return {}; }
+    bool IsSuperResPerformanceLimited() const { return false; }
+    float SuperResAverageMs() const { return -1.0f; }
+    void SetSuperResPerformanceOverride(bool /*enabled*/) {}
+    void ResetSuperRes() {}
+    float LastGpuFrameMs() const { return -1.0f; }
 
     CudaInteropSurface(const CudaInteropSurface&) = delete;
     CudaInteropSurface& operator=(const CudaInteropSurface&) = delete;

@@ -1,6 +1,8 @@
 #ifdef _WIN32
 
 #include "openzoom/ui/ai_settings_dialog.hpp"
+#include "openzoom/common/codex_app_server_client.hpp"
+#include "openzoom/ui/wheel_safe_combo_box.hpp"
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -10,6 +12,7 @@
 #include <QFileInfo>
 #include <QFormLayout>
 #include <QGroupBox>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -17,6 +20,7 @@
 #include <QPlainTextEdit>
 #include <QPushButton>
 #include <QScopedValueRollback>
+#include <QScrollArea>
 #include <QSignalBlocker>
 #include <QSlider>
 #include <QStandardPaths>
@@ -49,47 +53,87 @@ QString VoiceLabel(const QVoice& voice)
 }
 #endif
 
+QString ReasoningLabel(const QString& effort)
+{
+    const QString normalized = effort.trimmed().toLower();
+    if (normalized == QStringLiteral("xhigh")) {
+        return QStringLiteral("Extra high");
+    }
+    if (normalized == QStringLiteral("none")) {
+        return QStringLiteral("None");
+    }
+    if (normalized == QStringLiteral("minimal")) {
+        return QStringLiteral("Minimal");
+    }
+    if (normalized.isEmpty()) {
+        return QStringLiteral("Default");
+    }
+    QString label = normalized;
+    label[0] = label[0].toUpper();
+    return label;
+}
+
 } // namespace
 
 AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, QWidget* parent)
     : QDialog(parent)
 {
     setWindowTitle("AI Settings");
-    setMinimumWidth(600);
+    setMinimumSize(620, 480);
+    resize(780, 820);
 
     // Large-ish fonts and clear focus outlines, matching the main window.
     setStyleSheet(QStringLiteral(R"(
         QWidget { font-size: 12pt; }
-        QLineEdit, QPlainTextEdit {
+        QLineEdit, QPlainTextEdit, QComboBox {
             padding: 6px;
             border: 2px solid palette(mid);
             border-radius: 6px;
             background: palette(base);
         }
-        QLineEdit:focus, QPlainTextEdit:focus { border-color: palette(highlight); }
+        QLineEdit:focus, QPlainTextEdit:focus, QComboBox:focus {
+            border-color: palette(highlight);
+        }
         QPushButton { min-height: 32px; padding: 4px 14px; }
         QCheckBox { spacing: 8px; }
         QCheckBox::indicator { width: 20px; height: 20px; }
     )"));
 
-    auto* layout = new QVBoxLayout(this);
-    layout->setSpacing(12);
+    auto* outerLayout = new QVBoxLayout(this);
+    outerLayout->setSpacing(12);
+
+    auto* scrollArea = new QScrollArea(this);
+    scrollArea->setWidgetResizable(true);
+    scrollArea->setFrameShape(QFrame::NoFrame);
+    scrollArea->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    scrollArea->setAccessibleName(QStringLiteral("AI settings sections"));
+
+    auto* scrollContent = new QWidget(scrollArea);
+    auto* contentLayout = new QVBoxLayout(scrollContent);
+    contentLayout->setContentsMargins(4, 4, 8, 4);
+    contentLayout->setSpacing(14);
 
     auto* introLabel = new QLabel(
         "Use a signed-in Codex CLI with a ChatGPT subscription, or select an "
         "OpenAI-compatible server such as LM Studio or Ollama.");
     introLabel->setWordWrap(true);
-    layout->addWidget(introLabel);
+    contentLayout->addWidget(introLabel);
 
-    auto* form = new QFormLayout();
-    form->setSpacing(10);
+    auto* providerForm = new QFormLayout();
+    providerForm->setSpacing(10);
 
-    providerCombo_ = new QComboBox();
+    providerCombo_ = new WheelSafeComboBox();
     providerCombo_->addItem("Codex subscription", QStringLiteral("codex"));
     providerCombo_->addItem("OpenAI-compatible server", QStringLiteral("openai-compatible"));
     const int providerIndex = providerCombo_->findData(initial.aiProvider);
     providerCombo_->setCurrentIndex(providerIndex >= 0 ? providerIndex : 0);
-    form->addRow("AI provider:", providerCombo_);
+    providerForm->addRow("AI provider:", providerCombo_);
+    contentLayout->addLayout(providerForm);
+
+    auto* codexGroup = new QGroupBox(QStringLiteral("Codex subscription"));
+    auto* form = new QFormLayout(codexGroup);
+    form->setSpacing(10);
+    contentLayout->addWidget(codexGroup);
 
     codexPathEdit_ = new QLineEdit(initial.codexExecutablePath);
     codexPathEdit_->setPlaceholderText("Auto-detect codex.exe");
@@ -108,19 +152,24 @@ AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, Q
     codexPathRow->addWidget(codexBrowseButton);
     form->addRow("Codex CLI path:", codexPathRow);
 
-    codexModelEdit_ = new QLineEdit(initial.codexModel.trimmed().isEmpty()
-                                        ? QStringLiteral("gpt-5.5")
-                                        : initial.codexModel.trimmed());
-    codexModelEdit_->setPlaceholderText("gpt-5.5");
-    form->addRow("Codex model:", codexModelEdit_);
+    codexModelCombo_ = new WheelSafeComboBox();
+    codexModelCombo_->setMinimumContentsLength(24);
+    codexModelCombo_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
+    const QString configuredModel = initial.codexModel.trimmed().isEmpty()
+                                        ? QStringLiteral("gpt-5.6-tera")
+                                        : initial.codexModel.trimmed();
+    codexModelCombo_->addItem(configuredModel, configuredModel);
+    form->addRow("Codex model:", codexModelCombo_);
 
-    codexReasoningCombo_ = new QComboBox();
-    codexReasoningCombo_->addItem("Low", QStringLiteral("low"));
-    codexReasoningCombo_->addItem("Medium", QStringLiteral("medium"));
-    codexReasoningCombo_->addItem("High", QStringLiteral("high"));
-    codexReasoningCombo_->addItem("Extra high", QStringLiteral("xhigh"));
-    const int reasoningIndex = codexReasoningCombo_->findData(initial.codexReasoningEffort);
-    codexReasoningCombo_->setCurrentIndex(reasoningIndex >= 0 ? reasoningIndex : 3);
+    codexReasoningCombo_ = new WheelSafeComboBox();
+    preferredReasoningEffort_ = initial.codexReasoningEffort.trimmed().toLower();
+    for (const QString& effort : {QStringLiteral("low"), QStringLiteral("medium"),
+                                  QStringLiteral("high"), QStringLiteral("xhigh")}) {
+        codexReasoningCombo_->addItem(ReasoningLabel(effort), effort);
+    }
+    const int reasoningIndex =
+        codexReasoningCombo_->findData(preferredReasoningEffort_);
+    codexReasoningCombo_->setCurrentIndex(reasoningIndex >= 0 ? reasoningIndex : 0);
     form->addRow("Reasoning:", codexReasoningCombo_);
 
     codexInternetCheckbox_ = new QCheckBox("Allow internet access");
@@ -152,40 +201,67 @@ AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, Q
     codexWorkspaceRow->addWidget(codexWorkspaceBrowseButton_);
     form->addRow("Coding workspace:", codexWorkspaceRow);
 
+    builtInInstructionsEdit_ = new QPlainTextEdit(
+        CodexAppServerClient::BuiltInAssistantInstructions());
+    builtInInstructionsEdit_->setReadOnly(true);
+    builtInInstructionsEdit_->setMaximumHeight(120);
+    builtInInstructionsEdit_->setToolTip(
+        QStringLiteral("OpenZoom always sends this instruction to Codex. "
+                       "Permission rules are appended from the controls above."));
+    form->addRow("Built-in prompt:", builtInInstructionsEdit_);
+
     assistantInstructionsEdit_ = new QPlainTextEdit(initial.assistantInstructions);
     assistantInstructionsEdit_->setPlaceholderText(
         "Example: Always answer in Turkish. Use short sentences and explain technical terms.");
     assistantInstructionsEdit_->setMaximumHeight(110);
     auto* assistantBehaviorGroup = new QGroupBox("Assistant behavior");
     auto* assistantBehaviorLayout = new QFormLayout(assistantBehaviorGroup);
-    assistantBehaviorLayout->addRow("Instructions:", assistantInstructionsEdit_);
+    assistantBehaviorLayout->addRow("Your instructions:", assistantInstructionsEdit_);
     form->addRow(assistantBehaviorGroup);
+
+    auto* vlmGroup =
+        new QGroupBox(QStringLiteral("OpenAI-compatible vision server"));
+    auto* vlmForm = new QFormLayout(vlmGroup);
+    vlmForm->setSpacing(10);
+    contentLayout->addWidget(vlmGroup);
 
     apiUrlEdit_ = new QLineEdit(initial.vlmApiUrl);
     apiUrlEdit_->setPlaceholderText(
         "https://api.openai.com/v1/chat/completions or http://localhost:11434/v1/chat/completions");
-    form->addRow("VLM server URL:", apiUrlEdit_);
+    vlmForm->addRow("Server URL:", apiUrlEdit_);
 
     apiKeyEdit_ = new QLineEdit(initial.vlmApiKey);
     apiKeyEdit_->setEchoMode(QLineEdit::Password);
     apiKeyEdit_->setPlaceholderText("Optional for local servers");
-    form->addRow("API key:", apiKeyEdit_);
+    vlmForm->addRow("API key:", apiKeyEdit_);
 
     modelEdit_ = new QLineEdit(initial.vlmModel);
     modelEdit_->setPlaceholderText("gpt-4o-mini or llava");
-    form->addRow("Model:", modelEdit_);
+    vlmForm->addRow("Vision model:", modelEdit_);
 
     promptEdit_ = new QPlainTextEdit(initial.vlmPrompt);
     promptEdit_->setPlaceholderText(
         "Instructions for the vision model, e.g. describe the lecture slide briefly.");
     promptEdit_->setMaximumHeight(100);
-    form->addRow("Scene prompt:", promptEdit_);
+    vlmForm->addRow("Scene prompt:", promptEdit_);
 
     connect(providerCombo_, qOverload<int>(&QComboBox::currentIndexChanged),
             this, [this]() { UpdateProviderFields(); });
     connect(codexCodingCheckbox_, &QCheckBox::toggled,
             this, [this]() { UpdateProviderFields(); });
+    connect(codexModelCombo_, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this]() { UpdateCodexReasoningOptions(); });
+    connect(codexReasoningCombo_, qOverload<int>(&QComboBox::currentIndexChanged),
+            this, [this]() {
+                preferredReasoningEffort_ =
+                    codexReasoningCombo_->currentData().toString();
+            });
     UpdateProviderFields();
+
+    auto* ocrGroup = new QGroupBox(QStringLiteral("Text recognition (OCR)"));
+    auto* ocrForm = new QFormLayout(ocrGroup);
+    ocrForm->setSpacing(10);
+    contentLayout->addWidget(ocrGroup);
 
     tesseractPathEdit_ = new QLineEdit(initial.tesseractPath);
     tesseractPathEdit_->setPlaceholderText("Path to tesseract.exe");
@@ -204,23 +280,28 @@ AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, Q
     tesseractRow->setSpacing(8);
     tesseractRow->addWidget(tesseractPathEdit_, 1);
     tesseractRow->addWidget(browseButton);
-    form->addRow("Tesseract path:", tesseractRow);
+    ocrForm->addRow("Tesseract path:", tesseractRow);
 
     ocrLanguageEdit_ = new QLineEdit(
         initial.ocrLanguage.isEmpty() ? QStringLiteral("eng") : initial.ocrLanguage);
     ocrLanguageEdit_->setPlaceholderText("eng");
-    form->addRow("OCR language:", ocrLanguageEdit_);
+    ocrForm->addRow("OCR language:", ocrLanguageEdit_);
 
     preferredVoiceName_ = initial.ttsVoiceName;
     preferredVoiceLocale_ = initial.ttsVoiceLocale;
     ttsEngine_ = initial.ttsEngine;
 
-    ttsVoiceCombo_ = new QComboBox();
+    auto* speechGroup = new QGroupBox(QStringLiteral("Read aloud"));
+    auto* speechForm = new QFormLayout(speechGroup);
+    speechForm->setSpacing(10);
+    contentLayout->addWidget(speechGroup);
+
+    ttsVoiceCombo_ = new WheelSafeComboBox();
     ttsVoiceCombo_->setMinimumContentsLength(30);
     ttsVoiceCombo_->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-    form->addRow("Voice:", ttsVoiceCombo_);
+    speechForm->addRow("Voice:", ttsVoiceCombo_);
 
-    ttsRateSlider_ = new QSlider(Qt::Horizontal);
+    ttsRateSlider_ = new WheelSafeSlider(Qt::Horizontal);
     ttsRateSlider_->setRange(-100, 100);
     ttsRateSlider_->setSingleStep(10);
     ttsRateSlider_->setPageStep(25);
@@ -237,7 +318,7 @@ AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, Q
     speechRateRow->addWidget(ttsRateSlider_, 1);
     speechRateRow->addWidget(ttsRateValueLabel_);
     speechRateRow->addWidget(ttsPreviewButton_);
-    form->addRow("Speed:", speechRateRow);
+    speechForm->addRow("Speed:", speechRateRow);
 
     connect(ttsRateSlider_, &QSlider::valueChanged, this, [this]() {
         UpdateSpeechRateLabel();
@@ -285,11 +366,16 @@ AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, Q
     ttsPreviewButton_->setEnabled(false);
 #endif
 
-    layout->addLayout(form);
-
+    auto* notesGroup = new QGroupBox(QStringLiteral("Lecture notes"));
+    auto* notesLayout = new QVBoxLayout(notesGroup);
     lectureNotesCheckbox_ = new QCheckBox("Write lecture notes file");
     lectureNotesCheckbox_->setChecked(initial.lectureNotesEnabled);
-    layout->addWidget(lectureNotesCheckbox_);
+    notesLayout->addWidget(lectureNotesCheckbox_);
+    contentLayout->addWidget(notesGroup);
+    contentLayout->addStretch(1);
+
+    scrollArea->setWidget(scrollContent);
+    outerLayout->addWidget(scrollArea, 1);
 
     auto* buttons = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel);
     connect(buttons, &QDialogButtonBox::accepted, this, [this]() {
@@ -307,7 +393,7 @@ AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, Q
         accept();
     });
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    layout->addWidget(buttons);
+    outerLayout->addWidget(buttons);
 
     auto setA11y = [](QWidget* widget, const QString& name, const QString& description) {
         widget->setAccessibleName(name);
@@ -319,8 +405,8 @@ AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, Q
             "Optional location of codex.exe; leave blank for automatic detection");
     setA11y(codexBrowseButton, "Browse for Codex CLI",
             "Pick the Codex command line executable from disk");
-    setA11y(codexModelEdit_, "Codex Model",
-            "Codex image model; GPT 5.5 is the current default for this installation");
+    setA11y(codexModelCombo_, "Codex Model",
+            "Choose an image-capable model reported by the connected Codex app server");
     setA11y(codexReasoningCombo_, "Codex Reasoning",
             "Choose how much reasoning Codex uses; extra high is the default");
     setA11y(codexInternetCheckbox_, "Allow Assistant Internet Access",
@@ -333,6 +419,8 @@ AiSettingsDialog::AiSettingsDialog(const settings::AssistiveSettings& initial, Q
             "Choose the folder available to Codex coding commands and file changes");
     setA11y(assistantInstructionsEdit_, "Assistant Instructions",
             "Set the response language, tone, detail, and other response preferences");
+    setA11y(builtInInstructionsEdit_, "Built-in Codex Prompt",
+            "Read-only OpenZoom instruction always sent to Codex before your instructions");
     setA11y(apiUrlEdit_, "VLM Server URL",
             "Address of the OpenAI-compatible chat completions endpoint");
     setA11y(apiKeyEdit_, "API Key",
@@ -362,7 +450,7 @@ settings::AssistiveSettings AiSettingsDialog::result() const
     settings::AssistiveSettings out;
     out.aiProvider = providerCombo_->currentData().toString();
     out.codexExecutablePath = codexPathEdit_->text().trimmed();
-    out.codexModel = codexModelEdit_->text().trimmed();
+    out.codexModel = codexModelCombo_->currentData().toString().trimmed();
     out.codexReasoningEffort = codexReasoningCombo_->currentData().toString();
     out.codexInternetEnabled = codexInternetCheckbox_->isChecked();
     out.codexCodingEnabled = codexCodingCheckbox_->isChecked();
@@ -512,7 +600,7 @@ void AiSettingsDialog::UpdateProviderFields()
 {
     const bool codex = providerCombo_->currentData().toString() == QStringLiteral("codex");
     codexPathEdit_->setEnabled(codex);
-    codexModelEdit_->setEnabled(codex);
+    codexModelCombo_->setEnabled(codex);
     codexReasoningCombo_->setEnabled(codex);
     codexInternetCheckbox_->setEnabled(codex);
     codexCodingCheckbox_->setEnabled(codex);
@@ -522,6 +610,131 @@ void AiSettingsDialog::UpdateProviderFields()
     apiUrlEdit_->setEnabled(!codex);
     apiKeyEdit_->setEnabled(!codex);
     modelEdit_->setEnabled(!codex);
+    promptEdit_->setEnabled(!codex);
+}
+
+void AiSettingsDialog::SetCodexModelCatalog(const QJsonArray& models,
+                                            const QString& selectedModel)
+{
+    codexModelCatalog_ = models;
+    QString wantedModel = codexModelCombo_->currentData().toString();
+    if (wantedModel.isEmpty()) {
+        wantedModel = selectedModel.trimmed();
+    }
+
+    QSignalBlocker blocker(codexModelCombo_);
+    codexModelCombo_->clear();
+    int selectedIndex = -1;
+    for (const QJsonValue& value : codexModelCatalog_) {
+        const QJsonObject model = value.toObject();
+        const QString id = model.value(QStringLiteral("id")).toString().trimmed();
+        if (id.isEmpty()) {
+            continue;
+        }
+        const QString displayName =
+            model.value(QStringLiteral("displayName")).toString().trimmed();
+        const QString label = displayName.isEmpty() || displayName == id
+                                  ? id
+                                  : QStringLiteral("%1 (%2)").arg(displayName, id);
+        const int index = codexModelCombo_->count();
+        codexModelCombo_->addItem(label, id);
+        codexModelCombo_->setItemData(
+            index,
+            QStringLiteral("Model ID: %1").arg(id),
+            Qt::ToolTipRole);
+        if (id == wantedModel ||
+            (selectedIndex < 0 && wantedModel.isEmpty() && id == selectedModel)) {
+            selectedIndex = index;
+        }
+    }
+
+    if (!wantedModel.isEmpty() && codexModelCombo_->findData(wantedModel) < 0) {
+        codexModelCombo_->addItem(
+            QStringLiteral("%1 (current setting; unavailable in catalog)")
+                .arg(wantedModel),
+            wantedModel);
+        selectedIndex = codexModelCombo_->count() - 1;
+    }
+    if (codexModelCombo_->count() == 0) {
+        const QString fallback = wantedModel.isEmpty()
+                                     ? QStringLiteral("gpt-5.6-tera")
+                                     : wantedModel;
+        codexModelCombo_->addItem(fallback, fallback);
+        selectedIndex = 0;
+    }
+    codexModelCombo_->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
+    blocker.unblock();
+    UpdateCodexReasoningOptions();
+}
+
+void AiSettingsDialog::UpdateCodexReasoningOptions()
+{
+    const QString modelId = codexModelCombo_->currentData().toString();
+    QJsonObject selectedModel;
+    for (const QJsonValue& value : codexModelCatalog_) {
+        const QJsonObject candidate = value.toObject();
+        if (candidate.value(QStringLiteral("id")).toString() == modelId) {
+            selectedModel = candidate;
+            break;
+        }
+    }
+
+    struct EffortOption {
+        QString effort;
+        QString description;
+    };
+    QList<EffortOption> options;
+    const QJsonArray supported =
+        selectedModel.value(QStringLiteral("supportedReasoningEfforts")).toArray();
+    for (const QJsonValue& value : supported) {
+        QString effort;
+        QString description;
+        if (value.isString()) {
+            effort = value.toString();
+        } else {
+            const QJsonObject object = value.toObject();
+            effort = object.value(QStringLiteral("reasoningEffort")).toString();
+            description = object.value(QStringLiteral("description")).toString();
+        }
+        effort = effort.trimmed().toLower();
+        if (!effort.isEmpty()) {
+            options.push_back({effort, description});
+        }
+    }
+    if (options.isEmpty()) {
+        for (const QString& effort : {QStringLiteral("low"),
+                                      QStringLiteral("medium"),
+                                      QStringLiteral("high"),
+                                      QStringLiteral("xhigh")}) {
+            options.push_back({effort, {}});
+        }
+    }
+
+    QString wantedEffort = preferredReasoningEffort_;
+    const QString defaultEffort =
+        selectedModel.value(QStringLiteral("defaultReasoningEffort"))
+            .toString()
+            .trimmed()
+            .toLower();
+    QSignalBlocker blocker(codexReasoningCombo_);
+    codexReasoningCombo_->clear();
+    for (const EffortOption& option : options) {
+        const int index = codexReasoningCombo_->count();
+        codexReasoningCombo_->addItem(ReasoningLabel(option.effort),
+                                      option.effort);
+        if (!option.description.isEmpty()) {
+            codexReasoningCombo_->setItemData(index,
+                                              option.description,
+                                              Qt::ToolTipRole);
+        }
+    }
+    int index = codexReasoningCombo_->findData(wantedEffort);
+    if (index < 0) {
+        index = codexReasoningCombo_->findData(defaultEffort);
+    }
+    codexReasoningCombo_->setCurrentIndex(index >= 0 ? index : 0);
+    preferredReasoningEffort_ =
+        codexReasoningCombo_->currentData().toString();
 }
 
 } // namespace openzoom

@@ -11,6 +11,7 @@
 #include <QJsonParseError>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QSignalBlocker>
 #include <QStandardPaths>
 #include <QTimer>
 
@@ -106,6 +107,10 @@ CodexAppServerClient::CodexAppServerClient(QObject* parent)
 
 CodexAppServerClient::~CodexAppServerClient()
 {
+    // QProcess::waitForFinished can synchronously deliver finished/error
+    // callbacks. They must complete internal cleanup without forwarding state
+    // changes from an object whose owner is already being destroyed.
+    const QSignalBlocker block(this);
     Shutdown();
 }
 
@@ -123,11 +128,12 @@ void CodexAppServerClient::Configure(const QString& executablePath,
     preferredModel_ = preferredModel.trimmed();
     const QString normalizedEffort = reasoningEffort.trimmed().toLower();
     static const QStringList supportedEfforts{
+        QStringLiteral("none"), QStringLiteral("minimal"),
         QStringLiteral("low"), QStringLiteral("medium"),
         QStringLiteral("high"), QStringLiteral("xhigh")};
     reasoningEffort_ = supportedEfforts.contains(normalizedEffort)
                            ? normalizedEffort
-                           : QStringLiteral("xhigh");
+                           : QStringLiteral("low");
     assistantInstructions_ = assistantInstructions.trimmed();
     internetEnabled_ = internetEnabled;
     codingEnabled_ = codingEnabled;
@@ -187,6 +193,11 @@ bool CodexAppServerClient::IsTurnActive() const
     return pendingTurn_.valid || !activeThreadId_.isEmpty();
 }
 QString CodexAppServerClient::SelectedModel() const { return selectedModel_; }
+
+QString CodexAppServerClient::BuiltInAssistantInstructions()
+{
+    return QString::fromLatin1(kAssistantIdentity).trimmed();
+}
 
 void CodexAppServerClient::RefreshAccount()
 {
@@ -392,6 +403,12 @@ QString CodexAppServerClient::ResolveExecutable() const
     }
     const QString localAppData = qEnvironmentVariable("LOCALAPPDATA").trimmed();
     if (!localAppData.isEmpty()) {
+        const QString standalone =
+            QDir(localAppData).filePath(
+                QStringLiteral("Programs/OpenAI/Codex/bin/codex.exe"));
+        if (QFileInfo::exists(standalone)) {
+            return standalone;
+        }
         const QString winget = QDir(localAppData).filePath(QStringLiteral("Microsoft/WinGet/Links/codex.exe"));
         if (QFileInfo::exists(winget)) {
             return winget;
@@ -706,6 +723,7 @@ void CodexAppServerClient::FinishInitialization(const QJsonObject& error)
                             {QStringLiteral("includeHidden"), false}},
                 [this](const QJsonObject& result, const QJsonObject&) {
                     QStringList modelIds;
+                    QJsonArray modelCatalog;
                     QString defaultImageModel;
                     for (const QJsonValue& value : result.value(QStringLiteral("data")).toArray()) {
                         const QJsonObject model = value.toObject();
@@ -715,6 +733,7 @@ void CodexAppServerClient::FinishInitialization(const QJsonObject& error)
                             continue;
                         }
                         modelIds.push_back(id);
+                        modelCatalog.push_back(model);
                         if (model.value(QStringLiteral("isDefault")).toBool()) {
                             defaultImageModel = id;
                         }
@@ -727,6 +746,7 @@ void CodexAppServerClient::FinishInitialization(const QJsonObject& error)
                         selectedModel_ = modelIds.front();
                     }
                     emit ModelsChanged(modelIds, selectedModel_);
+                    emit ModelCatalogChanged(modelCatalog, selectedModel_);
                 });
     RefreshAccount();
     if (loginWhenReady_) {

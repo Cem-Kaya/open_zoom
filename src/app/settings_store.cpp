@@ -1,6 +1,7 @@
 #ifdef _WIN32
 
 #include "openzoom/app/settings_store.hpp"
+#include "openzoom/app/constants.hpp"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -32,6 +33,63 @@ int SnapRotation(int turns)
 float Clamp01(float value)
 {
     return std::clamp(value, 0.0f, 1.0f);
+}
+
+QJsonObject ColorSchemeToJson(const color_schemes::ColorScheme& requested)
+{
+    const color_schemes::ColorScheme scheme =
+        color_schemes::NormalizeColorScheme(requested);
+    QJsonArray stops;
+    for (const QColor& color : scheme.stops) {
+        stops.append(color.name(QColor::HexRgb));
+    }
+    return QJsonObject{
+        {QStringLiteral("id"), scheme.id},
+        {QStringLiteral("name"), scheme.name},
+        {QStringLiteral("mode"), color_schemes::ModeToken(scheme.mode)},
+        {QStringLiteral("stops"), stops},
+        {QStringLiteral("stepped"), scheme.stepped},
+        {QStringLiteral("textColorAtHighLuma"), scheme.textColorAtHighLuma},
+    };
+}
+
+color_schemes::ColorScheme ColorSchemeFromJson(const QJsonValue& value,
+                                                int legacyMode)
+{
+    if (!value.isObject()) {
+        return color_schemes::LegacyColorScheme(legacyMode);
+    }
+    const QJsonObject object = value.toObject();
+    color_schemes::ColorScheme scheme;
+    scheme.id = object.value(QStringLiteral("id")).toString();
+    scheme.name = object.value(QStringLiteral("name")).toString();
+    scheme.accessibleName = scheme.name;
+    scheme.mode = color_schemes::ModeFromToken(
+        object.value(QStringLiteral("mode")).toString());
+    scheme.stepped = object.value(QStringLiteral("stepped")).toBool(
+        scheme.mode == color_schemes::SchemeMode::Posterize);
+    scheme.textColorAtHighLuma =
+        object.value(QStringLiteral("textColorAtHighLuma")).toBool(true);
+    const QJsonArray stops = object.value(QStringLiteral("stops")).toArray();
+    const int count = std::clamp(static_cast<int>(stops.size()), 0, 8);
+    for (int i = 0; i < count; ++i) {
+        const QString text = stops.at(i).toString();
+        const QColor color(text);
+        if (!color.isValid() || text.size() != 7 || !text.startsWith(QLatin1Char('#'))) {
+            return color_schemes::LegacyColorScheme(legacyMode);
+        }
+        scheme.stops.push_back(color);
+    }
+    if (scheme.stops.size() < 2) {
+        return color_schemes::LegacyColorScheme(legacyMode);
+    }
+    if (const color_schemes::ColorScheme* builtIn =
+            color_schemes::FindBuiltInColorScheme(scheme.id)) {
+        scheme.accessibleName = builtIn->accessibleName;
+        scheme.legacyMode = builtIn->legacyMode;
+        scheme.effect = builtIn->effect;
+    }
+    return color_schemes::NormalizeColorScheme(scheme, legacyMode);
 }
 
 AdvancedConfig MakeConfig(QString id,
@@ -196,6 +254,35 @@ const std::vector<AdvancedConfig>& BuiltInConfigsStorage()
             config.stabilizationStrength = 0.85f;
             return config;
         }(),
+        []() {
+            AdvancedConfig config = MakeConfig(QStringLiteral("preset-document-config"),
+                       QStringLiteral("Document"),
+                       QStringLiteral("Adaptive text clarity for pages with shadows, glare, or uneven light."),
+                       false, 0.5f, true, 1.6f, 0.5f, 0.5f,
+                       false, 1.0f, 3,
+                       false, 0.25f,
+                       false, 1, 0.25f,
+                       false, false, 0,
+                       false, false, true);
+            config.autoTextClarityEnabled = true;
+            config.backgroundFlattenEnabled = true;
+            config.backgroundFlattenStrength = 0.85f;
+            config.adaptiveBinarizationEnabled = true;
+            config.sauvolaStrength = 0.28f;
+            config.binarizationSoftness = 0.06f;
+            config.smartSharpenEnabled = true;
+            config.smartSharpenStrength = 0.42f;
+            config.textPolarityMode = 0;
+            config.strokeWeight = 1;
+            config.twoColorTextEnabled = true;
+            config.textHysteresisEnabled = true;
+            config.textHysteresisStrength = 0.08f;
+            config.selectiveSharpenEnabled = true;
+            config.focusDetectionEnabled = true;
+            config.glareSuppressionEnabled = true;
+            config.glareSuppressionStrength = 0.45f;
+            return config;
+        }(),
     };
     return kConfigs;
 }
@@ -223,6 +310,8 @@ const std::vector<PresetDefinition>& BuiltInPresetsStorage()
          QStringLiteral("Straightens the projected screen and fixes washed-out colors."), QStringLiteral("preset-projector-config"), true},
         {QStringLiteral("preset-whiteboard"), QStringLiteral("Whiteboard"),
          QStringLiteral("High contrast and sharpening for handwriting on a board."), QStringLiteral("preset-whiteboard-config"), true},
+        {QStringLiteral("preset-document"), QStringLiteral("Document"),
+         QStringLiteral("Adaptive text clarity for paper, handouts, and uneven lighting."), QStringLiteral("preset-document-config"), true},
     };
     return kPresets;
 }
@@ -249,17 +338,47 @@ QJsonObject ConfigToJson(const AdvancedConfig& config)
     object.insert(QStringLiteral("spatialSharpness"), config.spatialSharpness);
     object.insert(QStringLiteral("debugView"), config.debugView);
     object.insert(QStringLiteral("focusMarker"), config.focusMarker);
+    object.insert(QStringLiteral("rotationQuarterTurns"),
+                  SnapRotation(config.rotationQuarterTurns));
     object.insert(QStringLiteral("ocrAssistEnabled"), config.ocrAssistEnabled);
     object.insert(QStringLiteral("vlmAssistEnabled"), config.vlmAssistEnabled);
     object.insert(QStringLiteral("assistiveOverlayEnabled"), config.assistiveOverlayEnabled);
     object.insert(QStringLiteral("stabilizationEnabled"), config.stabilizationEnabled);
     object.insert(QStringLiteral("stabilizationStrength"), config.stabilizationStrength);
     object.insert(QStringLiteral("displayColorMode"), config.displayColorMode);
+    object.insert(QStringLiteral("colorScheme"), ColorSchemeToJson(
+        config.colorScheme.stops.size() >= 2
+            ? config.colorScheme
+            : color_schemes::LegacyColorScheme(config.displayColorMode)));
     object.insert(QStringLiteral("contrast"), config.contrast);
     object.insert(QStringLiteral("brightness"), config.brightness);
     object.insert(QStringLiteral("keystoneEnabled"), config.keystoneEnabled);
     object.insert(QStringLiteral("autoContrastEnabled"), config.autoContrastEnabled);
     object.insert(QStringLiteral("autoContrastStrength"), config.autoContrastStrength);
+    object.insert(QStringLiteral("autoTextClarityEnabled"), config.autoTextClarityEnabled);
+    object.insert(QStringLiteral("backgroundFlattenEnabled"), config.backgroundFlattenEnabled);
+    object.insert(QStringLiteral("backgroundFlattenStrength"), config.backgroundFlattenStrength);
+    object.insert(QStringLiteral("adaptiveBinarizationEnabled"), config.adaptiveBinarizationEnabled);
+    object.insert(QStringLiteral("sauvolaStrength"), config.sauvolaStrength);
+    object.insert(QStringLiteral("binarizationSoftness"), config.binarizationSoftness);
+    object.insert(QStringLiteral("textPolarityMode"), config.textPolarityMode);
+    object.insert(QStringLiteral("strokeWeight"), config.strokeWeight);
+    object.insert(QStringLiteral("smartSharpenEnabled"), config.smartSharpenEnabled);
+    object.insert(QStringLiteral("smartSharpenStrength"), config.smartSharpenStrength);
+    object.insert(QStringLiteral("claheEnabled"), config.claheEnabled);
+    object.insert(QStringLiteral("claheClipLimit"), config.claheClipLimit);
+    object.insert(QStringLiteral("twoColorTextEnabled"), config.twoColorTextEnabled);
+    object.insert(QStringLiteral("textHysteresisEnabled"), config.textHysteresisEnabled);
+    object.insert(QStringLiteral("textHysteresisStrength"), config.textHysteresisStrength);
+    object.insert(QStringLiteral("selectiveSharpenEnabled"), config.selectiveSharpenEnabled);
+    object.insert(QStringLiteral("focusDetectionEnabled"), config.focusDetectionEnabled);
+    object.insert(QStringLiteral("focusThreshold"), config.focusThreshold);
+    object.insert(QStringLiteral("glareSuppressionEnabled"), config.glareSuppressionEnabled);
+    object.insert(QStringLiteral("glareSuppressionStrength"), config.glareSuppressionStrength);
+    object.insert(QStringLiteral("mlSuperResEnabled"), config.mlSuperResEnabled);
+    object.insert(QStringLiteral("mlSuperResStrength"), config.mlSuperResStrength);
+    object.insert(QStringLiteral("mlSuperResPrefer2x"), config.mlSuperResPrefer2x);
+    object.insert(QStringLiteral("mlSuperResUltra1440p"), config.mlSuperResUltra1440p);
     return object;
 }
 
@@ -291,12 +410,49 @@ AdvancedConfig ConfigFromJson(const QJsonObject& object, const AdvancedConfig& d
     config.assistiveOverlayEnabled = object.value(QStringLiteral("assistiveOverlayEnabled")).toBool(config.assistiveOverlayEnabled);
     config.stabilizationEnabled = object.value(QStringLiteral("stabilizationEnabled")).toBool(config.stabilizationEnabled);
     config.stabilizationStrength = Clamp01(static_cast<float>(object.value(QStringLiteral("stabilizationStrength")).toDouble(config.stabilizationStrength)));
-    config.displayColorMode = std::clamp(object.value(QStringLiteral("displayColorMode")).toInt(config.displayColorMode), 0, 4);
+    config.displayColorMode = std::clamp(
+        object.value(QStringLiteral("displayColorMode")).toInt(config.displayColorMode),
+        0, app_constants::kDisplayColorModeCount - 1);
+    config.colorScheme = ColorSchemeFromJson(object.value(QStringLiteral("colorScheme")),
+                                             config.displayColorMode);
     config.contrast = std::clamp(static_cast<float>(object.value(QStringLiteral("contrast")).toDouble(config.contrast)), 0.25f, 4.0f);
     config.brightness = std::clamp(static_cast<float>(object.value(QStringLiteral("brightness")).toDouble(config.brightness)), -1.0f, 1.0f);
     config.keystoneEnabled = object.value(QStringLiteral("keystoneEnabled")).toBool(config.keystoneEnabled);
     config.autoContrastEnabled = object.value(QStringLiteral("autoContrastEnabled")).toBool(config.autoContrastEnabled);
     config.autoContrastStrength = Clamp01(static_cast<float>(object.value(QStringLiteral("autoContrastStrength")).toDouble(config.autoContrastStrength)));
+    config.autoTextClarityEnabled = object.value(QStringLiteral("autoTextClarityEnabled")).toBool(config.autoTextClarityEnabled);
+    config.backgroundFlattenEnabled = object.value(QStringLiteral("backgroundFlattenEnabled")).toBool(config.backgroundFlattenEnabled);
+    config.backgroundFlattenStrength = Clamp01(static_cast<float>(object.value(QStringLiteral("backgroundFlattenStrength")).toDouble(config.backgroundFlattenStrength)));
+    config.adaptiveBinarizationEnabled = object.value(QStringLiteral("adaptiveBinarizationEnabled")).toBool(config.adaptiveBinarizationEnabled);
+    config.sauvolaStrength = std::clamp(static_cast<float>(object.value(QStringLiteral("sauvolaStrength")).toDouble(config.sauvolaStrength)), 0.1f, 0.5f);
+    config.binarizationSoftness = std::clamp(static_cast<float>(object.value(QStringLiteral("binarizationSoftness")).toDouble(config.binarizationSoftness)), 0.0f, 0.25f);
+    config.textPolarityMode = std::clamp(object.value(QStringLiteral("textPolarityMode")).toInt(config.textPolarityMode), 0, 2);
+    config.strokeWeight = std::clamp(object.value(QStringLiteral("strokeWeight")).toInt(config.strokeWeight), -3, 3);
+    config.smartSharpenEnabled = object.value(QStringLiteral("smartSharpenEnabled")).toBool(config.smartSharpenEnabled);
+    config.smartSharpenStrength = Clamp01(static_cast<float>(object.value(QStringLiteral("smartSharpenStrength")).toDouble(config.smartSharpenStrength)));
+    config.claheEnabled = object.value(QStringLiteral("claheEnabled")).toBool(config.claheEnabled);
+    config.claheClipLimit = std::clamp(static_cast<float>(object.value(QStringLiteral("claheClipLimit")).toDouble(config.claheClipLimit)), 1.0f, 8.0f);
+    config.twoColorTextEnabled = object.value(QStringLiteral("twoColorTextEnabled")).toBool(config.twoColorTextEnabled);
+    config.textHysteresisEnabled = object.value(QStringLiteral("textHysteresisEnabled")).toBool(config.textHysteresisEnabled);
+    config.textHysteresisStrength = std::clamp(static_cast<float>(object.value(QStringLiteral("textHysteresisStrength")).toDouble(config.textHysteresisStrength)), 0.0f, 0.25f);
+    config.selectiveSharpenEnabled = object.value(QStringLiteral("selectiveSharpenEnabled")).toBool(config.selectiveSharpenEnabled);
+    config.focusDetectionEnabled = object.value(QStringLiteral("focusDetectionEnabled")).toBool(config.focusDetectionEnabled);
+    config.focusThreshold = std::clamp(static_cast<float>(object.value(QStringLiteral("focusThreshold")).toDouble(config.focusThreshold)), 0.001f, 0.1f);
+    config.glareSuppressionEnabled = object.value(QStringLiteral("glareSuppressionEnabled")).toBool(config.glareSuppressionEnabled);
+    config.glareSuppressionStrength = Clamp01(static_cast<float>(object.value(QStringLiteral("glareSuppressionStrength")).toDouble(config.glareSuppressionStrength)));
+    config.mlSuperResEnabled = object.value(QStringLiteral("mlSuperResEnabled"))
+                                   .toBool(object.value(QStringLiteral("mlTextSuperResolutionEnabled"))
+                                               .toBool(config.mlSuperResEnabled));
+    config.mlSuperResStrength = Clamp01(static_cast<float>(
+        object.value(QStringLiteral("mlSuperResStrength"))
+            .toDouble(object.value(QStringLiteral("mlTextSuperResolutionStrength"))
+                          .toDouble(config.mlSuperResStrength))));
+    config.mlSuperResPrefer2x =
+        object.value(QStringLiteral("mlSuperResPrefer2x"))
+            .toBool(config.mlSuperResPrefer2x);
+    config.mlSuperResUltra1440p =
+        object.value(QStringLiteral("mlSuperResUltra1440p"))
+            .toBool(config.mlSuperResUltra1440p);
     return config;
 }
 
@@ -497,7 +653,35 @@ std::optional<PersistentSettings> Load(const QString& path)
     settings.virtualJoystick = ui.value(QStringLiteral("virtualJoystick")).toBool(settings.virtualJoystick);
     settings.controlsCollapsed = ui.value(QStringLiteral("controlsCollapsed")).toBool(settings.controlsCollapsed);
     settings.simpleUiMode = ui.value(QStringLiteral("simpleUiMode")).toBool(settings.simpleUiMode);
+    settings.advancedPanelWidth = std::clamp(
+        ui.value(QStringLiteral("advancedPanelWidth")).toInt(settings.advancedPanelWidth),
+        360, 1200);
+    settings.viewportRateMode = static_cast<ViewportRateMode>(std::clamp(
+        ui.value(QStringLiteral("viewportRateMode"))
+            .toInt(static_cast<int>(settings.viewportRateMode)),
+        static_cast<int>(ViewportRateMode::AutoUpTo120),
+        static_cast<int>(ViewportRateMode::MatchDisplay)));
+    settings.viewportFitMode = static_cast<ViewportFitModeSetting>(std::clamp(
+        ui.value(QStringLiteral("viewportFitMode"))
+            .toInt(static_cast<int>(settings.viewportFitMode)),
+        static_cast<int>(ViewportFitModeSetting::Fill),
+        static_cast<int>(ViewportFitModeSetting::Fit)));
     settings.selectedPresetId = ui.value(QStringLiteral("selectedPresetId")).toString();
+    settings.setupAssistantDeclined =
+        ui.value(QStringLiteral("setupAssistantDeclined")).toBool(settings.setupAssistantDeclined);
+    const QJsonObject overlayGeometry =
+        ui.value(QStringLiteral("assistiveOverlayGeometry")).toObject();
+    const int overlayWidth = std::clamp(
+        overlayGeometry.value(QStringLiteral("width")).toInt(), 0, 4096);
+    const int overlayHeight = std::clamp(
+        overlayGeometry.value(QStringLiteral("height")).toInt(), 0, 4096);
+    if (overlayWidth > 0 && overlayHeight > 0) {
+        settings.assistiveOverlayGeometry = QRect(
+            std::clamp(overlayGeometry.value(QStringLiteral("x")).toInt(), -32768, 32768),
+            std::clamp(overlayGeometry.value(QStringLiteral("y")).toInt(), -32768, 32768),
+            overlayWidth,
+            overlayHeight);
+    }
 
     settings.assistive = AssistiveFromJson(root.value(QStringLiteral("assistive")).toObject());
 
@@ -515,6 +699,12 @@ std::optional<PersistentSettings> Load(const QString& path)
 
     const AdvancedConfig defaultConfig = BuiltInConfigsStorage().front();
     settings.currentConfig = ConfigFromJson(root.value(QStringLiteral("currentConfig")).toObject(), defaultConfig);
+    if (root.value(QStringLiteral("customColorScheme")).isObject()) {
+        settings.customColorScheme = ColorSchemeFromJson(
+            root.value(QStringLiteral("customColorScheme")), 0);
+        settings.customColorScheme.id = QStringLiteral("custom");
+        settings.customColorScheme.legacyMode = -1;
+    }
     settings.rotationQuarterTurns = SnapRotation(
         root.value(QStringLiteral("rotationQuarterTurns")).toInt(settings.currentConfig.rotationQuarterTurns));
     if (settings.currentConfig.id.isEmpty()) {
@@ -556,7 +746,7 @@ bool Save(const QString& path, const PersistentSettings& settings)
     EnsureSettingsDirectory(path);
 
     QJsonObject root;
-    root.insert(QStringLiteral("version"), 5);
+    root.insert(QStringLiteral("version"), 7);
     root.insert(QStringLiteral("cameraIndex"), settings.cameraIndex);
     root.insert(QStringLiteral("rotationQuarterTurns"), SnapRotation(settings.rotationQuarterTurns));
 
@@ -564,7 +754,21 @@ bool Save(const QString& path, const PersistentSettings& settings)
     ui.insert(QStringLiteral("virtualJoystick"), settings.virtualJoystick);
     ui.insert(QStringLiteral("controlsCollapsed"), settings.controlsCollapsed);
     ui.insert(QStringLiteral("simpleUiMode"), settings.simpleUiMode);
+    ui.insert(QStringLiteral("advancedPanelWidth"), settings.advancedPanelWidth);
+    ui.insert(QStringLiteral("viewportRateMode"),
+              static_cast<int>(settings.viewportRateMode));
+    ui.insert(QStringLiteral("viewportFitMode"),
+              static_cast<int>(settings.viewportFitMode));
     ui.insert(QStringLiteral("selectedPresetId"), settings.selectedPresetId);
+    ui.insert(QStringLiteral("setupAssistantDeclined"), settings.setupAssistantDeclined);
+    if (settings.assistiveOverlayGeometry.isValid()) {
+        const QRect& geometry = settings.assistiveOverlayGeometry;
+        ui.insert(QStringLiteral("assistiveOverlayGeometry"),
+                  QJsonObject{{QStringLiteral("x"), geometry.x()},
+                              {QStringLiteral("y"), geometry.y()},
+                              {QStringLiteral("width"), geometry.width()},
+                              {QStringLiteral("height"), geometry.height()}});
+    }
     root.insert(QStringLiteral("ui"), ui);
 
     root.insert(QStringLiteral("assistive"), AssistiveToJson(settings.assistive));
@@ -576,6 +780,10 @@ bool Save(const QString& path, const PersistentSettings& settings)
     root.insert(QStringLiteral("codexConversations"), conversationArray);
 
     root.insert(QStringLiteral("currentConfig"), ConfigToJson(settings.currentConfig));
+    if (settings.customColorScheme.stops.size() >= 2) {
+        root.insert(QStringLiteral("customColorScheme"),
+                    ColorSchemeToJson(settings.customColorScheme));
+    }
 
     QJsonArray configArray;
     for (const AdvancedConfig& config : settings.customConfigs) {
@@ -692,12 +900,42 @@ bool AreConfigsEquivalent(const AdvancedConfig& lhs, const AdvancedConfig& rhs)
            lhs.assistiveOverlayEnabled == rhs.assistiveOverlayEnabled &&
            lhs.stabilizationEnabled == rhs.stabilizationEnabled &&
            withinUiStep(lhs.stabilizationStrength, rhs.stabilizationStrength, 0.005f) &&
-           lhs.displayColorMode == rhs.displayColorMode &&
+           color_schemes::SchemesEquivalent(
+               lhs.colorScheme.stops.size() >= 2
+                   ? lhs.colorScheme
+                   : color_schemes::LegacyColorScheme(lhs.displayColorMode),
+               rhs.colorScheme.stops.size() >= 2
+                   ? rhs.colorScheme
+                   : color_schemes::LegacyColorScheme(rhs.displayColorMode)) &&
            withinUiStep(lhs.contrast, rhs.contrast, 0.005f) &&
            withinUiStep(lhs.brightness, rhs.brightness, 0.005f) &&
            lhs.keystoneEnabled == rhs.keystoneEnabled &&
            lhs.autoContrastEnabled == rhs.autoContrastEnabled &&
-           withinUiStep(lhs.autoContrastStrength, rhs.autoContrastStrength, 0.005f);
+           withinUiStep(lhs.autoContrastStrength, rhs.autoContrastStrength, 0.005f) &&
+           lhs.autoTextClarityEnabled == rhs.autoTextClarityEnabled &&
+           lhs.backgroundFlattenEnabled == rhs.backgroundFlattenEnabled &&
+           withinUiStep(lhs.backgroundFlattenStrength, rhs.backgroundFlattenStrength, 0.005f) &&
+           lhs.adaptiveBinarizationEnabled == rhs.adaptiveBinarizationEnabled &&
+           withinUiStep(lhs.sauvolaStrength, rhs.sauvolaStrength, 0.005f) &&
+           withinUiStep(lhs.binarizationSoftness, rhs.binarizationSoftness, 0.005f) &&
+           lhs.textPolarityMode == rhs.textPolarityMode &&
+           lhs.strokeWeight == rhs.strokeWeight &&
+           lhs.smartSharpenEnabled == rhs.smartSharpenEnabled &&
+           withinUiStep(lhs.smartSharpenStrength, rhs.smartSharpenStrength, 0.005f) &&
+           lhs.claheEnabled == rhs.claheEnabled &&
+           withinUiStep(lhs.claheClipLimit, rhs.claheClipLimit, 0.05f) &&
+           lhs.twoColorTextEnabled == rhs.twoColorTextEnabled &&
+           lhs.textHysteresisEnabled == rhs.textHysteresisEnabled &&
+           withinUiStep(lhs.textHysteresisStrength, rhs.textHysteresisStrength, 0.005f) &&
+           lhs.selectiveSharpenEnabled == rhs.selectiveSharpenEnabled &&
+           lhs.focusDetectionEnabled == rhs.focusDetectionEnabled &&
+           withinUiStep(lhs.focusThreshold, rhs.focusThreshold, 0.0005f) &&
+           lhs.glareSuppressionEnabled == rhs.glareSuppressionEnabled &&
+           withinUiStep(lhs.glareSuppressionStrength, rhs.glareSuppressionStrength, 0.005f) &&
+           lhs.mlSuperResEnabled == rhs.mlSuperResEnabled &&
+           withinUiStep(lhs.mlSuperResStrength, rhs.mlSuperResStrength, 0.005f) &&
+           lhs.mlSuperResPrefer2x == rhs.mlSuperResPrefer2x &&
+           lhs.mlSuperResUltra1440p == rhs.mlSuperResUltra1440p;
 }
 
 } // namespace openzoom::settings

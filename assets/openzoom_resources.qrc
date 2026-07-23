@@ -1,5 +1,6 @@
 <RCC>
     <qresource prefix="/openzoom/icons">
+        <file alias="app.png">openzoom-icon.png</file>
         <file alias="camera.svg">icons/lucide/camera.svg</file>
         <file alias="record.svg">icons/lucide/circle.svg</file>
         <file alias="explain.svg">icons/lucide/message-circle-question.svg</file>
@@ -8,5 +9,9 @@
         <file alias="previous.svg">icons/lucide/chevron-left.svg</file>
         <file alias="next.svg">icons/lucide/chevron-right.svg</file>
         <file alias="close.svg">icons/lucide/x.svg</file>
+        <file alias="step-back.svg">icons/lucide/step-back.svg</file>
+        <file alias="pause.svg">icons/lucide/pause.svg</file>
+        <file alias="play.svg">icons/lucide/play.svg</file>
+        <file alias="step-forward.svg">icons/lucide/step-forward.svg</file>
     </qresource>
 </RCC>

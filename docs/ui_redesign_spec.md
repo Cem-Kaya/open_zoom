@@ -1,5 +1,7 @@
 # UI Redesign Spec — "Option 7 Plus" (agreed 2026-07-21, refined 2026-07-22)
 
+> **Status: implemented and review-verified, 2026-07-22.** Kept as the design contract; hotkeys have since been extended to `1`–`9`.
+
 Decision from reviewing `ui ideas/ui-option-01..15.png`: **option 7 is the base**
 (full-bleed video, floating corner clusters), upgraded with the strongest ideas
 from options 9, 13, and 14. This file is the contract for the implementing

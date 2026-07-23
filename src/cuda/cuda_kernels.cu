@@ -26,6 +26,8 @@ namespace openzoom {
 
 namespace {
 
+__constant__ std::uint32_t gDisplayColorLut[256];
+
 __device__ unsigned char FloatToByte(float value) {
     const float clamped = fminf(fmaxf(value, 0.0f), 1.0f);
     return static_cast<unsigned char>(clamped * 255.0f);
@@ -322,10 +324,29 @@ __global__ void ZoomLinearKernel(uchar4* dst, size_t dstPitch,
     dstRow[x] = sampled;
 }
 
+__global__ void BlendLinearKernel(uchar4* dst, size_t dstPitch,
+                                  const uchar4* base, size_t basePitch,
+                                  const uchar4* enhanced, size_t enhancedPitch,
+                                  int width, int height, float strength) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) {
+        return;
+    }
+    const float amount = fminf(fmaxf(strength, 0.0f), 1.0f);
+    const uchar4 a = RowAt(base, basePitch, y)[x];
+    const uchar4 b = RowAt(enhanced, enhancedPitch, y)[x];
+    uchar4 output;
+    output.x = static_cast<unsigned char>(roundf(a.x + amount * (b.x - a.x)));
+    output.y = static_cast<unsigned char>(roundf(a.y + amount * (b.y - a.y)));
+    output.z = static_cast<unsigned char>(roundf(a.z + amount * (b.z - a.z)));
+    output.w = static_cast<unsigned char>(roundf(a.w + amount * (b.w - a.w)));
+    RowAt(dst, dstPitch, y)[x] = output;
+}
+
 constexpr int kMaxBlurRadius = 50;
 __constant__ float gGaussianKernel[(kMaxBlurRadius * 2) + 1];
 __constant__ int gGaussianRadius;
-__constant__ int gGaussianKernelSize;
 
 __global__ void GaussianBlurHorizontalKernel(uchar4* dst, size_t dstPitch,
                                              const uchar4* src, size_t srcPitch,
@@ -583,6 +604,23 @@ void LaunchZoomLinear(uchar4* dst, size_t dstPitchBytes,
     CheckCuda("ZoomLinearKernel launch failed");
 }
 
+void LaunchBlendLinear(uchar4* dst, size_t dstPitchBytes,
+                       const uchar4* base, size_t basePitchBytes,
+                       const uchar4* enhanced, size_t enhancedPitchBytes,
+                       int width, int height, float strength,
+                       cudaStream_t stream) {
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    const dim3 blockSize(16, 16);
+    const dim3 gridSize((width + blockSize.x - 1) / blockSize.x,
+                        (height + blockSize.y - 1) / blockSize.y);
+    BlendLinearKernel<<<gridSize, blockSize, 0, stream>>>(
+        dst, dstPitchBytes, base, basePitchBytes, enhanced, enhancedPitchBytes,
+        width, height, strength);
+    CheckCuda("BlendLinearKernel launch failed");
+}
+
 void LaunchGaussianBlurLinear(uchar4* dst, size_t dstPitchBytes,
                               uchar4* scratch, size_t scratchPitchBytes,
                               const uchar4* src, size_t srcPitchBytes,
@@ -732,19 +770,36 @@ __global__ void StabilizationLumaDownsampleKernel(float* dstLuma,
     dstLuma[y * smallWidth + x] = (count > 0) ? sum / static_cast<float>(count) : 0.0f;
 }
 
-// Profiles are tiny (<= 320 floats), so atomicAdd contention is negligible.
 __global__ void StabilizationProjectionKernel(const float* luma,
                                               int smallWidth, int smallHeight,
                                               float* colProj, float* rowProj) {
+    __shared__ float colPart[16];
+    __shared__ float rowPart[16];
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
     const int y = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x >= smallWidth || y >= smallHeight) {
-        return;
+    if (threadIdx.y == 0) {
+        colPart[threadIdx.x] = 0.0f;
     }
+    if (threadIdx.x == 0) {
+        rowPart[threadIdx.y] = 0.0f;
+    }
+    __syncthreads();
 
-    const float value = luma[y * smallWidth + x];
-    atomicAdd(&colProj[x], value);
-    atomicAdd(&rowProj[y], value);
+    if (x < smallWidth && y < smallHeight) {
+        const float value = luma[y * smallWidth + x];
+        atomicAdd(&colPart[threadIdx.x], value);
+        atomicAdd(&rowPart[threadIdx.y], value);
+    }
+    __syncthreads();
+
+    // Shared-memory contention is local to the SM. Only one partial per row
+    // and column reaches global memory from each 16x16 block.
+    if (threadIdx.y == 0 && x < smallWidth) {
+        atomicAdd(&colProj[x], colPart[threadIdx.x]);
+    }
+    if (threadIdx.x == 0 && y < smallHeight) {
+        atomicAdd(&rowProj[y], rowPart[threadIdx.y]);
+    }
 }
 
 // SAD between the current profile and the previous profile displaced by `shift`
@@ -893,21 +948,22 @@ __device__ float ApplyAutoContrast(float value, float lo, float hi, float streng
     return value + strength * (stretched - value);
 }
 
+__device__ uchar4 UnpackBgra(std::uint32_t packed) {
+    return make_uchar4(static_cast<unsigned char>(packed & 0xffu),
+                       static_cast<unsigned char>((packed >> 8) & 0xffu),
+                       static_cast<unsigned char>((packed >> 16) & 0xffu),
+                       static_cast<unsigned char>((packed >> 24) & 0xffu));
+}
+
 // Contrast/brightness plus display color mode. Operates in place: each thread
 // reads and writes only its own pixel, so no ping-pong buffer swap is needed.
 // When enabled, the auto-contrast level stretch runs first (levels are read
 // straight from device memory — no host readback), then contrast/brightness.
-// Modes (values 0..1, buffers are BGRA):
-//   0 Normal:        pass-through after contrast/brightness.
-//   1 Inverted:      each color channel -> 1 - v (alpha unchanged).
-//   2 WhiteOnBlack:  grayscale, r=g=b=L (bright text stays bright on black).
-//   3 YellowOnBlack: r=g=L, b=0 (luma tinted yellow).
-//   4 BlackOnYellow: r=g=L, b=0.15*L — bright background maps to yellow paper,
-//                    dark text stays black; the small blue floor keeps the
-//                    yellow slightly soft instead of fully saturated.
+// Transform 0 preserves full color, transform 1 inverts each channel, and
+// transform 2 maps luma through the app-provided constant-memory LUT.
 __global__ void DisplayColorGradeKernel(uchar4* buffer, size_t pitchBytes,
                                         int width, int height,
-                                        int colorMode, float contrast, float brightness,
+                                        int colorTransform, float contrast, float brightness,
                                         const float2* autoContrastLevels,
                                         float autoContrastStrength) {
     const int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -936,7 +992,7 @@ __global__ void DisplayColorGradeKernel(uchar4* buffer, size_t pitchBytes,
     g = ApplyContrastBrightness(g, contrast, brightness);
     r = ApplyContrastBrightness(r, contrast, brightness);
 
-    switch (colorMode) {
+    switch (colorTransform) {
     case 1: {
         b = 1.0f - b;
         g = 1.0f - g;
@@ -945,27 +1001,13 @@ __global__ void DisplayColorGradeKernel(uchar4* buffer, size_t pitchBytes,
     }
     case 2: {
         const float luma = 0.299f * r + 0.587f * g + 0.114f * b;
-        b = luma;
-        g = luma;
-        r = luma;
+        const uchar4 mapped = UnpackBgra(gDisplayColorLut[FloatToByte(luma)]);
+        b = static_cast<float>(mapped.x) / 255.0f;
+        g = static_cast<float>(mapped.y) / 255.0f;
+        r = static_cast<float>(mapped.z) / 255.0f;
         break;
     }
-    case 3: {
-        const float luma = 0.299f * r + 0.587f * g + 0.114f * b;
-        b = 0.0f;
-        g = luma;
-        r = luma;
-        break;
-    }
-    case 4: {
-        const float luma = 0.299f * r + 0.587f * g + 0.114f * b;
-        b = 0.15f * luma;
-        g = luma;
-        r = luma;
-        break;
-    }
-    default:
-        break;
+    default: break;
     }
 
     row[x] = make_uchar4(FloatToByte(b), FloatToByte(g), FloatToByte(r), pixel.w);
@@ -1277,7 +1319,7 @@ void LaunchStabilizationWarp(uchar4* dst, size_t dstPitchBytes,
 
 void LaunchDisplayColorGradeLinear(uchar4* buffer, size_t pitchBytes,
                                    int width, int height,
-                                   int colorMode, float contrast, float brightness,
+                                   int colorTransform, float contrast, float brightness,
                                    const float2* autoContrastLevels,
                                    float autoContrastStrength,
                                    cudaStream_t stream) {
@@ -1289,7 +1331,7 @@ void LaunchDisplayColorGradeLinear(uchar4* buffer, size_t pitchBytes,
                         (height + blockSize.y - 1) / blockSize.y);
     DisplayColorGradeKernel<<<gridSize, blockSize, 0, stream>>>(buffer, pitchBytes,
                                                                 width, height,
-                                                                colorMode, contrast, brightness,
+                                                                colorTransform, contrast, brightness,
                                                                 autoContrastLevels,
                                                                 autoContrastStrength);
     CheckCuda("DisplayColorGradeKernel launch failed");
@@ -1409,6 +1451,522 @@ void LaunchAutoContrastAnalysis(const unsigned int* histogram256,
     CheckCuda("AutoContrastAnalysisKernel launch failed");
 }
 
+namespace {
+
+__device__ inline const float* FloatRow(const float* base, size_t pitch, int y) {
+    return reinterpret_cast<const float*>(reinterpret_cast<const char*>(base) + static_cast<size_t>(y) * pitch);
+}
+
+__device__ inline float* FloatRow(float* base, size_t pitch, int y) {
+    return reinterpret_cast<float*>(reinterpret_cast<char*>(base) + static_cast<size_t>(y) * pitch);
+}
+
+__device__ inline const unsigned char* ByteRow(const unsigned char* base, size_t pitch, int y) {
+    return reinterpret_cast<const unsigned char*>(reinterpret_cast<const char*>(base) + static_cast<size_t>(y) * pitch);
+}
+
+__device__ inline unsigned char* ByteRow(unsigned char* base, size_t pitch, int y) {
+    return reinterpret_cast<unsigned char*>(reinterpret_cast<char*>(base) + static_cast<size_t>(y) * pitch);
+}
+
+__device__ inline float PixelLuma(const uchar4& p) {
+    return (0.114f * static_cast<float>(p.x) +
+            0.587f * static_cast<float>(p.y) +
+            0.299f * static_cast<float>(p.z)) / 255.0f;
+}
+
+__global__ void TextLumaKernel(float* luma, size_t floatPitch,
+                               const uchar4* src, size_t srcPitch,
+                               int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    FloatRow(luma, floatPitch, y)[x] = PixelLuma(RowAt(src, srcPitch, y)[x]);
+}
+
+// One thread per row/column gives an O(N) sliding window without integral-image
+// overflow or a wide per-pixel loop. Camera rows/columns run independently.
+__global__ void TextBoxHorizontalKernel(const float* luma, size_t pitch,
+                                        float* horizontal, float* sqHorizontal,
+                                        int width, int height, int radius) {
+    const int y = blockIdx.x * blockDim.x + threadIdx.x;
+    if (y >= height) return;
+    const float* in = FloatRow(luma, pitch, y);
+    float* out = FloatRow(horizontal, pitch, y);
+    float* sqOut = FloatRow(sqHorizontal, pitch, y);
+    float sum = 0.0f;
+    float sq = 0.0f;
+    int count = 0;
+    for (int i = 0; i <= min(radius, width - 1); ++i) {
+        sum += in[i]; sq += in[i] * in[i]; ++count;
+    }
+    for (int x = 0; x < width; ++x) {
+        if (x > 0) {
+            const int add = x + radius;
+            const int remove = x - radius - 1;
+            if (add < width) { sum += in[add]; sq += in[add] * in[add]; ++count; }
+            if (remove >= 0) { sum -= in[remove]; sq -= in[remove] * in[remove]; --count; }
+        }
+        out[x] = sum / static_cast<float>(max(count, 1));
+        sqOut[x] = sq / static_cast<float>(max(count, 1));
+    }
+}
+
+__global__ void TextBoxVerticalKernel(const float* horizontal,
+                                      const float* sqHorizontal,
+                                      size_t pitch, float* mean, float* sqMean,
+                                      int width, int height, int radius) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    if (x >= width) return;
+    float sum = 0.0f;
+    float sq = 0.0f;
+    int count = 0;
+    for (int i = 0; i <= min(radius, height - 1); ++i) {
+        sum += FloatRow(horizontal, pitch, i)[x];
+        sq += FloatRow(sqHorizontal, pitch, i)[x];
+        ++count;
+    }
+    for (int y = 0; y < height; ++y) {
+        if (y > 0) {
+            const int add = y + radius;
+            const int remove = y - radius - 1;
+            if (add < height) {
+                sum += FloatRow(horizontal, pitch, add)[x];
+                sq += FloatRow(sqHorizontal, pitch, add)[x];
+                ++count;
+            }
+            if (remove >= 0) {
+                sum -= FloatRow(horizontal, pitch, remove)[x];
+                sq -= FloatRow(sqHorizontal, pitch, remove)[x];
+                --count;
+            }
+        }
+        FloatRow(mean, pitch, y)[x] = sum / static_cast<float>(max(count, 1));
+        FloatRow(sqMean, pitch, y)[x] = sq / static_cast<float>(max(count, 1));
+    }
+}
+
+__global__ void TextSceneAnalysisKernel(const unsigned int* histogram,
+                                        int pixelCount, int4* analysis) {
+    if (blockIdx.x != 0 || threadIdx.x != 0 || pixelCount <= 0) return;
+    double sum = 0.0;
+    double sumSq = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        const double n = static_cast<double>(histogram[i]);
+        const double v = static_cast<double>(i) / 255.0;
+        sum += n * v;
+        sumSq += n * v * v;
+    }
+    const float mean = static_cast<float>(sum / static_cast<double>(pixelCount));
+    const float variance = fmaxf(static_cast<float>(sumSq / static_cast<double>(pixelCount)) - mean * mean, 0.0f);
+    const float contrast = sqrtf(variance);
+    double thirdMoment = 0.0;
+    for (int i = 0; i < 256; ++i) {
+        const double centered = static_cast<double>(i) / 255.0 - static_cast<double>(mean);
+        thirdMoment += static_cast<double>(histogram[i]) * centered * centered * centered;
+    }
+    thirdMoment /= static_cast<double>(pixelCount);
+    // Bright strokes on a dark field create a positive luma tail; dark ink on
+    // pale paper creates a negative one. Near-symmetric scenes use mean as a
+    // stable fallback instead of letting tiny histogram changes flip polarity.
+    const int lightText = fabs(thirdMoment) > 1.0e-5 ? (thirdMoment > 0.0 ? 1 : 0)
+                                                     : (mean < 0.46f ? 1 : 0);
+    const int scene = mean > 0.62f ? 1 : (mean < 0.34f ? 2 : 0);
+    *analysis = make_int4(lightText, scene,
+                          static_cast<int>(mean * 10000.0f),
+                          static_cast<int>(contrast * 10000.0f));
+}
+
+__global__ void BackgroundFlattenKernel(uchar4* dst, size_t dstPitch,
+                                        const uchar4* src, size_t srcPitch,
+                                        const float* luma, const float* mean,
+                                        size_t floatPitch, int width, int height,
+                                        float strength, int suppressGlare,
+                                        float glareStrength, const int4* analysis) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const uchar4 p = RowAt(src, srcPitch, y)[x];
+    const float lum = FloatRow(luma, floatPitch, y)[x];
+    const float background = FloatRow(mean, floatPitch, y)[x];
+    const int scene = analysis ? analysis->y : 0;
+    const float backgroundTarget = scene == 1 ? 0.78f : (scene == 2 ? 0.28f : 0.55f);
+    float corrected = fminf(fmaxf(lum + fminf(fmaxf(strength, 0.0f), 1.0f) *
+                                  (backgroundTarget - background), 0.0f), 1.0f);
+    if (suppressGlare && lum > 0.94f && background < 0.91f) {
+        const float replacement = fminf(background + 0.08f, 0.94f);
+        const float glare = fminf(fmaxf((lum - 0.94f) / 0.06f, 0.0f), 1.0f) *
+                            fminf(fmaxf(glareStrength, 0.0f), 1.0f);
+        corrected += glare * (replacement - corrected);
+    }
+    const float delta = (corrected - lum) * 255.0f;
+    uchar4* row = RowAt(dst, dstPitch, y);
+    row[x] = make_uchar4(static_cast<unsigned char>(fminf(fmaxf(static_cast<float>(p.x) + delta, 0.0f), 255.0f)),
+                         static_cast<unsigned char>(fminf(fmaxf(static_cast<float>(p.y) + delta, 0.0f), 255.0f)),
+                         static_cast<unsigned char>(fminf(fmaxf(static_cast<float>(p.z) + delta, 0.0f), 255.0f)), p.w);
+}
+
+constexpr int kClaheTilesX = 8;
+constexpr int kClaheTilesY = 8;
+
+__global__ void ClaheHistogramKernel(unsigned int* histograms,
+                                     const uchar4* src, size_t srcPitch,
+                                     int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const int tx = min((x * kClaheTilesX) / max(width, 1), kClaheTilesX - 1);
+    const int ty = min((y * kClaheTilesY) / max(height, 1), kClaheTilesY - 1);
+    const int bin = min(static_cast<int>(PixelLuma(RowAt(src, srcPitch, y)[x]) * 255.0f), 255);
+    atomicAdd(&histograms[(ty * kClaheTilesX + tx) * 256 + bin], 1u);
+}
+
+__global__ void ClaheMapKernel(const unsigned int* histograms, float* maps,
+                               int width, int height, float clipLimit) {
+    const int tile = blockIdx.x;
+    const int bin = threadIdx.x;
+    __shared__ unsigned int scan[256];
+    __shared__ unsigned int clippedTotal;
+    if (bin == 0) clippedTotal = 0;
+    __syncthreads();
+    const int tilePixels = max(1, ((width + 7) / 8) * ((height + 7) / 8));
+    const unsigned int clip = max(1u, static_cast<unsigned int>(fmaxf(clipLimit, 1.0f) * tilePixels / 256.0f));
+    unsigned int value = histograms[tile * 256 + bin];
+    if (value > clip) atomicAdd(&clippedTotal, value - clip);
+    value = min(value, clip);
+    scan[bin] = value;
+    __syncthreads();
+    value += clippedTotal / 256u + (static_cast<unsigned int>(bin) < (clippedTotal % 256u) ? 1u : 0u);
+    scan[bin] = value;
+    __syncthreads();
+    for (int offset = 1; offset < 256; offset <<= 1) {
+        const unsigned int add = bin >= offset ? scan[bin - offset] : 0u;
+        __syncthreads();
+        scan[bin] += add;
+        __syncthreads();
+    }
+    const unsigned int total = max(scan[255], 1u);
+    maps[tile * 256 + bin] = static_cast<float>(scan[bin]) / static_cast<float>(total);
+}
+
+__global__ void ClaheApplyKernel(uchar4* dst, size_t dstPitch,
+                                 const uchar4* src, size_t srcPitch,
+                                 const float* maps, int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const uchar4 p = RowAt(src, srcPitch, y)[x];
+    const float lum = PixelLuma(p);
+    const int bin = min(static_cast<int>(lum * 255.0f), 255);
+    const float gx = (static_cast<float>(x) + 0.5f) * kClaheTilesX / max(width, 1) - 0.5f;
+    const float gy = (static_cast<float>(y) + 0.5f) * kClaheTilesY / max(height, 1) - 0.5f;
+    const int x0 = max(0, min(kClaheTilesX - 1, static_cast<int>(floorf(gx))));
+    const int y0 = max(0, min(kClaheTilesY - 1, static_cast<int>(floorf(gy))));
+    const int x1 = min(x0 + 1, kClaheTilesX - 1);
+    const int y1 = min(y0 + 1, kClaheTilesY - 1);
+    const float tx = fminf(fmaxf(gx - floorf(gx), 0.0f), 1.0f);
+    const float ty = fminf(fmaxf(gy - floorf(gy), 0.0f), 1.0f);
+    const float a = maps[(y0 * 8 + x0) * 256 + bin];
+    const float b = maps[(y0 * 8 + x1) * 256 + bin];
+    const float c = maps[(y1 * 8 + x0) * 256 + bin];
+    const float d = maps[(y1 * 8 + x1) * 256 + bin];
+    const float mapped = (a + tx * (b - a)) + ty * ((c + tx * (d - c)) - (a + tx * (b - a)));
+    const float delta = (mapped - lum) * 255.0f;
+    RowAt(dst, dstPitch, y)[x] = make_uchar4(
+        static_cast<unsigned char>(fminf(fmaxf(p.x + delta, 0.0f), 255.0f)),
+        static_cast<unsigned char>(fminf(fmaxf(p.y + delta, 0.0f), 255.0f)),
+        static_cast<unsigned char>(fminf(fmaxf(p.z + delta, 0.0f), 255.0f)), p.w);
+}
+
+__device__ inline float SmoothStep(float edge0, float edge1, float x) {
+    const float t = fminf(fmaxf((x - edge0) / fmaxf(edge1 - edge0, 1.0e-5f), 0.0f), 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+__global__ void SauvolaMaskKernel(unsigned char* mask, size_t maskPitch,
+                                  const float* luma, const float* mean,
+                                  const float* sqMean, size_t floatPitch,
+                                  int width, int height, float k, float softness,
+                                  int polarityMode, const int4* analysis) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float lum = FloatRow(luma, floatPitch, y)[x];
+    const float m = FloatRow(mean, floatPitch, y)[x];
+    const float variance = fmaxf(FloatRow(sqMean, floatPitch, y)[x] - m * m, 0.0f);
+    const float threshold = m * (1.0f + fminf(fmaxf(k, 0.1f), 0.5f) * (sqrtf(variance) / 0.5f - 1.0f));
+    const float s = fminf(fmaxf(softness, 0.002f), 0.25f);
+    const bool lightText = polarityMode == 2 || (polarityMode == 0 && analysis && analysis->x != 0);
+    const float ink = lightText ? SmoothStep(threshold - s, threshold + s, lum)
+                                : 1.0f - SmoothStep(threshold - s, threshold + s, lum);
+    ByteRow(mask, maskPitch, y)[x] = FloatToByte(ink);
+}
+
+__global__ void StrokeWeightKernel(unsigned char* dst, size_t dstPitch,
+                                   const unsigned char* src, size_t srcPitch,
+                                   int width, int height, int radius, int dilate) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    int result = dilate ? 0 : 255;
+    for (int j = -radius; j <= radius; ++j) {
+        const unsigned char* row = ByteRow(src, srcPitch, max(0, min(height - 1, y + j)));
+        for (int i = -radius; i <= radius; ++i) {
+            const int v = row[max(0, min(width - 1, x + i))];
+            result = dilate ? max(result, v) : min(result, v);
+        }
+    }
+    ByteRow(dst, dstPitch, y)[x] = static_cast<unsigned char>(result);
+}
+
+__global__ void TextHysteresisKernel(unsigned char* mask, size_t pitch,
+                                     unsigned char* history, int width, int height,
+                                     float strength, int historyValid) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    unsigned char* current = ByteRow(mask, pitch, y);
+    unsigned char* previous = ByteRow(history, pitch, y);
+    float value = current[x] / 255.0f;
+    if (historyValid && fabsf(value - 0.5f) < strength) value = previous[x] / 255.0f;
+    const unsigned char stable = value >= 0.5f ? 255u : 0u;
+    current[x] = stable;
+    previous[x] = stable;
+}
+
+__device__ inline uchar4 TextColors(float ink,
+                                    std::uint32_t foregroundBgra,
+                                    std::uint32_t backgroundBgra) {
+    const uchar4 foreground = UnpackBgra(foregroundBgra);
+    const uchar4 background = UnpackBgra(backgroundBgra);
+    return make_uchar4(
+        static_cast<unsigned char>(background.x + ink * (foreground.x - background.x)),
+        static_cast<unsigned char>(background.y + ink * (foreground.y - background.y)),
+        static_cast<unsigned char>(background.z + ink * (foreground.z - background.z)), 255u);
+}
+
+__global__ void TextMaskCompositeKernel(uchar4* dst, size_t dstPitch,
+                                        const uchar4* src, size_t srcPitch,
+                                        const unsigned char* mask, size_t maskPitch,
+                                        int width, int height,
+                                        std::uint32_t foregroundBgra,
+                                        std::uint32_t backgroundBgra,
+                                        int compositeMode, const int4* analysis) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float ink = ByteRow(mask, maskPitch, y)[x] / 255.0f;
+    const uchar4 mapped = TextColors(ink, foregroundBgra, backgroundBgra);
+    const bool replaceImage = compositeMode == 1 ||
+                              (compositeMode == 2 && analysis && analysis->y != 0);
+    if (replaceImage) {
+        RowAt(dst, dstPitch, y)[x] = mapped;
+    } else if (compositeMode == 2) {
+        // Mixed content: background flattening plus selective smart sharpen
+        // already improved text; leave photos and diagrams in natural color.
+        RowAt(dst, dstPitch, y)[x] = RowAt(src, srcPitch, y)[x];
+    } else {
+        const uchar4 p = RowAt(src, srcPitch, y)[x];
+        const float blend = 0.7f * ink;
+        RowAt(dst, dstPitch, y)[x] = make_uchar4(
+            static_cast<unsigned char>(p.x + blend * (mapped.x - p.x)),
+            static_cast<unsigned char>(p.y + blend * (mapped.y - p.y)),
+            static_cast<unsigned char>(p.z + blend * (mapped.z - p.z)), p.w);
+    }
+}
+
+__global__ void Bilateral3x3Kernel(uchar4* dst, size_t dstPitch,
+                                   const uchar4* src, size_t srcPitch,
+                                   int width, int height) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float3 center = ReadPixelLinear(src, srcPitch, x, y, width, height);
+    float3 sum = make_float3(0.0f, 0.0f, 0.0f);
+    float weights = 0.0f;
+    for (int j = -1; j <= 1; ++j) {
+        for (int i = -1; i <= 1; ++i) {
+            const float3 p = ReadPixelLinear(src, srcPitch, x + i, y + j, width, height);
+            const float db = p.x - center.x, dg = p.y - center.y, dr = p.z - center.z;
+            const float spatial = (i == 0 && j == 0) ? 1.0f : ((i == 0 || j == 0) ? 0.78f : 0.61f);
+            const float range = expf(-(db * db + dg * dg + dr * dr) / (3.0f * 28.0f * 28.0f));
+            const float w = spatial * range;
+            sum.x += p.x * w; sum.y += p.y * w; sum.z += p.z * w; weights += w;
+        }
+    }
+    RowAt(dst, dstPitch, y)[x] = make_uchar4(
+        static_cast<unsigned char>(sum.x / weights + 0.5f),
+        static_cast<unsigned char>(sum.y / weights + 0.5f),
+        static_cast<unsigned char>(sum.z / weights + 0.5f), 255u);
+}
+
+__global__ void SmartSharpenKernel(uchar4* dst, size_t dstPitch,
+                                   const uchar4* src, size_t srcPitch,
+                                   const unsigned char* mask, size_t maskPitch,
+                                   int width, int height, float strength, int selective) {
+    const int x = blockIdx.x * blockDim.x + threadIdx.x;
+    const int y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (x >= width || y >= height) return;
+    const float3 center = ReadPixelLinear(src, srcPitch, x, y, width, height);
+    const float3 blurred = BoxBlur3x3(src, srcPitch, x, y, width, height);
+    float factor = fminf(fmaxf(strength, 0.0f), 1.0f) * 1.6f;
+    if (selective && mask) {
+        int lo = 255, hi = 0;
+        for (int j = -1; j <= 1; ++j) {
+            const unsigned char* row = ByteRow(mask, maskPitch, max(0, min(height - 1, y + j)));
+            for (int i = -1; i <= 1; ++i) {
+                const int v = row[max(0, min(width - 1, x + i))]; lo = min(lo, v); hi = max(hi, v);
+            }
+        }
+        factor *= static_cast<float>(hi - lo) / 255.0f;
+    }
+    const float clampAmount = 28.0f;
+    const float db = fminf(fmaxf((center.x - blurred.x) * factor, -clampAmount), clampAmount);
+    const float dg = fminf(fmaxf((center.y - blurred.y) * factor, -clampAmount), clampAmount);
+    const float dr = fminf(fmaxf((center.z - blurred.z) * factor, -clampAmount), clampAmount);
+    RowAt(dst, dstPitch, y)[x] = make_uchar4(
+        static_cast<unsigned char>(fminf(fmaxf(center.x + db, 0.0f), 255.0f)),
+        static_cast<unsigned char>(fminf(fmaxf(center.y + dg, 0.0f), 255.0f)),
+        static_cast<unsigned char>(fminf(fmaxf(center.z + dr, 0.0f), 255.0f)), 255u);
+}
+
+__global__ void FocusMetricKernel(const float* luma, size_t pitch,
+                                  int width, int height, float2* stats) {
+    const int sx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int sy = blockIdx.y * blockDim.y + threadIdx.y;
+    const int x = sx * 4 + 2;
+    const int y = sy * 4 + 2;
+    if (x >= width - 1 || y >= height - 1) return;
+    const float center = FloatRow(luma, pitch, y)[x];
+    const float lap = FloatRow(luma, pitch, y)[x - 1] + FloatRow(luma, pitch, y)[x + 1] +
+                      FloatRow(luma, pitch, y - 1)[x] + FloatRow(luma, pitch, y + 1)[x] - 4.0f * center;
+    atomicAdd(&stats->x, lap);
+    atomicAdd(&stats->y, lap * lap);
+}
+
+} // namespace
+
+void LaunchTextLocalStatistics(float* luma, size_t floatPitchBytes,
+                               float* horizontal, float* mean,
+                               float* sqHorizontal, float* sqMean,
+                               const uchar4* src, size_t srcPitchBytes,
+                               int width, int height, int radius,
+                               cudaStream_t stream) {
+    const dim3 block(16, 16);
+    const dim3 grid((width + 15) / 16, (height + 15) / 16);
+    TextLumaKernel<<<grid, block, 0, stream>>>(luma, floatPitchBytes, src, srcPitchBytes, width, height);
+    TextBoxHorizontalKernel<<<(height + 127) / 128, 128, 0, stream>>>(luma, floatPitchBytes,
+        horizontal, sqHorizontal, width, height, max(1, radius));
+    TextBoxVerticalKernel<<<(width + 127) / 128, 128, 0, stream>>>(horizontal, sqHorizontal,
+        floatPitchBytes, mean, sqMean, width, height, max(1, radius));
+    CheckCuda("text local-statistics launch failed");
+}
+
+void LaunchTextSceneAnalysis(const unsigned int* histogram256, int pixelCount,
+                             int4* analysis, cudaStream_t stream) {
+    TextSceneAnalysisKernel<<<1, 1, 0, stream>>>(histogram256, pixelCount, analysis);
+    CheckCuda("text scene analysis launch failed");
+}
+
+void LaunchBackgroundFlattenLinear(uchar4* dst, size_t dstPitchBytes,
+                                   const uchar4* src, size_t srcPitchBytes,
+                                   const float* luma, const float* mean,
+                                   size_t floatPitchBytes, int width, int height,
+                                   float strength, bool suppressGlare,
+                                   float glareStrength, const int4* analysis,
+                                   cudaStream_t stream) {
+    const dim3 block(16, 16), grid((width + 15) / 16, (height + 15) / 16);
+    BackgroundFlattenKernel<<<grid, block, 0, stream>>>(dst, dstPitchBytes, src, srcPitchBytes,
+        luma, mean, floatPitchBytes, width, height, strength,
+        suppressGlare ? 1 : 0, glareStrength, analysis);
+    CheckCuda("background flatten launch failed");
+}
+
+void LaunchClaheLinear(uchar4* dst, size_t dstPitchBytes,
+                       const uchar4* src, size_t srcPitchBytes,
+                       unsigned int* tileHistograms, float* tileMaps,
+                       int width, int height, float clipLimit,
+                       cudaStream_t stream) {
+    CheckCudaStatus(cudaMemsetAsync(tileHistograms, 0, 64 * 256 * sizeof(unsigned int), stream),
+                    "CLAHE histogram clear failed");
+    const dim3 block(16, 16), grid((width + 15) / 16, (height + 15) / 16);
+    ClaheHistogramKernel<<<grid, block, 0, stream>>>(tileHistograms, src, srcPitchBytes, width, height);
+    ClaheMapKernel<<<64, 256, 0, stream>>>(tileHistograms, tileMaps, width, height, clipLimit);
+    ClaheApplyKernel<<<grid, block, 0, stream>>>(dst, dstPitchBytes, src, srcPitchBytes, tileMaps, width, height);
+    CheckCuda("CLAHE launch failed");
+}
+
+void LaunchSauvolaMask(unsigned char* mask, size_t maskPitchBytes,
+                       const float* luma, const float* mean, const float* sqMean,
+                       size_t floatPitchBytes, int width, int height,
+                       float strength, float softness, int polarityMode,
+                       const int4* analysis, cudaStream_t stream) {
+    const dim3 block(16, 16), grid((width + 15) / 16, (height + 15) / 16);
+    SauvolaMaskKernel<<<grid, block, 0, stream>>>(mask, maskPitchBytes, luma, mean, sqMean,
+        floatPitchBytes, width, height, strength, softness, polarityMode, analysis);
+    CheckCuda("Sauvola mask launch failed");
+}
+
+void LaunchStrokeWeight(unsigned char* dst, size_t dstPitchBytes,
+                        const unsigned char* src, size_t srcPitchBytes,
+                        int width, int height, int strokeWeight,
+                        cudaStream_t stream) {
+    if (strokeWeight == 0) return;
+    const dim3 block(16, 16), grid((width + 15) / 16, (height + 15) / 16);
+    StrokeWeightKernel<<<grid, block, 0, stream>>>(dst, dstPitchBytes, src, srcPitchBytes,
+        width, height, min(abs(strokeWeight), 3), strokeWeight > 0 ? 1 : 0);
+    CheckCuda("stroke-weight launch failed");
+}
+
+void LaunchTextMaskHysteresis(unsigned char* mask, size_t maskPitchBytes,
+                              unsigned char* history, int width, int height,
+                              float strength, bool historyValid,
+                              cudaStream_t stream) {
+    const dim3 block(16, 16), grid((width + 15) / 16, (height + 15) / 16);
+    TextHysteresisKernel<<<grid, block, 0, stream>>>(mask, maskPitchBytes, history,
+        width, height, strength, historyValid ? 1 : 0);
+    CheckCuda("text hysteresis launch failed");
+}
+
+void LaunchTextMaskComposite(uchar4* dst, size_t dstPitchBytes,
+                             const uchar4* src, size_t srcPitchBytes,
+                             const unsigned char* mask, size_t maskPitchBytes,
+                             int width, int height,
+                             std::uint32_t foregroundBgra,
+                             std::uint32_t backgroundBgra,
+                             int compositeMode, const int4* analysis,
+                             cudaStream_t stream) {
+    const dim3 block(16, 16), grid((width + 15) / 16, (height + 15) / 16);
+    TextMaskCompositeKernel<<<grid, block, 0, stream>>>(dst, dstPitchBytes, src, srcPitchBytes,
+        mask, maskPitchBytes, width, height, foregroundBgra, backgroundBgra,
+        compositeMode, analysis);
+    CheckCuda("text-mask composite launch failed");
+}
+
+void LaunchSmartSharpenLinear(uchar4* dst, size_t dstPitchBytes,
+                              uchar4* scratch, size_t scratchPitchBytes,
+                              const uchar4* src, size_t srcPitchBytes,
+                              const unsigned char* mask, size_t maskPitchBytes,
+                              int width, int height, float strength,
+                              bool selective, cudaStream_t stream) {
+    const dim3 block(16, 16), grid((width + 15) / 16, (height + 15) / 16);
+    Bilateral3x3Kernel<<<grid, block, 0, stream>>>(scratch, scratchPitchBytes, src, srcPitchBytes, width, height);
+    SmartSharpenKernel<<<grid, block, 0, stream>>>(dst, dstPitchBytes, scratch, scratchPitchBytes,
+        mask, maskPitchBytes, width, height, strength, selective ? 1 : 0);
+    CheckCuda("smart-sharpen launch failed");
+}
+
+void LaunchFocusMetric(const float* luma, size_t floatPitchBytes,
+                       int width, int height, float2* stats,
+                       cudaStream_t stream) {
+    CheckCudaStatus(cudaMemsetAsync(stats, 0, sizeof(float2), stream), "focus metric clear failed");
+    const int sampleWidth = (width + 3) / 4;
+    const int sampleHeight = (height + 3) / 4;
+    const dim3 block(16, 16), grid((sampleWidth + 15) / 16, (sampleHeight + 15) / 16);
+    FocusMetricKernel<<<grid, block, 0, stream>>>(luma, floatPitchBytes, width, height, stats);
+    CheckCuda("focus metric launch failed");
+}
+
 bool UploadGaussianKernel(int radius, float sigma, cudaStream_t stream) {
     if (radius <= 0 || sigma <= 0.0f) {
         return false;
@@ -1435,26 +1993,30 @@ bool UploadGaussianKernel(int radius, float sigma, cudaStream_t stream) {
         weight /= weightSum;
     }
 
-    cudaError_t status = cudaMemcpyToSymbol(gGaussianKernel, kernel.data(), kernel.size() * sizeof(float),
-                                            0, cudaMemcpyHostToDevice);
+    // CUDA stages async H2D copies from pageable host memory before returning
+    // to the caller. The local vector/scalar therefore remain valid through
+    // both calls. Do not make these sources page-locked without giving them
+    // persistent storage plus their own completion event.
+    cudaError_t status = cudaMemcpyToSymbolAsync(gGaussianKernel, kernel.data(), kernel.size() * sizeof(float),
+                                                 0, cudaMemcpyHostToDevice, stream);
     if (status != cudaSuccess) {
         return false;
     }
-    status = cudaMemcpyToSymbol(gGaussianRadius, &clampedRadius, sizeof(int),
-                                0, cudaMemcpyHostToDevice);
-    if (status != cudaSuccess) {
-        return false;
-    }
-    status = cudaMemcpyToSymbol(gGaussianKernelSize, &kernelSize, sizeof(int),
-                                0, cudaMemcpyHostToDevice);
-    if (status != cudaSuccess) {
-        return false;
-    }
-    status = cudaDeviceSynchronize();
+    status = cudaMemcpyToSymbolAsync(gGaussianRadius, &clampedRadius, sizeof(int),
+                                     0, cudaMemcpyHostToDevice, stream);
     if (status != cudaSuccess) {
         return false;
     }
     return true;
+}
+
+bool UploadDisplayColorLut(const std::uint32_t* lut256, cudaStream_t stream) {
+    if (!lut256) {
+        return false;
+    }
+    return cudaMemcpyToSymbolAsync(gDisplayColorLut, lut256,
+                                   sizeof(gDisplayColorLut), 0,
+                                   cudaMemcpyHostToDevice, stream) == cudaSuccess;
 }
 
 } // namespace openzoom

@@ -18,8 +18,6 @@ set BUILD_DIR=%ROOT_DIR%\build\release-bundle
 set DIST_DIR=%ROOT_DIR%\dist
 set OUTPUT_DIR=%DIST_DIR%\OpenZoom
 set QT_PREFIX_DEFAULT=C:\Qt\6.9.3\msvc2022_64
-set CUDA_PREFIX_DEFAULT=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.0
-set TESSERACT_PREFIX_DEFAULT=C:\Program Files\Tesseract-OCR
 
 if not exist "%DIST_DIR%" mkdir "%DIST_DIR%"
 if exist "%OUTPUT_DIR%" (
@@ -50,7 +48,10 @@ if not defined QT_BIN_DIR if exist "%QT_PREFIX_DEFAULT%" (
 )
 
 set "CMAKE_EXTRA_ARGS=%CMAKE_ARGS%"
-if defined OPENZOOM_ENABLE_CUDA set "CMAKE_EXTRA_ARGS=%CMAKE_EXTRA_ARGS% -DOPENZOOM_ENABLE_CUDA=%OPENZOOM_ENABLE_CUDA%"
+if not defined OPENZOOM_ENABLE_CUDA set "OPENZOOM_ENABLE_CUDA=ON"
+if not defined OPENZOOM_ENABLE_TEXT_SR set "OPENZOOM_ENABLE_TEXT_SR=ON"
+set "CMAKE_EXTRA_ARGS=%CMAKE_EXTRA_ARGS% -DOPENZOOM_ENABLE_CUDA=%OPENZOOM_ENABLE_CUDA%"
+set "CMAKE_EXTRA_ARGS=%CMAKE_EXTRA_ARGS% -DOPENZOOM_ENABLE_TEXT_SR=%OPENZOOM_ENABLE_TEXT_SR%"
 
 cmake -S "%ROOT_DIR%" -B "%BUILD_DIR%" -G "%GENERATOR%" %CMAKE_ARCH_ARGS% -DCMAKE_BUILD_TYPE=Release %CMAKE_QT_ARGS% %CMAKE_EXTRA_ARGS%
 if errorlevel 1 goto :fail
@@ -109,16 +110,10 @@ if defined WINDEPLOYQT (
     echo Warning: windeployqt.exe not found; Qt DLLs were not copied.
 )
 
-rem -------------------------------------------------------------
-rem Copy CUDA redistributable runtime (if available)
-rem -------------------------------------------------------------
-call :copy_cuda_runtime "%OUTPUT_DIR%"
-
-rem -------------------------------------------------------------
-rem Copy optional local OCR runtime (if available)
-rem -------------------------------------------------------------
-call :copy_tesseract_runtime "%OUTPUT_DIR%"
-if errorlevel 1 goto :fail
+rem Proprietary NVIDIA runtimes, Tesseract, and Codex CLI are installed
+rem separately through OpenZoom's Setup Assistant. Keep the release bundle free
+rem of those optional tools, including Qt's optional software OpenGL DLL.
+if exist "%OUTPUT_DIR%\opengl32sw.dll" del /q "%OUTPUT_DIR%\opengl32sw.dll"
 
 rem -------------------------------------------------------------
 rem Copy ancillary files
@@ -164,114 +159,6 @@ for /f "delims=" %%Q in ('where /r "%QT_SEARCH_ROOT%" windeployqt.exe 2^>nul') d
     set "WINDEPLOYQT=%%~fQ"
     goto :eof
 )
-goto :eof
-
-:copy_tesseract_runtime
-set "TESSERACT_BUNDLE_ROOT=%~1"
-if not defined TESSERACT_BUNDLE_ROOT goto :eof
-set "TESSERACT_SOURCE="
-
-if defined OPENZOOM_TESSERACT_DIR if exist "%OPENZOOM_TESSERACT_DIR%\tesseract.exe" (
-    set "TESSERACT_SOURCE=%OPENZOOM_TESSERACT_DIR%"
-)
-if not defined TESSERACT_SOURCE if defined TESSERACT_PREFIX if exist "%TESSERACT_PREFIX%\tesseract.exe" (
-    set "TESSERACT_SOURCE=%TESSERACT_PREFIX%"
-)
-if not defined TESSERACT_SOURCE if exist "%TESSERACT_PREFIX_DEFAULT%\tesseract.exe" (
-    set "TESSERACT_SOURCE=%TESSERACT_PREFIX_DEFAULT%"
-)
-if not defined TESSERACT_SOURCE (
-    for /f "delims=" %%T in ('where tesseract.exe 2^>nul') do if not defined TESSERACT_SOURCE (
-        for %%P in ("%%~fT") do set "TESSERACT_SOURCE=%%~dpP"
-    )
-)
-
-if not defined TESSERACT_SOURCE (
-    echo Tesseract OCR was not found; release bundle will not include local OCR.
-    goto :eof
-)
-
-set "TESSERACT_DEST=%TESSERACT_BUNDLE_ROOT%\tools\tesseract"
-if not exist "%TESSERACT_DEST%" mkdir "%TESSERACT_DEST%"
-echo Bundling Tesseract OCR from %TESSERACT_SOURCE%
-
-copy /y "%TESSERACT_SOURCE%\tesseract.exe" "%TESSERACT_DEST%\tesseract.exe" >nul
-if errorlevel 1 goto :tesseract_failed
-for %%F in ("%TESSERACT_SOURCE%\*.dll") do if exist "%%~fF" (
-    copy /y "%%~fF" "%TESSERACT_DEST%" >nul
-    if errorlevel 1 goto :tesseract_failed
-)
-if exist "%TESSERACT_SOURCE%\tessdata" (
-    xcopy /e /i /y "%TESSERACT_SOURCE%\tessdata" "%TESSERACT_DEST%\tessdata" >nul
-    if errorlevel 1 goto :tesseract_failed
-)
-if not exist "%TESSERACT_DEST%\licenses" mkdir "%TESSERACT_DEST%\licenses"
-if exist "%TESSERACT_SOURCE%\doc\LICENSE" copy /y "%TESSERACT_SOURCE%\doc\LICENSE" "%TESSERACT_DEST%\licenses\TESSERACT_LICENSE.txt" >nul
-if exist "%TESSERACT_SOURCE%\doc\AUTHORS" copy /y "%TESSERACT_SOURCE%\doc\AUTHORS" "%TESSERACT_DEST%\licenses\TESSERACT_AUTHORS.txt" >nul
-if exist "%TESSERACT_SOURCE%\doc\README.md" copy /y "%TESSERACT_SOURCE%\doc\README.md" "%TESSERACT_DEST%\licenses\TESSERACT_README.md" >nul
-echo Bundled Tesseract OCR runtime and language data.
-goto :eof
-
-:tesseract_failed
-echo Failed to copy the Tesseract OCR runtime.
-exit /b 1
-
-:copy_cuda_runtime
-set "DEST_DIR=%~1"
-if not defined DEST_DIR goto :eof
-set "CUDA_REDIST="
-if defined CUDA_PATH (
-    if exist "%CUDA_PATH%\redistributable_bin" (
-        set "CUDA_REDIST=%CUDA_PATH%\redistributable_bin"
-    ) else if exist "%CUDA_PATH%\bin\x64" (
-        set "CUDA_REDIST=%CUDA_PATH%\bin\x64"
-    ) else if exist "%CUDA_PATH%\bin" (
-        set "CUDA_REDIST=%CUDA_PATH%\bin"
-    )
-)
-if not defined CUDA_PATH if exist "%CUDA_PREFIX_DEFAULT%" set "CUDA_PATH=%CUDA_PREFIX_DEFAULT%"
-if not defined CUDA_REDIST if exist "%CUDA_PREFIX_DEFAULT%\bin\x64" set "CUDA_REDIST=%CUDA_PREFIX_DEFAULT%\bin\x64"
-if not defined CUDA_REDIST (
-    for /f "tokens=1* delims==" %%A in ('set CUDA_PATH_V 2^>nul') do (
-        if not defined CUDA_REDIST (
-            for %%P in ("%%B") do (
-                if exist "%%~fP\redistributable_bin" (
-                    set "CUDA_REDIST=%%~fP\redistributable_bin"
-                ) else if exist "%%~fP\bin\x64" (
-                    set "CUDA_REDIST=%%~fP\bin\x64"
-                ) else if exist "%%~fP\bin" (
-                    set "CUDA_REDIST=%%~fP\bin"
-                )
-            )
-        )
-    )
-)
-if not defined CUDA_REDIST goto :cuda_done
-
-echo Using CUDA redistributables from %CUDA_REDIST%
-
-set COPIED=0
-set "CUDA_DLL_LIST=cudart64_13.dll nvrtc64_130_0.dll nvrtc64_130_0.alt.dll nvrtc-builtins64_130.dll nvJitLink_130_0.dll nvfatbin_130_0.dll"
-for %%F in (%CUDA_DLL_LIST%) do (
-    if exist "%CUDA_REDIST%\%%F" (
-        copy /y "%CUDA_REDIST%\%%F" "%DEST_DIR%" >nul
-        set COPIED=1
-    )
-)
-for %%F in (cudart64*.dll nvrtc64*.dll) do (
-    for %%P in ("%CUDA_REDIST%\%%F") do (
-        if exist %%~fP (
-            copy /y %%~fP "%DEST_DIR%" >nul
-            set COPIED=1
-        )
-    )
-)
-if !COPIED! EQU 0 (
-    echo Warning: No CUDA redistributable DLLs copied from %CUDA_REDIST%.
-) else (
-    echo Copied CUDA redistributable DLLs from %CUDA_REDIST%.
-)
-:cuda_done
 goto :eof
 
 :fail

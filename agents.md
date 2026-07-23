@@ -24,10 +24,15 @@ open while contributing and update it whenever the workflow evolves.
    is compatible and you note it in `docs/THIRD_PARTY_LICENSES.md`.
 
 ## Module Map
-- `src/app/` – Qt entry point and application wiring.
-- `src/cuda/` – CUDA interop and kernels.
-- `src/d3d12/`, `src/capture/`, `src/ui/`, `src/common/` – reserved for the
-  ongoing refactor; consult their README stubs before populating them.
+- `src/app/` – Qt entry point, application wiring, settings persistence.
+- `src/cuda/` – CUDA interop surface and the GPU effect pipeline (stabilization,
+  keystone, color conversion, blur/sharpen, display color grading).
+- `src/d3d12/` – pipelined D3D12 presenter with async readback ring.
+- `src/capture/` – Media Foundation camera enumeration/capture with retry and
+  device-loss recovery.
+- `src/ui/` – Simple/Advanced main window, floating chrome, AI settings dialog.
+- `src/common/` – CPU frame prep, assistive runtime (OCR/VLM/TTS/notes), Codex
+  app-server client, fragmented-MP4 video recorder.
 - Public headers mirror the source tree under `include/openzoom/`.
 
 ## Workflow Expectations

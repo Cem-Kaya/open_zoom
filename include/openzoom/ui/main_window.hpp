@@ -10,6 +10,10 @@
 
 #include <array>
 
+#include "openzoom/ui/render_widget.hpp"
+#include "openzoom/ui/assistive_overlay.hpp"
+#include "openzoom/ui/joystick_overlay.hpp"
+
 QT_BEGIN_NAMESPACE
 class QAbstractButton;
 class QComboBox;
@@ -17,7 +21,7 @@ class QCheckBox;
 class QListWidgetItem;
 class QParallelAnimationGroup;
 class QSlider;
-class QPaintEngine;
+class QSplitter;
 class QPushButton;
 class QToolButton;
 class QLabel;
@@ -38,106 +42,9 @@ QT_END_NAMESPACE
 namespace openzoom {
 
 class OpenZoomApp;
-class D3D12Presenter;
+class ColorSchemePicker;
 
-class RenderWidget : public QWidget {
-    Q_OBJECT
-public:
-    explicit RenderWidget(QWidget* parent = nullptr);
 
-    QPaintEngine* paintEngine() const override;
-    void setPresenter(D3D12Presenter* presenter);
-    bool isPresenterReady() const;
-
-protected:
-    void showEvent(QShowEvent* event) override;
-    void resizeEvent(QResizeEvent* event) override;
-
-private:
-    bool EnsurePresenter();
-
-    D3D12Presenter* presenter_{};
-};
-
-class AssistiveOverlay : public QWidget {
-    Q_OBJECT
-public:
-    explicit AssistiveOverlay(QWidget* parent = nullptr);
-
-    void SetContent(const QString& title, const QString& body, bool visible);
-    void SetBusy(bool busy);
-    std::array<QWidget*, 5> FocusTargets() const;
-
-signals:
-    void Dismissed();
-    void ReadAloudRequested(const QString& text);
-    void QuestionSubmitted(const QString& question);
-
-protected:
-    bool eventFilter(QObject* watched, QEvent* event) override;
-    void showEvent(QShowEvent* event) override;
-    void mousePressEvent(QMouseEvent* event) override;
-    void mouseMoveEvent(QMouseEvent* event) override;
-    void mouseReleaseEvent(QMouseEvent* event) override;
-    void leaveEvent(QEvent* event) override;
-
-private:
-    void UpdatePlacement();
-    void BeginDrag(const QPoint& globalPosition);
-    void ContinueDrag(const QPoint& globalPosition);
-    void BeginResize(const QPoint& localPosition, const QPoint& globalPosition);
-    void ContinueResize(const QPoint& globalPosition);
-    void UpdateResizeCursor(const QPoint& localPosition);
-    Qt::Edges ResizeEdgesAt(const QPoint& localPosition) const;
-    QRect ConstrainedGeometry(const QRect& requested) const;
-    void SubmitQuestion();
-
-    QString title_;
-    QString body_;
-    QWidget* headerWidget_{};
-    QLabel* titleLabel_{};
-    QTextBrowser* bodyView_{};
-    QLineEdit* questionEdit_{};
-    QPushButton* askButton_{};
-    QPushButton* readAloudButton_{};
-    QToolButton* closeButton_{};
-    QPoint pointerStartGlobal_;
-    QPoint parentOrigin_;
-    QRect pointerStartGeometry_;
-    Qt::Edges resizeEdges_{};
-    bool dragging_{};
-    bool resizing_{};
-    bool placementInitialized_{};
-};
-
-class JoystickOverlay : public QWidget {
-    Q_OBJECT
-public:
-    explicit JoystickOverlay(QWidget* parent = nullptr);
-
-    void ResetKnob();
-
-signals:
-    void JoystickChanged(float normX, float normY);
-
-protected:
-    bool eventFilter(QObject* watched, QEvent* event) override;
-    void showEvent(QShowEvent* event) override;
-    void paintEvent(QPaintEvent* event) override;
-    void mousePressEvent(QMouseEvent* event) override;
-    void mouseMoveEvent(QMouseEvent* event) override;
-    void mouseReleaseEvent(QMouseEvent* event) override;
-    void resizeEvent(QResizeEvent* event) override;
-
-private:
-    QRectF KnobRect() const;
-    void UpdatePlacement();
-    void UpdateFromPosition(const QPointF& pos);
-    void UpdateMask();
-
-    bool dragging_{};
-    QPointF knobPos_{};
-};
 
 class MainWindow : public QMainWindow, public QAbstractNativeEventFilter {
     Q_OBJECT
@@ -183,11 +90,15 @@ public:
     QLabel* spatialSharpnessValueLabel() const;
     QLabel* processingStatusLabel() const;
     QComboBox* rotationCombo() const;
+    QComboBox* viewportRateCombo() const;
+    QComboBox* viewportFitCombo() const;
 
     // Two-speed UI: Simple overlays compact corner controls on the full render
     // surface; Advanced adds a right-side inspector.
     void setSimpleMode(bool simple);
     bool isSimpleMode() const;
+    int advancedPanelWidth() const;
+    void setAdvancedPanelWidth(int width);
     QAbstractButton* simpleModeButton() const;
     QAbstractButton* advancedModeButton() const;
     QPushButton* explainNowButton() const;
@@ -197,11 +108,37 @@ public:
     QCheckBox* keystoneCheckbox() const;
     QCheckBox* autoContrastCheckbox() const;
     QSlider* autoContrastStrengthSlider() const;
-    QComboBox* displayColorCombo() const;
+    QCheckBox* simpleTextClarityCheckbox() const;
+    QCheckBox* textClarityCheckbox() const;
+    QCheckBox* backgroundFlattenCheckbox() const;
+    QSlider* backgroundFlattenStrengthSlider() const;
+    QCheckBox* adaptiveBinarizationCheckbox() const;
+    QSlider* sauvolaStrengthSlider() const;
+    QSlider* binarizationSoftnessSlider() const;
+    QComboBox* textPolarityCombo() const;
+    QSlider* strokeWeightSlider() const;
+    QCheckBox* smartSharpenCheckbox() const;
+    QSlider* smartSharpenStrengthSlider() const;
+    QCheckBox* claheCheckbox() const;
+    QSlider* claheClipLimitSlider() const;
+    QCheckBox* twoColorTextCheckbox() const;
+    QCheckBox* textHysteresisCheckbox() const;
+    QSlider* textHysteresisStrengthSlider() const;
+    QCheckBox* selectiveSharpenCheckbox() const;
+    QCheckBox* focusDetectionCheckbox() const;
+    QSlider* focusThresholdSlider() const;
+    QCheckBox* glareSuppressionCheckbox() const;
+    QSlider* glareSuppressionStrengthSlider() const;
+    QCheckBox* mlTextSuperResolutionCheckbox() const;
+    QSlider* mlTextSuperResolutionStrengthSlider() const;
+    QCheckBox* mlTextSuperResolutionPrefer2xCheckbox() const;
+    QCheckBox* mlTextSuperResolutionUltra1440pCheckbox() const;
+    ColorSchemePicker* displayColorPicker() const;
     QSlider* contrastSlider() const;
     QSlider* brightnessSlider() const;
     QPushButton* aiSettingsButton() const;
     QPushButton* openNotesButton() const;
+    QPushButton* setupAssistantButton() const;
     QLabel* assistantConnectionLabel() const;
     QLabel* assistantUsageLabel() const;
     QPushButton* assistantConnectButton() const;
@@ -215,6 +152,27 @@ public:
     QPushButton* assistantRenameButton() const;
     QPushButton* assistantExportButton() const;
     QPushButton* assistantDeleteButton() const;
+    bool isMaxineRuntimeInstalled() const;
+    void setMaxineRuntimeInstalled(bool installed);
+    void setSuperResStatus(const QString& status,
+                           bool active,
+                           bool performanceLimited = false);
+    void setSuperResPerformanceOverrideChecked(bool checked);
+    void setKeystoneTrackingControls(bool active,
+                                     bool available,
+                                     bool paused,
+                                     bool canStepBack,
+                                     bool canStepForward,
+                                     bool stepPending,
+                                     int position,
+                                     int count);
+
+signals:
+    void keystoneStepBackRequested();
+    void keystonePauseResumeRequested();
+    void keystoneStepForwardRequested();
+    void resetCurrentProfileRequested();
+    void superResPerformanceOverrideChanged(bool enabled);
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -233,6 +191,8 @@ private:
     void FadeSimpleChrome();
     void SetChromeOpacity(qreal opacity, int durationMs, bool hideWhenFinished);
     bool SimpleChromeHasFocus() const;
+    void ApplyAdvancedPanelWidth();
+    void ShowHelpDialog();
 
     RenderWidget* renderWidget_{};
     QComboBox* cameraCombo_{};
@@ -266,14 +226,23 @@ private:
     QSlider* zoomCenterXSlider_{};
     QSlider* zoomCenterYSlider_{};
     QCheckBox* joystickCheckbox_{};
+    QToolButton* helpButton_{};
+    QPushButton* resetProfileButton_{};
     QToolButton* controlsToggleButton_{};
     QWidget* controlsContainer_{};
     QLabel* processingStatusLabel_{};
+    QLabel* maxineAttribution_{};
+    bool maxineRuntimeInstalled_{};
     OpenZoomApp* app_{};
     QComboBox* rotationCombo_{};
+    QComboBox* viewportRateCombo_{};
+    QComboBox* viewportFitCombo_{};
     QWidget* advancedPanel_{};
+    QSplitter* contentSplitter_{};
+    int advancedPanelPreferredWidth_{520};
     QWidget* topLeftPanel_{};
     QWidget* bottomLeftPanel_{};
+    QWidget* keystoneTrackingPanel_{};
     QWidget* bottomRightPanel_{};
     QWidget* modeGridPopup_{};
     QWidget* modeToast_{};
@@ -283,11 +252,15 @@ private:
     QPushButton* previousModeButton_{};
     QPushButton* currentModeButton_{};
     QPushButton* nextModeButton_{};
+    QPushButton* simpleKeystoneBackButton_{};
+    QPushButton* simpleKeystonePauseButton_{};
+    QPushButton* simpleKeystoneNextButton_{};
     QTimer* simpleChromeIdleTimer_{};
     QTimer* modeToastTimer_{};
     QParallelAnimationGroup* chromeAnimation_{};
     bool simpleChromeVisible_{true};
     bool chromePinned_{};
+    bool keystoneTrackingActive_{};
     QPushButton* simpleModeButton_{};
     QPushButton* advancedModeButton_{};
     QPushButton* explainNowButton_{};
@@ -295,13 +268,45 @@ private:
     QCheckBox* stabilizationCheckbox_{};
     QSlider* stabilizationStrengthSlider_{};
     QCheckBox* keystoneCheckbox_{};
+    QWidget* advancedKeystoneTrackingRow_{};
+    QPushButton* advancedKeystoneBackButton_{};
+    QPushButton* advancedKeystonePauseButton_{};
+    QPushButton* advancedKeystoneNextButton_{};
     QCheckBox* autoContrastCheckbox_{};
     QSlider* autoContrastStrengthSlider_{};
-    QComboBox* displayColorCombo_{};
+    QCheckBox* simpleTextClarityCheckbox_{};
+    QCheckBox* textClarityCheckbox_{};
+    QCheckBox* backgroundFlattenCheckbox_{};
+    QSlider* backgroundFlattenStrengthSlider_{};
+    QCheckBox* adaptiveBinarizationCheckbox_{};
+    QSlider* sauvolaStrengthSlider_{};
+    QSlider* binarizationSoftnessSlider_{};
+    QComboBox* textPolarityCombo_{};
+    QSlider* strokeWeightSlider_{};
+    QCheckBox* smartSharpenCheckbox_{};
+    QSlider* smartSharpenStrengthSlider_{};
+    QCheckBox* claheCheckbox_{};
+    QSlider* claheClipLimitSlider_{};
+    QCheckBox* twoColorTextCheckbox_{};
+    QCheckBox* textHysteresisCheckbox_{};
+    QSlider* textHysteresisStrengthSlider_{};
+    QCheckBox* selectiveSharpenCheckbox_{};
+    QCheckBox* focusDetectionCheckbox_{};
+    QSlider* focusThresholdSlider_{};
+    QCheckBox* glareSuppressionCheckbox_{};
+    QSlider* glareSuppressionStrengthSlider_{};
+    QCheckBox* mlTextSuperResolutionCheckbox_{};
+    QSlider* mlTextSuperResolutionStrengthSlider_{};
+    QCheckBox* mlTextSuperResolutionPrefer2xCheckbox_{};
+    QCheckBox* mlTextSuperResolutionUltra1440pCheckbox_{};
+    QLabel* mlTextSuperResolutionStatusLabel_{};
+    QCheckBox* mlTextSuperResolutionOverrideCheckbox_{};
+    ColorSchemePicker* displayColorPicker_{};
     QSlider* contrastSlider_{};
     QSlider* brightnessSlider_{};
     QPushButton* aiSettingsButton_{};
     QPushButton* openNotesButton_{};
+    QPushButton* setupAssistantButton_{};
     QLabel* assistantConnectionLabel_{};
     QLabel* assistantUsageLabel_{};
     QPushButton* assistantConnectButton_{};

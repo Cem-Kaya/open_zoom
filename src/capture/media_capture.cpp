@@ -331,6 +331,8 @@ bool MediaCapture::StartCapture(const CameraDescriptor& descriptor,
         sourceReader_ = std::move(reader);
         activeActivation_ = descriptor.activation;
         currentFormat_ = format;
+        frameRateNumerator_.store(format.frameRateNumerator);
+        frameRateDenominator_.store(format.frameRateDenominator);
         lastSymbolicLink_ = descriptor.symbolicLink;
         activationGuard.Dismiss();
 
@@ -402,6 +404,15 @@ bool MediaCapture::ConsumeDeviceLost()
     return deviceLost_.exchange(false);
 }
 
+double MediaCapture::CurrentFrameRate() const
+{
+    const UINT denominator = frameRateDenominator_.load();
+    return denominator == 0
+               ? 0.0
+               : static_cast<double>(frameRateNumerator_.load()) /
+                     static_cast<double>(denominator);
+}
+
 void MediaCapture::StopCapture()
 {
     running_ = false;
@@ -428,6 +439,8 @@ void MediaCapture::StopCapture()
     mediaSource_.Reset();
     activeActivation_.Reset();
     currentFormat_ = FrameFormat{};
+    frameRateNumerator_.store(0);
+    frameRateDenominator_.store(0);
 }
 
 bool MediaCapture::ConfigureReader(IMFSourceReader* reader,
@@ -507,6 +520,15 @@ bool MediaCapture::ReadCurrentFormat(IMFSourceReader* reader, FrameFormat& outFo
     outFormat.width = width;
     outFormat.height = height;
     outFormat.stride = static_cast<UINT>(std::abs(rawStride));
+    UINT32 frameRateNumerator = 0;
+    UINT32 frameRateDenominator = 0;
+    if (SUCCEEDED(MFGetAttributeRatio(currentType.Get(),
+                                      MF_MT_FRAME_RATE,
+                                      &frameRateNumerator,
+                                      &frameRateDenominator))) {
+        outFormat.frameRateNumerator = frameRateNumerator;
+        outFormat.frameRateDenominator = frameRateDenominator;
+    }
     return true;
 }
 
@@ -648,6 +670,8 @@ void MediaCapture::CaptureLoop(FrameCallback callback, CaptureErrorCallback erro
                 }
                 format = updatedFormat;
                 currentFormat_ = updatedFormat;
+                frameRateNumerator_.store(updatedFormat.frameRateNumerator);
+                frameRateDenominator_.store(updatedFormat.frameRateDenominator);
             } catch (const std::exception& e) {
                 running_ = false;
                 reportFailure(std::string("Failed to read the camera's changed media format: ") + e.what());
@@ -687,7 +711,7 @@ void MediaCapture::CaptureLoop(FrameCallback callback, CaptureErrorCallback erro
 
         if (callback) {
             try {
-                callback(frame);
+                callback(std::move(frame));
             } catch (const std::exception& e) {
                 running_ = false;
                 reportFailure(std::string("Frame callback failed: ") + e.what());

@@ -10,6 +10,10 @@ int main(int argc, char* argv[]) {
 #ifdef _WIN32
     try {
         openzoom::OpenZoomApp app(argc, argv);
+        if (!app.Initialize()) {
+            std::cerr << "OpenZoom initialization failed." << std::endl;
+            return EXIT_FAILURE;
+        }
         return app.Run();
     } catch (const std::exception& ex) {
         std::cerr << "Fatal error: " << ex.what() << std::endl;

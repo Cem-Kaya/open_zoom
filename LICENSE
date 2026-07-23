@@ -2,10 +2,32 @@ OpenZoom dual-license notice (non-normative)
 SPDX-License-Identifier: GPL-3.0-only
 
 OpenZoom is offered under a dual license:
-• GPL-3.0-only for open-source use. The full text follows verbatim.
-• Commercial license available. For commercial licensing, contact the repository owner via GitHub.
+- GPL-3.0-only for open-source use. The full text follows verbatim.
+- A commercial license by direct arrangement with the project owner.
+  See COMMERCIAL.md, or contact the repository owner via GitHub.
 
-By contributing, you agree your contribution is provided under both GPL-3.0-only and the OpenZoom Commercial License (inbound = outbound).
+Contributions are accepted under the OpenZoom Contributor License
+Agreement (CLA.md): contributors keep ownership of their work and license
+it for distribution under both the GPL and the OpenZoom Commercial
+License. Every contribution always remains available under the GPL.
+
+Additional permission under GNU GPL version 3 section 7
+(NVIDIA runtime linking exception)
+
+If you modify this Program, or any covered work, by linking or combining
+it with NVIDIA proprietary libraries or SDK components - including but
+not limited to the NVIDIA CUDA Runtime and other CUDA Toolkit libraries,
+NVIDIA display driver components, the NVIDIA Optical Flow SDK, the NVIDIA
+Video Effects / Maxine SDK, and NVIDIA TensorRT - or with modified
+versions of those libraries, the licensor of this Program grants you
+additional permission to convey the resulting work. The GNU GPL continues
+to apply to every part of the work other than those NVIDIA components,
+and corresponding source must still be offered for all covered parts; the
+NVIDIA components themselves are excluded from that source requirement.
+This additional permission does not waive or modify any NVIDIA license
+term - recipients must independently satisfy NVIDIA's own redistribution
+terms for those components. As provided by section 7 of the GNU GPL, you
+may remove this additional permission from copies you convey.
 
 ---- do not edit below this line; verbatim GPL-3.0 text begins ----
 
