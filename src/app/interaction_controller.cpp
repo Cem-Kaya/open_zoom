@@ -8,7 +8,6 @@
 
 #include <QCursor>
 #include <QtGlobal>
-#include <QSignalBlocker>
 #include <QWheelEvent>
 #include <QCheckBox>
 #include <QSlider>
@@ -23,28 +22,35 @@ InteractionController::InteractionController(OpenZoomApp& app)
 
 bool InteractionController::HandlePanKey(int key, bool pressed)
 {
+    bool* keyState = nullptr;
     switch (key) {
     case Qt::Key_Left:
-        panLeftPressed_ = pressed;
-        return true;
-    case Qt::Key_Right:
-        panRightPressed_ = pressed;
-        return true;
-    case Qt::Key_Up:
-        panUpPressed_ = pressed;
-        return true;
-    case Qt::Key_Down:
-        panDownPressed_ = pressed;
-        return true;
-    default:
+        keyState = &panLeftPressed_;
         break;
+    case Qt::Key_Right:
+        keyState = &panRightPressed_;
+        break;
+    case Qt::Key_Up:
+        keyState = &panUpPressed_;
+        break;
+    case Qt::Key_Down:
+        keyState = &panDownPressed_;
+        break;
+    default:
+        return false;
     }
-    return false;
+    const bool changed = *keyState != pressed;
+    *keyState = pressed;
+    if (changed && !pressed && !HasContinuousMotion()) {
+        app_.SetZoomCenter(
+            app_.zoomCenterX_, app_.zoomCenterY_, true, true, true);
+    }
+    return true;
 }
 
 bool InteractionController::HandlePanScroll(const QWheelEvent* wheelEvent)
 {
-    if (!wheelEvent || !app_.renderWidget_) {
+    if (!wheelEvent || !app_.uiState_->renderWidget_) {
         return false;
     }
 
@@ -79,8 +85,8 @@ bool InteractionController::HandlePanScroll(const QWheelEvent* wheelEvent)
     float moveY = 0.0f;
 
     if (hasPixelPrecision) {
-        const float widgetWidth = static_cast<float>(std::max(1, app_.renderWidget_->width()));
-        const float widgetHeight = static_cast<float>(std::max(1, app_.renderWidget_->height()));
+        const float widgetWidth = static_cast<float>(std::max(1, app_.uiState_->renderWidget_->width()));
+        const float widgetHeight = static_cast<float>(std::max(1, app_.uiState_->renderWidget_->height()));
         moveX = -deltaX / widgetWidth / zoomFactor;
         moveY = -deltaY / widgetHeight / zoomFactor;
     } else {
@@ -102,7 +108,7 @@ bool InteractionController::HandlePanScroll(const QWheelEvent* wheelEvent)
 
 void InteractionController::HandleZoomWheel(int delta, const QPointF& localPos)
 {
-    if (!app_.zoomSlider_) {
+    if (!app_.uiState_->zoomSlider_) {
         return;
     }
 
@@ -114,12 +120,12 @@ void InteractionController::HandleZoomWheel(int delta, const QPointF& localPos)
     }
 
     if (!app_.zoomEnabled_) {
-        if (app_.zoomCheckbox_) {
-            QSignalBlocker blocker(app_.zoomCheckbox_);
-            app_.zoomCheckbox_->setChecked(true);
+        if (app_.uiState_->zoomCheckbox_) {
+            auto blocker = app_.uiState_->BlockSignals(app_.uiState_->zoomCheckbox_);
+            app_.uiState_->zoomCheckbox_->setChecked(true);
         }
         app_.zoomEnabled_ = true;
-        app_.zoomSlider_->setEnabled(true);
+        app_.uiState_->zoomSlider_->setEnabled(true);
     }
 
     const int stepUnits = (delta / 120);
@@ -127,18 +133,18 @@ void InteractionController::HandleZoomWheel(int delta, const QPointF& localPos)
         return;
     }
     const float prevZoom = app_.zoomAmount_;
-    const int stepSize = std::max(app_.zoomSlider_->pageStep() / 2, 1);
+    const int stepSize = std::max(app_.uiState_->zoomSlider_->pageStep() / 2, 1);
     const int deltaValue = stepUnits * stepSize;
-    const int newValue = std::clamp(app_.zoomSlider_->value() + deltaValue,
-                                    app_.zoomSlider_->minimum(),
-                                    app_.zoomSlider_->maximum());
+    const int newValue = std::clamp(app_.uiState_->zoomSlider_->value() + deltaValue,
+                                    app_.uiState_->zoomSlider_->minimum(),
+                                    app_.uiState_->zoomSlider_->maximum());
 
-    if (newValue == app_.zoomSlider_->value()) {
+    if (newValue == app_.uiState_->zoomSlider_->value()) {
         return;
     }
 
-    QSignalBlocker blockSlider(app_.zoomSlider_);
-    app_.zoomSlider_->setValue(newValue);
+    auto blockSlider = app_.uiState_->BlockSignals(app_.uiState_->zoomSlider_);
+    app_.uiState_->zoomSlider_->setValue(newValue);
     blockSlider.unblock();
     app_.zoomAmount_ = std::max(
         1.0f,
@@ -156,7 +162,7 @@ void InteractionController::HandleZoomWheel(int delta, const QPointF& localPos)
     }
 }
 
-void InteractionController::ApplyInputForces()
+bool InteractionController::ApplyInputForces(double elapsedSeconds)
 {
     float moveX = 0.0f;
     if (panLeftPressed_) {
@@ -177,7 +183,7 @@ void InteractionController::ApplyInputForces()
     moveY += -joystickPanY_;
 
     if (std::abs(moveX) < 1e-5f && std::abs(moveY) < 1e-5f) {
-        return;
+        return false;
     }
 
     const float length = std::sqrt(moveX * moveX + moveY * moveY);
@@ -191,24 +197,40 @@ void InteractionController::ApplyInputForces()
     const bool keyboardActive = panLeftPressed_ || panRightPressed_ || panUpPressed_ || panDownPressed_;
     const float analogStrength = std::sqrt(joystickPanX_ * joystickPanX_ + joystickPanY_ * joystickPanY_);
 
-    float baseStep = 0.0f;
+    float unitsPerSecond = 0.0f;
     if (keyboardActive) {
-        baseStep = app_constants::kPanKeyboardStep;
+        unitsPerSecond = app_constants::kPanKeyboardUnitsPerSecond;
     }
     if (analogStrength > 0.001f) {
-        baseStep = std::max(baseStep, app_constants::kPanJoystickStep * std::clamp(analogStrength, 0.1f, 1.0f));
+        unitsPerSecond = std::max(
+            unitsPerSecond,
+            app_constants::kPanJoystickUnitsPerSecond *
+                std::clamp(analogStrength, 0.1f, 1.0f));
     }
-    if (baseStep <= 0.0f) {
-        baseStep = app_constants::kPanJoystickStep;
+    if (unitsPerSecond <= 0.0f) {
+        unitsPerSecond = app_constants::kPanJoystickUnitsPerSecond;
     }
 
     const float zoomFactor = std::max(1.0f, app_.zoomAmount_);
-    const float step = baseStep / zoomFactor;
+    const float step =
+        unitsPerSecond *
+        static_cast<float>(std::clamp(elapsedSeconds, 0.0, 0.05)) /
+        zoomFactor;
 
     app_.SetZoomCenter(app_.zoomCenterX_ + normalizedX * step,
                        app_.zoomCenterY_ + normalizedY * step,
+                       false,
                        true,
-                       true);
+                       false);
+    return true;
+}
+
+bool InteractionController::HasContinuousMotion() const
+{
+    return panLeftPressed_ || panRightPressed_ ||
+           panUpPressed_ || panDownPressed_ ||
+           std::abs(joystickPanX_) > 0.001f ||
+           std::abs(joystickPanY_) > 0.001f;
 }
 
 void InteractionController::BeginMousePan(const QPointF& pos, const QSize& widgetSize)
@@ -216,9 +238,9 @@ void InteractionController::BeginMousePan(const QPointF& pos, const QSize& widge
     Q_UNUSED(widgetSize);
     middlePanActive_ = true;
     middlePanLastPos_ = pos;
-    if (app_.renderWidget_) {
-        app_.renderWidget_->setCursor(Qt::ClosedHandCursor);
-        app_.renderWidget_->grabMouse(Qt::ClosedHandCursor);
+    if (app_.uiState_->renderWidget_) {
+        app_.uiState_->renderWidget_->setCursor(Qt::ClosedHandCursor);
+        app_.uiState_->renderWidget_->grabMouse(Qt::ClosedHandCursor);
     }
 }
 
@@ -250,8 +272,9 @@ bool InteractionController::UpdateMousePan(const QPointF& pos)
 
     app_.SetZoomCenter(app_.zoomCenterX_ + deltaX,
                        app_.zoomCenterY_ + deltaY,
+                       false,
                        true,
-                       true);
+                       false);
     middlePanLastPos_ = pos;
     return true;
 }
@@ -262,9 +285,11 @@ void InteractionController::EndMousePan()
         return;
     }
     middlePanActive_ = false;
-    if (app_.renderWidget_) {
-        app_.renderWidget_->releaseMouse();
-        app_.renderWidget_->unsetCursor();
+    app_.SetZoomCenter(
+        app_.zoomCenterX_, app_.zoomCenterY_, true, true, true);
+    if (app_.uiState_->renderWidget_) {
+        app_.uiState_->renderWidget_->releaseMouse();
+        app_.uiState_->renderWidget_->unsetCursor();
     }
 }
 
@@ -276,8 +301,22 @@ void InteractionController::ResetJoystick()
 
 void InteractionController::SetJoystickAxes(float x, float y)
 {
+    const bool wasActive =
+        std::abs(joystickPanX_) > 0.001f ||
+        std::abs(joystickPanY_) > 0.001f;
     joystickPanX_ = std::clamp(x, -1.0f, 1.0f);
     joystickPanY_ = std::clamp(y, -1.0f, 1.0f);
+    const bool isActive =
+        std::abs(joystickPanX_) > 0.001f ||
+        std::abs(joystickPanY_) > 0.001f;
+    if (wasActive != isActive || isActive) {
+        app_.pipelineOrchestrator_->NotifyViewportMotion();
+        app_.pipelineOrchestrator_->UpdateTimerPolicy();
+    }
+    if (wasActive && !isActive) {
+        app_.SetZoomCenter(
+            app_.zoomCenterX_, app_.zoomCenterY_, true, true, true);
+    }
 }
 
 } // namespace openzoom

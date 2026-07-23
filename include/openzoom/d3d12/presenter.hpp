@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "openzoom/common/view_transform.hpp"
 #include "openzoom/cuda/cuda_interop.hpp"
 
 struct ID3D12Device;
@@ -19,6 +20,13 @@ struct IDXGISwapChain3;
 
 namespace openzoom {
 
+struct ViewportPresentationOptions {
+    bool drawFocusMarker{false};
+    float focusX{0.5f};
+    float focusY{0.5f};
+    bool requestReadback{false};
+};
+
 class D3D12Presenter {
 public:
     D3D12Presenter();
@@ -26,24 +34,40 @@ public:
 
     void Initialize(HWND hwnd, UINT width, UINT height);
     bool IsInitialized() const;
+    bool NeedsScenePresent() const;
+    UINT ViewportWidth() const;
+    UINT ViewportHeight() const;
+    std::uint64_t MissedPresentCount() const;
     void Resize(UINT width, UINT height);
     void Present(const uint8_t* data, UINT width, UINT height);
     void PresentFromTexture(ID3D12Resource* texture,
                             UINT width,
                             UINT height,
                             const FenceSyncParams* fenceSync = nullptr);
+    bool PresentSceneTexture(ID3D12Resource* texture,
+                             UINT sourceWidth,
+                             UINT sourceHeight,
+                             const ViewTransform& transform,
+                             const FenceSyncParams* fenceSync = nullptr,
+                             const ViewportPresentationOptions* options = nullptr,
+                             UINT64* outReadbackRequestId = nullptr);
 
-    // Copy a GPU texture into a CPU buffer (BGRA8). Blocking; waits for GPU completion.
+    // Copy a GPU texture into a CPU buffer (BGRA8). Blocking; first waits on
+    // waitFenceValue on the GPU queue, then waits for the copy to complete.
     bool ReadbackTexture(ID3D12Resource* texture,
                          UINT width,
                          UINT height,
-                         std::vector<uint8_t>& outBgra);
+                         std::vector<uint8_t>& outBgra,
+                         UINT64 waitFenceValue = 0);
 
     // Enqueue an async copy of texture into a ring slot; returns false if no
     // slot is free (both in flight) — caller just skips this frame's readback.
     // Never blocks the CPU; the result surfaces one or more frames later via
     // TryGetCompletedReadback.
-    bool RequestReadback(ID3D12Resource* texture, UINT width, UINT height);
+    bool RequestReadback(ID3D12Resource* texture,
+                         UINT width,
+                         UINT height,
+                         UINT64* outRequestId = nullptr);
 
     // If a previously requested readback has completed, move its pixels into
     // outBgra (BGRA8 tightly packed) and return true. Returns the OLDEST
@@ -52,7 +76,8 @@ public:
     // changing anyway) — callers get no result for those frames.
     bool TryGetCompletedReadback(std::vector<uint8_t>& outBgra,
                                  UINT& outWidth,
-                                 UINT& outHeight);
+                                 UINT& outHeight,
+                                 UINT64* outRequestId = nullptr);
 
     ID3D12Device* GetDevice() const;
     ID3D12Fence* GetFence() const;
@@ -72,17 +97,20 @@ private:
     void CreateCommandObjects();
     void CreateFenceObjects();
     void CreateSwapChain(UINT width, UINT height);
+    void CreateViewportPipeline();
     void AcquireBackBuffers();
     void EnsureUploadBuffer(UINT width, UINT height);
     void CopyToUpload(const uint8_t* data, UINT width, UINT height, UINT slot);
     void WaitForGpu();
     void WaitForFenceValue(UINT64 value);
-    void WaitForFrameSlot(UINT slot);
+    bool WaitForFrameSlot(UINT slot);
 
     HWND hwnd_{};
     UINT width_{};
     UINT height_{};
     bool initialized_{};
+    bool scenePresentNeeded_{true};
+    std::uint64_t missedPresentCount_{};
 
     Microsoft::WRL::ComPtr<IDXGIFactory6> factory_;
     Microsoft::WRL::ComPtr<ID3D12Device> device_;
@@ -92,11 +120,18 @@ private:
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> commandList_;
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swapChain_;
     std::vector<Microsoft::WRL::ComPtr<ID3D12Resource>> backBuffers_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> renderTargetHeap_;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> sceneSrvHeap_;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> sceneRootSignature_;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> scenePipelineState_;
+    UINT renderTargetDescriptorSize_{};
+    UINT sceneSrvDescriptorSize_{};
 
     Microsoft::WRL::ComPtr<ID3D12Fence> fence_;
     UINT64 fenceValue_{};
     UINT64 frameFenceValues_[kFrameCount]{};
     HANDLE fenceEvent_{nullptr};
+    HANDLE frameLatencyWaitableObject_{nullptr};
 
     Microsoft::WRL::ComPtr<ID3D12Resource> uploadBuffers_[kFrameCount];
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT uploadFootprint_{};
@@ -130,6 +165,7 @@ private:
         bool inFlight{};
     };
     static constexpr UINT kAsyncReadbackSlotCount = 2;
+    AsyncReadbackSlot* PrepareAsyncReadbackSlot(UINT width, UINT height);
     AsyncReadbackSlot asyncReadbackSlots_[kAsyncReadbackSlotCount];
 };
 

@@ -90,6 +90,41 @@ enumeration (enumeration re-runs on refresh/camera change).
 
 ## S4. Capture-thread vs UI-thread access to shared pipeline state
 
+- **Status: REFUTED 2026-07-23 — audit complete, no verified race, no code
+  change needed.** Every member touched by the MF capture callback thread was
+  enumerated and checked against the Qt-thread accesses (plan 11 Wave 2):
+  - `latestFrame_` — written on the MF thread under `cameraMutex_`
+    (`src/app/app.cpp:3372-3375`, `FrameCallback` lambda), read on the Qt tick
+    under the same mutex into a *deep copy* (`src/app/app.cpp:3664-3667`;
+    `MediaFrame` holds a `std::vector`, so the buffer-lifetime concern in the
+    original report is refuted — processing runs on the copy after unlock).
+  - Capture error path — the MF-thread `CaptureErrorCallback` lambda only
+    copies strings and marshals via `QMetaObject::invokeMethod(...,
+    Qt::QueuedConnection)` (`src/app/app.cpp:3376-3383`); `lastCameraError_`
+    is therefore written exclusively on the Qt thread
+    (`HandleCameraRuntimeFailure` / `HandleCameraStartFailure`). Stale
+    sessions are filtered by value-captured `cameraSessionId_`.
+  - `MediaCapture` cross-thread flags — `running_`, `deviceLost_`,
+    `lastFailureKind_` are `std::atomic`
+    (`include/openzoom/capture/media_capture.hpp:101-103`); `ConsumeDeviceLost()`
+    uses `exchange` (`src/capture/media_capture.cpp:402`). Verified atomic as
+    the plan suspected.
+  - `MediaCapture::lastError_` — written only on the control thread
+    (StartCapture/enumeration paths, `src/capture/media_capture.cpp:243-349,528`);
+    `CaptureLoop` reports failures through the by-value callback string
+    instead (`reportFailure`), never by writing `lastError_`. Single-thread.
+  - `MediaCapture::currentFormat_` — clean ownership handoff: control thread
+    writes only while no capture thread exists (line 333 pre-start, 430
+    post-join); the capture thread reads/updates it while running (lines 593,
+    650). No concurrent access window.
+  - App-side reconnect flags (`cameraReconnectPending_`, attempt/backoff
+    timestamps), frame dimension members (`processedFrameWidth_/Height_`,
+    `cudaSurfaceWidth_/Height_`), and all tuning state (`zoomAmount_`, …) —
+    Qt-thread-only: `OnFrameTick` runs on the Qt main thread via `QTimer`
+    (`src/app/app.cpp:1016`), and the MF thread touches none of them. Plain
+    (non-atomic) is correct here; no snapshot struct is required.
+  The snapshot-struct fix and the worker-thread move remain unnecessary until
+  A1-step-5 introduces a processing thread.
 - **Priority:** HIGH · **Effort:** large · **Status:** Reported
 - **Evidence:** `src/app/app.cpp` — camera callback writes `latestFrame_` under `cameraMutex_` (~lines 1852–1855); `OnFrameTick()` reads it under the same mutex (~1939–1942), but then processes via `cpuPipeline_` and reads tuning state (`zoomAmount_`, `blackWhiteThreshold_`, …) with no synchronization (~1948–1973).
 
@@ -130,6 +165,17 @@ over on-demand allocation inside `ProcessFrame()`.
 
 ## S6. D3D12↔CUDA fence protocol is implicit and unrecoverable on failure
 
+- **Status: DONE 2026-07-23 (S6b, plan 11 Wave 2).** The whole timeline now
+  lives in one `FenceSequencer` struct in `include/openzoom/app/app.hpp` with
+  the contract documented on the struct: `BeginCudaFrame()` re-seeds from the
+  presenter and *reserves* the CUDA signal value, `CudaSignaled()` commits it,
+  `CudaFailed()` rolls the reservation back (so no one ever waits on a value
+  that will never be signaled), `BeginGraphicsFrame()`/`GraphicsSignaled()`
+  sequence the present, and `ReadbackObserved()` keeps the next CUDA frame
+  behind in-flight readback copies. Recovery: three consecutive `ProcessFrame`
+  failures trigger `presenter_->WaitForIdle()` + `ResetCudaFenceState()` and a
+  single status message (`OpenZoomApp::HandleCudaProcessingFailure`,
+  `src/app/app.cpp`) instead of the previous per-failure reset.
 - **Partially addressed 2026-07-21:** `ProcessFrameWithCuda()` now re-seeds
   `sharedFenceCounter_` from `presenter_->GetLastSignaledFenceValue()` every
   CUDA frame, so fence values stay monotonic when CPU-path (debug view) frames

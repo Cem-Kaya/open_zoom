@@ -19,7 +19,8 @@ public:
     bool HandlePanScroll(const QWheelEvent* wheelEvent);
     void HandleZoomWheel(int delta, const QPointF& localPos);
 
-    void ApplyInputForces();
+    bool ApplyInputForces(double elapsedSeconds);
+    bool HasContinuousMotion() const;
 
     void BeginMousePan(const QPointF& pos, const QSize& widgetSize);
     bool UpdateMousePan(const QPointF& pos);

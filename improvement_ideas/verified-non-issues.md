@@ -51,3 +51,23 @@ pattern-matches to a real bug class but is actually correct in this codebase.
 
 - **Checked:** `git ls-files` at commit `9e069d9` — 58 tracked files, none under
   `build/`. The `build/` tree on disk is untracked working state; `.gitignore` covers it.
+
+## 6. "Capture-thread vs UI-thread races on app pipeline state" (was S4)
+
+- **Claimed at:** `src/app/app.cpp` — tuning state, frame dimensions,
+  reconnect flags, and `lastCameraError_` accessed "without synchronization"
+  alongside the MF capture callback.
+- **Why it's not a bug (audited 2026-07-23, plan 11 Wave 2):** the MF capture
+  thread touches exactly two things in the app: `latestFrame_` under
+  `cameraMutex_` (app.cpp:3372-3375; the Qt tick deep-copies it under the same
+  mutex, app.cpp:3664-3667) and a `QMetaObject::invokeMethod(...,
+  Qt::QueuedConnection)` marshal in the error callback (app.cpp:3376-3383).
+  Everything else — tuning values, frame dimensions, reconnect flags,
+  `lastCameraError_` — is written and read only on the Qt main thread
+  (`OnFrameTick` is a `QTimer` slot, app.cpp:1016). `MediaCapture`'s
+  cross-thread flags are `std::atomic` (media_capture.hpp:101-103), its
+  `lastError_` is control-thread-only (the capture loop reports through the
+  by-value callback string), and `currentFormat_` follows a clean ownership
+  handoff (control thread writes only while no capture thread exists). Full
+  member-by-member table in 01-stability-threading.md S4. Do not add a
+  snapshot mutex until processing moves off the UI thread (A1-step-5).

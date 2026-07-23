@@ -4,6 +4,8 @@
 
 #include <cuda_runtime_api.h>
 
+#include <cstdint>
+
 namespace openzoom {
 
 void LaunchGradientKernel(cudaSurfaceObject_t surface, int width, int height, float timeSeconds);
@@ -19,6 +21,12 @@ void LaunchZoomLinear(uchar4* dst, size_t dstPitchBytes,
                       int width, int height,
                       float zoomAmount, float centerXNorm, float centerYNorm,
                       cudaStream_t stream);
+
+void LaunchBlendLinear(uchar4* dst, size_t dstPitchBytes,
+                       const uchar4* base, size_t basePitchBytes,
+                       const uchar4* enhanced, size_t enhancedPitchBytes,
+                       int width, int height, float strength,
+                       cudaStream_t stream);
 
 void LaunchGaussianBlurLinear(uchar4* dst, size_t dstPitchBytes,
                               uchar4* scratch, size_t scratchPitchBytes,
@@ -93,7 +101,7 @@ void LaunchStabilizationWarp(uchar4* dst, size_t dstPitchBytes,
 // LaunchAutoContrastAnalysis; pass nullptr to disable the auto-contrast remap.
 void LaunchDisplayColorGradeLinear(uchar4* buffer, size_t pitchBytes,
                                    int width, int height,
-                                   int colorMode, float contrast, float brightness,
+                                   int colorTransform, float contrast, float brightness,
                                    const float2* autoContrastLevels,
                                    float autoContrastStrength,
                                    cudaStream_t stream);
@@ -144,7 +152,63 @@ void LaunchAutoContrastAnalysis(const unsigned int* histogram256,
                                 bool levelsValid,
                                 cudaStream_t stream);
 
+// Text-clarity kernels share a full-resolution float workspace and byte masks.
+// `analysis` is device-resident: x=auto light-text flag, y=scene class
+// (0=mixed, 1=paper, 2=board), z=mean luma x10000, w=contrast x10000.
+void LaunchTextLocalStatistics(float* luma, size_t floatPitchBytes,
+                               float* horizontal, float* mean,
+                               float* sqHorizontal, float* sqMean,
+                               const uchar4* src, size_t srcPitchBytes,
+                               int width, int height, int radius,
+                               cudaStream_t stream);
+void LaunchTextSceneAnalysis(const unsigned int* histogram256, int pixelCount,
+                             int4* analysis, cudaStream_t stream);
+void LaunchBackgroundFlattenLinear(uchar4* dst, size_t dstPitchBytes,
+                                   const uchar4* src, size_t srcPitchBytes,
+                                   const float* luma, const float* mean,
+                                   size_t floatPitchBytes,
+                                   int width, int height, float strength,
+                                   bool suppressGlare, float glareStrength,
+                                   const int4* analysis,
+                                   cudaStream_t stream);
+void LaunchClaheLinear(uchar4* dst, size_t dstPitchBytes,
+                       const uchar4* src, size_t srcPitchBytes,
+                       unsigned int* tileHistograms, float* tileMaps,
+                       int width, int height, float clipLimit,
+                       cudaStream_t stream);
+void LaunchSauvolaMask(unsigned char* mask, size_t maskPitchBytes,
+                       const float* luma, const float* mean, const float* sqMean,
+                       size_t floatPitchBytes, int width, int height,
+                       float strength, float softness, int polarityMode,
+                       const int4* analysis, cudaStream_t stream);
+void LaunchStrokeWeight(unsigned char* dst, size_t dstPitchBytes,
+                        const unsigned char* src, size_t srcPitchBytes,
+                        int width, int height, int strokeWeight,
+                        cudaStream_t stream);
+void LaunchTextMaskHysteresis(unsigned char* mask, size_t maskPitchBytes,
+                              unsigned char* history, int width, int height,
+                              float strength, bool historyValid,
+                              cudaStream_t stream);
+void LaunchTextMaskComposite(uchar4* dst, size_t dstPitchBytes,
+                             const uchar4* src, size_t srcPitchBytes,
+                             const unsigned char* mask, size_t maskPitchBytes,
+                             int width, int height,
+                             std::uint32_t foregroundBgra,
+                             std::uint32_t backgroundBgra,
+                             int compositeMode, const int4* analysis,
+                             cudaStream_t stream);
+void LaunchSmartSharpenLinear(uchar4* dst, size_t dstPitchBytes,
+                              uchar4* scratch, size_t scratchPitchBytes,
+                              const uchar4* src, size_t srcPitchBytes,
+                              const unsigned char* mask, size_t maskPitchBytes,
+                              int width, int height, float strength,
+                              bool selective, cudaStream_t stream);
+void LaunchFocusMetric(const float* luma, size_t floatPitchBytes,
+                       int width, int height, float2* stats,
+                       cudaStream_t stream);
+
 bool UploadGaussianKernel(int radius, float sigma, cudaStream_t stream);
+bool UploadDisplayColorLut(const std::uint32_t* lut256, cudaStream_t stream);
 
 } // namespace openzoom
 

@@ -28,22 +28,47 @@ OpenZoom relies on several third-party SDKs and code drops. Keep this summary wi
 - Upstream: <https://developer.nvidia.com/cuda-toolkit>
 - License: NVIDIA CUDA Toolkit EULA
 - OpenZoom redistribution scope:
-  - runtime DLLs only
-  - no CUDA headers, compilers, or developer tools are bundled
-- Review NVIDIA's current redistribution terms before shipping binaries that include CUDA runtime files
+  - the application links the CUDA runtime statically
+  - no standalone CUDA Toolkit runtime DLLs, headers, compilers, or developer
+    tools are copied into release bundles
+- Review NVIDIA's current redistribution terms before shipping CUDA-enabled
+  binaries.
+
+## NVIDIA Maxine Video Effects SuperRes
+- Upstream headers: <https://github.com/NVIDIA/MAXINE-VFX-SDK>
+- Runtime download page:
+  <https://www.nvidia.com/en-me/geforce/broadcasting/broadcast-sdk/resources/>
+- Local notices: [`third_party/maxine/Maxine-VFX-SDK/LICENSE`](../third_party/maxine/Maxine-VFX-SDK/LICENSE)
+  and [`third_party/maxine/LICENSE.txt`](../third_party/maxine/LICENSE.txt)
+- Header/sample snapshot license: MIT
+- Runtime license: NVIDIA SDK License Agreement; the supported 0.7.6 Video
+  Effects runtime is obtained and installed separately by the user.
+- OpenZoom usage: optional runtime-loaded SuperRes on supported NVIDIA GPUs.
+  The GPL application resolves `NVVideoEffects.dll` and `NVCVImage.dll` with
+  `LoadLibrary`/`GetProcAddress`; it has no import-library dependency.
+- Distribution scope: no NVIDIA Video Effects runtime binaries, models, or
+  installers are stored in the repository or copied into OpenZoom bundles.
+  The Setup Assistant fetches a pinned installer directly from NVIDIA, verifies
+  its SHA-256 value, and launches NVIDIA's installer after the user chooses to
+  install it.
+- Required product attribution: `SuperRes powered by NVIDIA Maxine™`.
+  This attribution does not imply NVIDIA endorsement.
 
 ## Tesseract OCR Windows Runtime
 - Upstream engine: <https://github.com/tesseract-ocr/tesseract>
 - Windows distribution: <https://github.com/UB-Mannheim/tesseract/wiki>
 - Tesseract license: Apache-2.0
-- OpenZoom usage: optional local OCR process; release bundles copy the installed
-  runtime, English/orientation language data, and the distribution's Tesseract
-  license/authors/readme under `tools/tesseract/`
+- OpenZoom usage: optional local OCR process. The Setup Assistant downloads a
+  pinned UB Mannheim installer directly from the distributor, verifies its
+  SHA-256 value, and installs a user-managed copy under
+  `%LOCALAPPDATA%\OpenZoom\tools\tesseract` only after the user requests it.
+- Distribution scope: OpenZoom release bundles contain no Tesseract binary,
+  language data, installer, or transitive runtime library.
 - The Windows runtime dynamically links Leptonica plus image, compression,
   Unicode, font, and GNU runtime libraries shipped by the UB Mannheim build.
   Those components retain their own permissive, LGPL, or runtime-exception
-  terms. Keep all DLLs replaceable and complete a transitive-license notice
-  audit before commercial redistribution outside this development bundle.
+  terms. The user accepts the distributor and dependency terms when choosing
+  to install it; the Setup Assistant can remove only OpenZoom's managed copy.
 
 ## Lucide Icons
 - Upstream: <https://lucide.dev/>
@@ -52,7 +77,8 @@ OpenZoom relies on several third-party SDKs and code drops. Keep this summary wi
 - License: ISC; several inherited Feather icons also carry the MIT notice in
   the same license file
 - OpenZoom usage: embedded Qt resource icons for camera actions, floating
-  Assistant controls, and Advanced section navigation
+  Assistant controls, Advanced section navigation, and keystone history
+  Previous/Stop/Continue/Next actions
 - Attribution: retain the local license file in source and the third-party
   notice in redistributed builds
 
@@ -65,12 +91,22 @@ OpenZoom relies on several third-party SDKs and code drops. Keep this summary wi
 - OpenCV DNN
 - TensorRT
 - external AI model weights
+- NVIDIA Video Effects runtime, models, and installers
+- Tesseract OCR runtime, language data, and installer
+- OpenAI Codex CLI binaries and installer/bootstrap files
 
-Those remain roadmap items. If they are added later, this file must be expanded in the same change.
+`OPENZOOM_ENABLE_TEXT_SR` adds only the dynamic Maxine adapter built from the
+MIT header snapshot. It does not add a link-time or redistribution dependency
+on the proprietary runtime.
 
 ## Optional External Tools And Services
 - OpenAI-compatible VLM services may be used at runtime through user-supplied endpoint credentials, but no hosted model or service SDK is bundled here.
 - OpenAI Codex CLI may be launched as an optional external `codex app-server`
-  process. OpenZoom does not bundle Codex source, binaries, model weights, or an
-  OpenAI SDK. Codex authentication, service access, usage limits, updates, and
-  licensing remain governed by the user's Codex installation and OpenAI terms.
+  process. At the user's request, Setup Assistant may download an exact pinned
+  copy of OpenAI's official Windows bootstrap script, verify its SHA-256, and
+  run it with prompts disabled. That upstream bootstrap independently verifies
+  the selected official release package against OpenAI's checksum manifest.
+  OpenZoom does not bundle Codex source, binaries, model weights, installer, or
+  an OpenAI SDK. Codex authentication, service access, usage limits, updates,
+  and licensing remain governed by the user's Codex installation and OpenAI
+  terms.

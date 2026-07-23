@@ -3,6 +3,7 @@
 #if defined(_WIN32) || defined(Q_MOC_RUN)
 
 #include <QDialog>
+#include <QJsonArray>
 
 #include "openzoom/app/settings_store.hpp"
 
@@ -31,6 +32,8 @@ public:
                               QWidget* parent = nullptr);
 
     openzoom::settings::AssistiveSettings result() const;
+    void SetCodexModelCatalog(const QJsonArray& models,
+                              const QString& selectedModel);
 
 private:
     void UpdateProviderFields();
@@ -38,16 +41,20 @@ private:
     void UpdateSpeechRateLabel();
     void ApplySpeechPreviewSettings();
     void PreviewSpeech();
+    void UpdateCodexReasoningOptions();
 
     QComboBox* providerCombo_{};
     QLineEdit* codexPathEdit_{};
-    QLineEdit* codexModelEdit_{};
+    QComboBox* codexModelCombo_{};
     QComboBox* codexReasoningCombo_{};
     QCheckBox* codexInternetCheckbox_{};
     QCheckBox* codexCodingCheckbox_{};
     QLineEdit* codexWorkspaceEdit_{};
     QPushButton* codexWorkspaceBrowseButton_{};
     QPlainTextEdit* assistantInstructionsEdit_{};
+    QPlainTextEdit* builtInInstructionsEdit_{};
+    QJsonArray codexModelCatalog_;
+    QString preferredReasoningEffort_;
     QLineEdit* apiUrlEdit_{};
     QLineEdit* apiKeyEdit_{};
     QLineEdit* modelEdit_{};

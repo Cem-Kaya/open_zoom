@@ -10,8 +10,11 @@ namespace openzoom::app_constants {
 inline constexpr int kZoomSliderScale = 100;
 inline constexpr int kZoomSliderMaxMultiplier = 12;
 inline constexpr int kZoomFocusSliderScale = 100;
+inline constexpr int kDisplayColorModeCount = 17;
 inline constexpr float kPanKeyboardStep = 0.01f;
 inline constexpr float kPanJoystickStep = 0.008f;
+inline constexpr float kPanKeyboardUnitsPerSecond = 0.625f;
+inline constexpr float kPanJoystickUnitsPerSecond = 0.5f;
 inline constexpr int kBlurSigmaSliderMin = 1;
 inline constexpr int kBlurSigmaSliderMax = 50;
 inline constexpr float kBlurSigmaStep = 0.1f;

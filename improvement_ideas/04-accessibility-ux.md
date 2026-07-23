@@ -43,8 +43,8 @@ size configurable while there.
 
 ## U3. Keyboard-only operation audit
 
-- **Priority:** MEDIUM · **Effort:** medium · **Status:** Reported (no shortcuts beyond arrow-key nudge found)
-- **Evidence:** README "Navigation And Interaction" lists mouse-centric controls; only arrow keys are keyboard-based
+- **Priority:** MEDIUM · **Effort:** medium · **Status:** Reported (partially improved 2026-07-22: number keys `1`–`9` apply quick modes, `Ctrl+H` pins Simple chrome, `Esc` closes the grid/panel, `Tab` traverses the corner clusters; zoom in/out, photo, record, and B&W toggle still require the mouse)
+- **Evidence:** README "Navigation And Interaction"; `src/ui/main_window.cpp` key handling (~2075–2137)
 
 **Problem.** Zoom in/out, preset switching, photo capture, and recording all require
 mouse interaction (Ctrl+wheel, buttons). Low-vision users are disproportionately

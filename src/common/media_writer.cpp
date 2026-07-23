@@ -79,7 +79,16 @@ void VideoRecorder::SetError(const std::string& err)
     lastError_ = err;
 }
 
-bool VideoRecorder::Start(const std::wstring& filePath, UINT width, UINT height, UINT fps)
+const char* VideoRecorder::CodecName(Codec codec)
+{
+    return codec == Codec::Av1 ? "AV1" : "H.264";
+}
+
+bool VideoRecorder::Start(const std::wstring& filePath,
+                          UINT width,
+                          UINT height,
+                          UINT fps,
+                          Codec codec)
 {
     Stop();
 
@@ -91,7 +100,7 @@ bool VideoRecorder::Start(const std::wstring& filePath, UINT width, UINT height,
     }
 
     try {
-        if (!InitializeSink(filePath, width, height, fps)) {
+        if (!InitializeSink(filePath, width, height, fps, codec)) {
             return false;
         }
         frameWidth_ = width;
@@ -102,6 +111,7 @@ bool VideoRecorder::Start(const std::wstring& filePath, UINT width, UINT height,
         targetPath_ = filePath;
         lastSpaceCheckTicks_ = GetTickCount64();
         stopReason_ = StopReason::None;
+        activeCodec_ = codec;
         recording_ = true;
         lastError_.clear();
         return true;
@@ -134,7 +144,11 @@ void VideoRecorder::FinalizeAndStop(StopReason reason)
     rtStart_ = 0;
 }
 
-bool VideoRecorder::InitializeSink(const std::wstring& filePath, UINT width, UINT height, UINT fps)
+bool VideoRecorder::InitializeSink(const std::wstring& filePath,
+                                   UINT width,
+                                   UINT height,
+                                   UINT fps,
+                                   Codec codec)
 {
     Microsoft::WRL::ComPtr<IMFAttributes> attrs;
     ThrowIfFailed(MFCreateAttributes(attrs.GetAddressOf(), 3), "Create sink attributes");
@@ -149,11 +163,13 @@ bool VideoRecorder::InitializeSink(const std::wstring& filePath, UINT width, UIN
     ThrowIfFailed(MFCreateSinkWriterFromURL(filePath.c_str(), nullptr, attrs.Get(), writer.GetAddressOf()),
                   "Create sink writer");
 
-    // Output type (H.264 in MP4)
+    // Output type. The caller probes AV1 first and falls back to H.264 when
+    // the installed Media Foundation encoder/container path rejects AV1.
     Microsoft::WRL::ComPtr<IMFMediaType> outType;
     ThrowIfFailed(MFCreateMediaType(outType.GetAddressOf()), "Create output type");
     ThrowIfFailed(outType->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video), "Set out major type");
-    ThrowIfFailed(outType->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264), "Set out subtype");
+    const GUID& outputSubtype = codec == Codec::Av1 ? MFVideoFormat_AV1 : MFVideoFormat_H264;
+    ThrowIfFailed(outType->SetGUID(MF_MT_SUBTYPE, outputSubtype), "Set out subtype");
     ThrowIfFailed(outType->SetUINT32(MF_MT_AVG_BITRATE, width * height * 5), "Set bitrate"); // rough default
     ThrowIfFailed(outType->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive), "Set interlace");
     ThrowIfFailed(MFSetAttributeSize(outType.Get(), MF_MT_FRAME_SIZE, width, height), "Set out frame size");

@@ -4,6 +4,7 @@
 
 #include <QDebug>
 
+#include <d3dcompiler.h>
 #include <dxgi1_6.h>
 
 #include <algorithm>
@@ -39,6 +40,33 @@ inline D3D12_RESOURCE_BARRIER TransitionBarrier(ID3D12Resource* resource,
     return barrier;
 }
 
+Microsoft::WRL::ComPtr<ID3DBlob> CompileShader(const char* source,
+                                               const char* entryPoint,
+                                               const char* target) {
+    Microsoft::WRL::ComPtr<ID3DBlob> shader;
+    Microsoft::WRL::ComPtr<ID3DBlob> errors;
+    const HRESULT result = D3DCompile(source,
+                                      std::strlen(source),
+                                      nullptr,
+                                      nullptr,
+                                      nullptr,
+                                      entryPoint,
+                                      target,
+                                      D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                                      0,
+                                      &shader,
+                                      &errors);
+    if (FAILED(result)) {
+        const std::string detail =
+            errors ? std::string(static_cast<const char*>(errors->GetBufferPointer()),
+                                 errors->GetBufferSize())
+                   : std::string();
+        throw std::runtime_error(
+            std::string("Failed to compile viewport shader: ") + detail);
+    }
+    return shader;
+}
+
 } // namespace
 
 D3D12Presenter::D3D12Presenter() = default;
@@ -70,6 +98,10 @@ D3D12Presenter::~D3D12Presenter()
         CloseHandle(fenceEvent_);
         fenceEvent_ = nullptr;
     }
+    if (frameLatencyWaitableObject_) {
+        CloseHandle(frameLatencyWaitableObject_);
+        frameLatencyWaitableObject_ = nullptr;
+    }
 }
 
 void D3D12Presenter::Initialize(HWND hwnd, UINT width, UINT height)
@@ -78,6 +110,7 @@ void D3D12Presenter::Initialize(HWND hwnd, UINT width, UINT height)
     CreateDevice();
     CreateCommandObjects();
     CreateFenceObjects();
+    CreateViewportPipeline();
     CreateSwapChain(width, height);
     EnsureUploadBuffer(width, height);
     initialized_ = true;
@@ -86,6 +119,26 @@ void D3D12Presenter::Initialize(HWND hwnd, UINT width, UINT height)
 bool D3D12Presenter::IsInitialized() const
 {
     return initialized_;
+}
+
+bool D3D12Presenter::NeedsScenePresent() const
+{
+    return scenePresentNeeded_;
+}
+
+UINT D3D12Presenter::ViewportWidth() const
+{
+    return width_;
+}
+
+UINT D3D12Presenter::ViewportHeight() const
+{
+    return height_;
+}
+
+std::uint64_t D3D12Presenter::MissedPresentCount() const
+{
+    return missedPresentCount_;
 }
 
 void D3D12Presenter::Resize(UINT width, UINT height)
@@ -109,13 +162,13 @@ void D3D12Presenter::Resize(UINT width, UINT height)
                                             width,
                                             height,
                                             DXGI_FORMAT_B8G8R8A8_UNORM,
-                                            0),
+                                            DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT),
                   "Failed to resize swap chain buffers");
 
     AcquireBackBuffers();
     width_ = width;
     height_ = height;
-    EnsureUploadBuffer(width, height);
+    scenePresentNeeded_ = true;
 }
 
 void D3D12Presenter::Present(const uint8_t* data, UINT width, UINT height)
@@ -138,7 +191,10 @@ void D3D12Presenter::Present(const uint8_t* data, UINT width, UINT height)
     // that previously used this slot's allocator/upload buffer/back buffer,
     // instead of draining the whole queue every frame.
     const UINT backIndex = swapChain_->GetCurrentBackBufferIndex();
-    WaitForFrameSlot(backIndex);
+    if (!WaitForFrameSlot(backIndex)) {
+        scenePresentNeeded_ = true;
+        return;
+    }
 
     CopyToUpload(data, width, height, backIndex);
 
@@ -176,6 +232,7 @@ void D3D12Presenter::Present(const uint8_t* data, UINT width, UINT height)
     const UINT64 signalValue = ++fenceValue_;
     ThrowIfFailed(commandQueue_->Signal(fence_.Get(), signalValue), "Failed to signal fence");
     frameFenceValues_[backIndex] = signalValue;
+    scenePresentNeeded_ = false;
 }
 
 void D3D12Presenter::PresentFromTexture(ID3D12Resource* texture,
@@ -183,18 +240,45 @@ void D3D12Presenter::PresentFromTexture(ID3D12Resource* texture,
                                         UINT height,
                                         const FenceSyncParams* fenceSync)
 {
-    if (!initialized_ || !texture || width == 0 || height == 0) {
-        return;
-    }
+    const ViewTransform transform =
+        ComputeViewTransform(width,
+                             height,
+                             width_,
+                             height_,
+                             1.0f,
+                             0.5f,
+                             0.5f,
+                             ViewportFitMode::kFill);
+    PresentSceneTexture(texture, width, height, transform, fenceSync);
+}
 
-    if (width != width_ || height != height_) {
-        Resize(width, height);
+bool D3D12Presenter::PresentSceneTexture(ID3D12Resource* texture,
+                                        UINT sourceWidth,
+                                        UINT sourceHeight,
+                                        const ViewTransform& transform,
+                                        const FenceSyncParams* fenceSync,
+                                        const ViewportPresentationOptions* options,
+                                        UINT64* outReadbackRequestId)
+{
+    if (outReadbackRequestId) {
+        *outReadbackRequestId = 0;
+    }
+    if (!initialized_ || !texture || sourceWidth == 0 || sourceHeight == 0 ||
+        width_ == 0 || height_ == 0 || !transform.valid) {
+        return false;
     }
 
     const bool useFenceSync = fenceSync && fenceSync->enable && fence_.Get() != nullptr;
+    AsyncReadbackSlot* readbackSlot =
+        options && options->requestReadback
+            ? PrepareAsyncReadbackSlot(width_, height_)
+            : nullptr;
 
     const UINT backIndex = swapChain_->GetCurrentBackBufferIndex();
-    WaitForFrameSlot(backIndex);
+    if (!WaitForFrameSlot(backIndex)) {
+        scenePresentNeeded_ = true;
+        return false;
+    }
 
     ID3D12CommandAllocator* allocator = frameCommandAllocators_[backIndex].Get();
     ThrowIfFailed(allocator->Reset(), "Failed to reset command allocator");
@@ -207,25 +291,102 @@ void D3D12Presenter::PresentFromTexture(ID3D12Resource* texture,
                       "Failed to queue wait on shared fence");
     }
 
-    auto transitionSourceToCopy = TransitionBarrier(texture,
-                                                    D3D12_RESOURCE_STATE_COMMON,
-                                                    D3D12_RESOURCE_STATE_COPY_SOURCE);
-    commandList_->ResourceBarrier(1, &transitionSourceToCopy);
+    auto transitionSourceToSample = TransitionBarrier(
+        texture,
+        D3D12_RESOURCE_STATE_COMMON,
+        D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    commandList_->ResourceBarrier(1, &transitionSourceToSample);
 
-    auto transitionDestToCopy = TransitionBarrier(backBuffer.Get(),
-                                                  D3D12_RESOURCE_STATE_PRESENT,
-                                                  D3D12_RESOURCE_STATE_COPY_DEST);
-    commandList_->ResourceBarrier(1, &transitionDestToCopy);
+    auto transitionDestToRender = TransitionBarrier(backBuffer.Get(),
+                                                    D3D12_RESOURCE_STATE_PRESENT,
+                                                    D3D12_RESOURCE_STATE_RENDER_TARGET);
+    commandList_->ResourceBarrier(1, &transitionDestToRender);
 
-    commandList_->CopyResource(backBuffer.Get(), texture);
+    D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+    srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    srvDesc.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE srvCpu =
+        sceneSrvHeap_->GetCPUDescriptorHandleForHeapStart();
+    srvCpu.ptr += static_cast<SIZE_T>(backIndex) * sceneSrvDescriptorSize_;
+    device_->CreateShaderResourceView(texture, &srvDesc, srvCpu);
 
-    auto transitionDestToPresent = TransitionBarrier(backBuffer.Get(),
-                                                     D3D12_RESOURCE_STATE_COPY_DEST,
-                                                     D3D12_RESOURCE_STATE_PRESENT);
-    commandList_->ResourceBarrier(1, &transitionDestToPresent);
+    D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+        renderTargetHeap_->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(backIndex) * renderTargetDescriptorSize_;
+
+    D3D12_VIEWPORT viewport{
+        0.0f, 0.0f, static_cast<float>(width_), static_cast<float>(height_), 0.0f, 1.0f};
+    D3D12_RECT scissor{
+        0, 0, static_cast<LONG>(width_), static_cast<LONG>(height_)};
+    commandList_->SetGraphicsRootSignature(sceneRootSignature_.Get());
+    ID3D12DescriptorHeap* descriptorHeaps[] = {sceneSrvHeap_.Get()};
+    commandList_->SetDescriptorHeaps(1, descriptorHeaps);
+    const float constants[16] = {
+        transform.sourceX,
+        transform.sourceY,
+        transform.sourceWidth,
+        transform.sourceHeight,
+        transform.destinationX,
+        transform.destinationY,
+        transform.destinationWidth,
+        transform.destinationHeight,
+        options ? options->focusX : 0.5f,
+        options ? options->focusY : 0.5f,
+        static_cast<float>(width_),
+        static_cast<float>(height_),
+        options && options->drawFocusMarker ? 1.0f : 0.0f,
+        0.0f,
+        0.0f,
+        0.0f,
+    };
+    commandList_->SetGraphicsRoot32BitConstants(0, 16, constants, 0);
+    D3D12_GPU_DESCRIPTOR_HANDLE srvGpu =
+        sceneSrvHeap_->GetGPUDescriptorHandleForHeapStart();
+    srvGpu.ptr += static_cast<UINT64>(backIndex) * sceneSrvDescriptorSize_;
+    commandList_->SetGraphicsRootDescriptorTable(1, srvGpu);
+    commandList_->RSSetViewports(1, &viewport);
+    commandList_->RSSetScissorRects(1, &scissor);
+    commandList_->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
+    commandList_->SetPipelineState(scenePipelineState_.Get());
+    commandList_->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    commandList_->DrawInstanced(3, 1, 0, 0);
+
+    if (readbackSlot) {
+        auto transitionDestToCopy = TransitionBarrier(
+            backBuffer.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_COPY_SOURCE);
+        commandList_->ResourceBarrier(1, &transitionDestToCopy);
+
+        D3D12_TEXTURE_COPY_LOCATION readbackDestination{};
+        readbackDestination.pResource = readbackSlot->buffer.Get();
+        readbackDestination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+        readbackDestination.PlacedFootprint = readbackSlot->footprint;
+
+        D3D12_TEXTURE_COPY_LOCATION renderedSource{};
+        renderedSource.pResource = backBuffer.Get();
+        renderedSource.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        renderedSource.SubresourceIndex = 0;
+        commandList_->CopyTextureRegion(
+            &readbackDestination, 0, 0, 0, &renderedSource, nullptr);
+
+        auto transitionDestToPresent = TransitionBarrier(
+            backBuffer.Get(),
+            D3D12_RESOURCE_STATE_COPY_SOURCE,
+            D3D12_RESOURCE_STATE_PRESENT);
+        commandList_->ResourceBarrier(1, &transitionDestToPresent);
+    } else {
+        auto transitionDestToPresent = TransitionBarrier(
+            backBuffer.Get(),
+            D3D12_RESOURCE_STATE_RENDER_TARGET,
+            D3D12_RESOURCE_STATE_PRESENT);
+        commandList_->ResourceBarrier(1, &transitionDestToPresent);
+    }
 
     auto transitionSourceToCommon = TransitionBarrier(texture,
-                                                      D3D12_RESOURCE_STATE_COPY_SOURCE,
+                                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
                                                       D3D12_RESOURCE_STATE_COMMON);
     commandList_->ResourceBarrier(1, &transitionSourceToCommon);
 
@@ -235,11 +396,15 @@ void D3D12Presenter::PresentFromTexture(ID3D12Resource* texture,
     commandQueue_->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
 
     if (useFenceSync) {
-        // Signal the shared fence as soon as the copy is queued so CUDA can
-        // begin its next frame once the copy executes; no CPU-side wait.
-        ThrowIfFailed(commandQueue_->Signal(fence_.Get(), fenceSync->signalValue),
+        // Signal the shared fence as soon as the sampled draw is queued so
+        // CUDA can begin its next frame once texture reads have retired.
+        const UINT64 textureSignal =
+            std::max({fenceValue_ + 1,
+                      fenceSync->waitValue + 1,
+                      fenceSync->signalValue});
+        ThrowIfFailed(commandQueue_->Signal(fence_.Get(), textureSignal),
                       "Failed to signal shared fence");
-        fenceValue_ = std::max(fenceValue_, fenceSync->signalValue);
+        fenceValue_ = textureSignal;
 
         ThrowIfFailed(swapChain_->Present(1, 0), "Failed to present swap chain");
 
@@ -247,14 +412,30 @@ void D3D12Presenter::PresentFromTexture(ID3D12Resource* texture,
         const UINT64 slotSignal = ++fenceValue_;
         ThrowIfFailed(commandQueue_->Signal(fence_.Get(), slotSignal), "Failed to signal fence");
         frameFenceValues_[backIndex] = slotSignal;
+        if (readbackSlot) {
+            readbackSlot->fenceValue = slotSignal;
+            readbackSlot->inFlight = true;
+            if (outReadbackRequestId) {
+                *outReadbackRequestId = slotSignal;
+            }
+        }
     } else {
         // Without the shared external semaphore there is no cross-API sync:
         // the caller's CUDA stream may write the source texture again as soon
-        // as we return, so the queued copy must fully complete first.
+        // as we return, so the queued draw must fully complete first.
         WaitForGpu();
         ThrowIfFailed(swapChain_->Present(1, 0), "Failed to present swap chain");
         frameFenceValues_[backIndex] = fenceValue_;
+        if (readbackSlot) {
+            readbackSlot->fenceValue = fenceValue_;
+            readbackSlot->inFlight = true;
+            if (outReadbackRequestId) {
+                *outReadbackRequestId = fenceValue_;
+            }
+        }
     }
+    scenePresentNeeded_ = false;
+    return true;
 }
 
 ID3D12Device* D3D12Presenter::GetDevice() const
@@ -377,6 +558,7 @@ void D3D12Presenter::CreateSwapChain(UINT width, UINT height)
     scDesc.BufferCount = 2;
     scDesc.Scaling = DXGI_SCALING_STRETCH;
     scDesc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    scDesc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
 
     Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain1;
     ThrowIfFailed(factory_->CreateSwapChainForHwnd(commandQueue_.Get(),
@@ -391,6 +573,13 @@ void D3D12Presenter::CreateSwapChain(UINT width, UINT height)
                   "Failed to disable Alt-Enter");
 
     ThrowIfFailed(swapChain1.As(&swapChain_), "Failed to query IDXGISwapChain3");
+    Microsoft::WRL::ComPtr<IDXGISwapChain2> latencySwapChain;
+    if (SUCCEEDED(swapChain_.As(&latencySwapChain)) && latencySwapChain) {
+        ThrowIfFailed(latencySwapChain->SetMaximumFrameLatency(1),
+                      "Failed to set swap-chain frame latency");
+        frameLatencyWaitableObject_ =
+            latencySwapChain->GetFrameLatencyWaitableObject();
+    }
 
     backBuffers_.resize(scDesc.BufferCount);
     AcquireBackBuffers();
@@ -398,11 +587,186 @@ void D3D12Presenter::CreateSwapChain(UINT width, UINT height)
     height_ = height;
 }
 
+void D3D12Presenter::CreateViewportPipeline()
+{
+    D3D12_DESCRIPTOR_HEAP_DESC rtvHeapDesc{};
+    rtvHeapDesc.NumDescriptors = kFrameCount;
+    rtvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+    ThrowIfFailed(device_->CreateDescriptorHeap(
+                      &rtvHeapDesc, IID_PPV_ARGS(&renderTargetHeap_)),
+                  "Failed to create viewport render-target heap");
+    renderTargetDescriptorSize_ =
+        device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+
+    D3D12_DESCRIPTOR_HEAP_DESC srvHeapDesc{};
+    srvHeapDesc.NumDescriptors = kFrameCount;
+    srvHeapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    srvHeapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    ThrowIfFailed(device_->CreateDescriptorHeap(
+                      &srvHeapDesc, IID_PPV_ARGS(&sceneSrvHeap_)),
+                  "Failed to create viewport shader-resource heap");
+    sceneSrvDescriptorSize_ =
+        device_->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+
+    D3D12_DESCRIPTOR_RANGE srvRange{};
+    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    srvRange.NumDescriptors = 1;
+    srvRange.BaseShaderRegister = 0;
+    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+
+    D3D12_ROOT_PARAMETER rootParameters[2]{};
+    rootParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    rootParameters[0].Constants.ShaderRegister = 0;
+    rootParameters[0].Constants.Num32BitValues = 16;
+    rootParameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    rootParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    rootParameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    rootParameters[1].DescriptorTable.pDescriptorRanges = &srvRange;
+    rootParameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_STATIC_SAMPLER_DESC sampler{};
+    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    sampler.ComparisonFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+    sampler.MaxLOD = D3D12_FLOAT32_MAX;
+    sampler.ShaderRegister = 0;
+    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+    D3D12_ROOT_SIGNATURE_DESC rootDesc{};
+    rootDesc.NumParameters = static_cast<UINT>(std::size(rootParameters));
+    rootDesc.pParameters = rootParameters;
+    rootDesc.NumStaticSamplers = 1;
+    rootDesc.pStaticSamplers = &sampler;
+    rootDesc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                     D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+                     D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+                     D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
+
+    Microsoft::WRL::ComPtr<ID3DBlob> serializedRoot;
+    Microsoft::WRL::ComPtr<ID3DBlob> rootErrors;
+    const HRESULT rootResult = D3D12SerializeRootSignature(
+        &rootDesc,
+        D3D_ROOT_SIGNATURE_VERSION_1,
+        &serializedRoot,
+        &rootErrors);
+    if (FAILED(rootResult)) {
+        const std::string detail =
+            rootErrors
+                ? std::string(
+                      static_cast<const char*>(rootErrors->GetBufferPointer()),
+                      rootErrors->GetBufferSize())
+                : std::string();
+        throw std::runtime_error(
+            std::string("Failed to serialize viewport root signature: ") + detail);
+    }
+    ThrowIfFailed(device_->CreateRootSignature(
+                      0,
+                      serializedRoot->GetBufferPointer(),
+                      serializedRoot->GetBufferSize(),
+                      IID_PPV_ARGS(&sceneRootSignature_)),
+                  "Failed to create viewport root signature");
+
+    static constexpr char kSceneShader[] = R"(
+cbuffer ViewConstants : register(b0) {
+    float4 sourceRect;
+    float4 destinationRect;
+    float4 overlayData;
+    float4 overlayOptions;
+};
+Texture2D<float4> sceneTexture : register(t0);
+SamplerState sceneSampler : register(s0);
+
+struct VertexOutput {
+    float4 position : SV_Position;
+    float2 viewportUv : TEXCOORD0;
+};
+
+VertexOutput VSMain(uint vertexId : SV_VertexID) {
+    const float2 positions[3] = {
+        float2(-1.0, -1.0),
+        float2(-1.0,  3.0),
+        float2( 3.0, -1.0)
+    };
+    const float2 uvs[3] = {
+        float2(0.0, 1.0),
+        float2(0.0, -1.0),
+        float2(2.0, 1.0)
+    };
+    VertexOutput output;
+    output.position = float4(positions[vertexId], 0.0, 1.0);
+    output.viewportUv = uvs[vertexId];
+    return output;
+}
+
+float4 PSMain(VertexOutput input) : SV_Target {
+    const float2 destinationMin = destinationRect.xy;
+    const float2 destinationMax = destinationRect.xy + destinationRect.zw;
+    if (any(input.viewportUv < destinationMin) ||
+        any(input.viewportUv > destinationMax)) {
+        return float4(0.0, 0.0, 0.0, 1.0);
+    }
+    const float2 localUv =
+        (input.viewportUv - destinationRect.xy) / destinationRect.zw;
+    const float2 sourceUv = sourceRect.xy + localUv * sourceRect.zw;
+    float4 color = sceneTexture.Sample(sceneSampler, sourceUv);
+
+    if (overlayOptions.x > 0.5) {
+        const float2 focusLocal =
+            (overlayData.xy - sourceRect.xy) / sourceRect.zw;
+        const float2 focusViewport =
+            destinationRect.xy + focusLocal * destinationRect.zw;
+        const float2 deltaPixels =
+            (input.viewportUv - focusViewport) * overlayData.zw;
+        const float distancePixels = length(deltaPixels);
+        if (distancePixels <= 18.0) {
+            color = distancePixels <= 6.0
+                        ? float4(1.0, 1.0, 1.0, 1.0)
+                        : float4(0.95, 0.08, 0.08, 1.0);
+        }
+    }
+    return color;
+}
+)";
+
+    const Microsoft::WRL::ComPtr<ID3DBlob> vertexShader =
+        CompileShader(kSceneShader, "VSMain", "vs_5_0");
+    const Microsoft::WRL::ComPtr<ID3DBlob> pixelShader =
+        CompileShader(kSceneShader, "PSMain", "ps_5_0");
+
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipelineDesc{};
+    pipelineDesc.pRootSignature = sceneRootSignature_.Get();
+    pipelineDesc.VS = {
+        vertexShader->GetBufferPointer(), vertexShader->GetBufferSize()};
+    pipelineDesc.PS = {
+        pixelShader->GetBufferPointer(), pixelShader->GetBufferSize()};
+    pipelineDesc.BlendState.RenderTarget[0].RenderTargetWriteMask =
+        D3D12_COLOR_WRITE_ENABLE_ALL;
+    pipelineDesc.SampleMask = UINT_MAX;
+    pipelineDesc.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pipelineDesc.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pipelineDesc.RasterizerState.DepthClipEnable = TRUE;
+    pipelineDesc.DepthStencilState.DepthEnable = FALSE;
+    pipelineDesc.DepthStencilState.StencilEnable = FALSE;
+    pipelineDesc.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipelineDesc.NumRenderTargets = 1;
+    pipelineDesc.RTVFormats[0] = DXGI_FORMAT_B8G8R8A8_UNORM;
+    pipelineDesc.SampleDesc.Count = 1;
+    ThrowIfFailed(device_->CreateGraphicsPipelineState(
+                      &pipelineDesc, IID_PPV_ARGS(&scenePipelineState_)),
+                  "Failed to create viewport pipeline state");
+}
+
 void D3D12Presenter::AcquireBackBuffers()
 {
     for (UINT i = 0; i < backBuffers_.size(); ++i) {
         ThrowIfFailed(swapChain_->GetBuffer(i, IID_PPV_ARGS(&backBuffers_[i])),
                       "Failed to retrieve swap chain buffer");
+        D3D12_CPU_DESCRIPTOR_HANDLE rtv =
+            renderTargetHeap_->GetCPUDescriptorHandleForHeapStart();
+        rtv.ptr += static_cast<SIZE_T>(i) * renderTargetDescriptorSize_;
+        device_->CreateRenderTargetView(backBuffers_[i].Get(), nullptr, rtv);
     }
 }
 
@@ -476,7 +840,8 @@ void D3D12Presenter::EnsureUploadBuffer(UINT width, UINT height)
 bool D3D12Presenter::ReadbackTexture(ID3D12Resource* texture,
                                      UINT width,
                                      UINT height,
-                                     std::vector<uint8_t>& outBgra)
+                                     std::vector<uint8_t>& outBgra,
+                                     UINT64 waitFenceValue)
 {
     if (!initialized_ || !texture || width == 0 || height == 0) {
         return false;
@@ -557,6 +922,15 @@ bool D3D12Presenter::ReadbackTexture(ID3D12Resource* texture,
 
     ThrowIfFailed(commandList_->Close(), "Failed to close command list");
 
+    if (waitFenceValue > 0 && fence_) {
+        // CUDA signals this shared fence after its writes retire. Queue the
+        // dependency before the copy instead of blocking the CPU or racing a
+        // still-active CUDA stream.
+        ThrowIfFailed(commandQueue_->Wait(fence_.Get(), waitFenceValue),
+                      "Failed to queue CUDA wait before texture readback");
+        fenceValue_ = std::max(fenceValue_, waitFenceValue);
+    }
+
     ID3D12CommandList* lists[] = { commandList_.Get() };
     commandQueue_->ExecuteCommandLists(static_cast<UINT>(std::size(lists)), lists);
 
@@ -579,12 +953,12 @@ bool D3D12Presenter::ReadbackTexture(ID3D12Resource* texture,
     return true;
 }
 
-bool D3D12Presenter::RequestReadback(ID3D12Resource* texture, UINT width, UINT height)
+D3D12Presenter::AsyncReadbackSlot*
+D3D12Presenter::PrepareAsyncReadbackSlot(UINT width, UINT height)
 {
-    if (!initialized_ || !texture || width == 0 || height == 0) {
-        return false;
+    if (!initialized_ || width == 0 || height == 0) {
+        return nullptr;
     }
-
     AsyncReadbackSlot* slot = nullptr;
     for (auto& candidate : asyncReadbackSlots_) {
         if (!candidate.inFlight) {
@@ -593,8 +967,7 @@ bool D3D12Presenter::RequestReadback(ID3D12Resource* texture, UINT width, UINT h
         }
     }
     if (!slot) {
-        // Both copies still in flight; the caller skips this frame's readback.
-        return false;
+        return nullptr;
     }
 
     if (!slot->buffer || slot->width != width || slot->height != height) {
@@ -645,6 +1018,23 @@ bool D3D12Presenter::RequestReadback(ID3D12Resource* texture, UINT width, UINT h
         slot->width = width;
         slot->height = height;
     }
+    return slot;
+}
+
+bool D3D12Presenter::RequestReadback(ID3D12Resource* texture,
+                                     UINT width,
+                                     UINT height,
+                                     UINT64* outRequestId)
+{
+    if (!initialized_ || !texture || width == 0 || height == 0) {
+        return false;
+    }
+
+    AsyncReadbackSlot* slot = PrepareAsyncReadbackSlot(width, height);
+    if (!slot) {
+        // Both copies still in flight; the caller skips this frame's readback.
+        return false;
+    }
 
     // The slot's previous submission retired before it became free, so the
     // allocator is idle and safe to reset without any CPU wait.
@@ -682,12 +1072,16 @@ bool D3D12Presenter::RequestReadback(ID3D12Resource* texture, UINT width, UINT h
     ThrowIfFailed(commandQueue_->Signal(fence_.Get(), signalValue), "Failed to signal fence");
     slot->fenceValue = signalValue;
     slot->inFlight = true;
+    if (outRequestId) {
+        *outRequestId = signalValue;
+    }
     return true;
 }
 
 bool D3D12Presenter::TryGetCompletedReadback(std::vector<uint8_t>& outBgra,
                                              UINT& outWidth,
-                                             UINT& outHeight)
+                                             UINT& outHeight,
+                                             UINT64* outRequestId)
 {
     if (!initialized_ || !fence_) {
         return false;
@@ -726,6 +1120,9 @@ bool D3D12Presenter::TryGetCompletedReadback(std::vector<uint8_t>& outBgra,
     oldest->inFlight = false;
     outWidth = width;
     outHeight = height;
+    if (outRequestId) {
+        *outRequestId = oldest->fenceValue;
+    }
     return true;
 }
 
@@ -769,9 +1166,22 @@ void D3D12Presenter::WaitForFenceValue(UINT64 value)
     }
 }
 
-void D3D12Presenter::WaitForFrameSlot(UINT slot)
+bool D3D12Presenter::WaitForFrameSlot(UINT slot)
 {
+    if (frameLatencyWaitableObject_) {
+        DWORD waitResult = WAIT_IO_COMPLETION;
+        while (waitResult == WAIT_IO_COMPLETION) {
+            waitResult =
+                WaitForSingleObjectEx(frameLatencyWaitableObject_, 100, TRUE);
+        }
+        if (waitResult != WAIT_OBJECT_0) {
+            qWarning() << "Swap-chain frame-latency wait timed out";
+            ++missedPresentCount_;
+            return false;
+        }
+    }
     WaitForFenceValue(frameFenceValues_[slot]);
+    return true;
 }
 
 void D3D12Presenter::WaitForIdle()

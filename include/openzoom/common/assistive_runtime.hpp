@@ -32,8 +32,8 @@ class CodexAppServerClient;
 struct AssistiveRuntimeConfig {
     QString aiProvider{QStringLiteral("codex")};
     QString codexExecutablePath;
-    QString codexModel{QStringLiteral("gpt-5.5")};
-    QString codexReasoningEffort{QStringLiteral("xhigh")};
+    QString codexModel{QStringLiteral("gpt-5.6-tera")};
+    QString codexReasoningEffort{QStringLiteral("low")};
     bool codexInternetEnabled{false};
     bool codexCodingEnabled{false};
     QString codexWorkspaceDirectory;
@@ -85,8 +85,8 @@ public:
     void RenameAssistantConversation(const QString& threadId, const QString& name);
     void DeleteAssistantConversation(const QString& threadId);
 
-    // Appends a "Photo captured" section referencing filePath to the lecture
-    // notes (no-op when notes are disabled).
+    // Appends a "Photo captured" section with an image reference to the HTML
+    // lecture notes (no-op when notes are disabled).
     void NoteCapturedPhoto(const QString& filePath);
     // Absolute path of the current lecture notes file; empty if nothing has
     // been written yet.
@@ -97,6 +97,7 @@ signals:
     void CodexServerStateChanged(bool ready, const QString& status);
     void CodexAccountChanged(bool signedIn, const QString& label, const QString& planType);
     void CodexModelsChanged(const QStringList& modelIds, const QString& selectedModel);
+    void CodexModelCatalogChanged(const QJsonArray& models, const QString& selectedModel);
     void CodexRateLimitChanged(const QString& summary);
     void CodexLoginUrlReady(const QUrl& url);
     void AssistantConversationCreated(const QJsonObject& thread);
@@ -132,7 +133,9 @@ private:
     bool UsesCodexProvider() const;
     bool ValidateFrame(const uint8_t* bgraData, int width, int height);
     bool EnsureNotesFile();
-    void AppendNoteSection(const QString& heading, const QString& bodyText);
+    void AppendNoteSection(const QString& heading,
+                           const QString& bodyText,
+                           const QString& imagePath = {});
     void SpeakText(const QString& text);
     void StopSpeech();
 

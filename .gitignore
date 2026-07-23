@@ -39,3 +39,9 @@ Thumbs.db
 /ui ideas/
 /design-qa.md
 /output/
+/third_party/maxine/redist/*
+!/third_party/maxine/redist/README.md
+# Only the MIT-licensed nvvfx header snapshot belongs in the repo; the SDK's
+# sample apps/media (93 MB, prebuilt binaries) and demo GIFs stay local.
+/third_party/maxine/Maxine-VFX-SDK/samples/
+/third_party/maxine/Maxine-VFX-SDK/resources/

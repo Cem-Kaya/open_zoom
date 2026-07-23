@@ -129,8 +129,11 @@ automatic reconnect to the same symbolic link before giving up with a visible me
 
 ## V7. Consistent readback/pipeline error reporting
 
-- **Priority:** LOW · **Effort:** small · **Status:** Reported
-- **Evidence:** `src/app/app.cpp` — `ReadbackTexture()` consumers at ~400 (photo), ~1983 (assistive), ~2191 (recording) discard failure reasons
+- **Priority:** LOW · **Effort:** small · **Status:** Reported (still open 2026-07-22; line refs updated for the async-readback rework)
+- **Evidence:** `src/app/app.cpp` — synchronous `ReadbackTexture()` consumers at ~461
+  (photo) and ~1501/~1560 (on-demand analysis) discard failure reasons; the async ring
+  (`RequestReadback` at ~2771) silently skips a frame when both slots are in flight or
+  the request fails
 
 **Fix.** Covered by U5's error-category enum
 ([04-accessibility-ux.md](04-accessibility-ux.md)) — extend it through
@@ -141,8 +144,8 @@ automatic reconnect to the same symbolic link before giving up with a visible me
 
 ## V8. Slider-value conversion hardening
 
-- **Priority:** LOW · **Effort:** small · **Status:** Reported
-- **Evidence:** `src/app/app.cpp` — `OnTemporalSmoothStrengthChanged()` hardcodes fallback min/max (~1324–1330); division-then-clamp ordering (~357); no range validation in several `On*Changed` slots
+- **Priority:** LOW · **Effort:** small · **Status:** Reported (partially improved 2026-07-22: the originally cited `OnTemporalSmoothStrengthChanged()` (~2055) now clamps against the slider's real min/max before dividing; other `On*Changed` slots still hand-roll conversion without a shared helper)
+- **Evidence:** `src/app/app.cpp` — per-slot ad-hoc conversion in the various `On*Changed` slots
 
 **Fix.** One shared helper that maps a slider value to a normalized float using the
 slider's *actual* min/max with clamping, used by every slot. Trivial once

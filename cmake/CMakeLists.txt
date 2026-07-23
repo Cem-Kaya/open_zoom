@@ -30,29 +30,49 @@ if (OPENZOOM_ENABLE_CUDA)
     target_sources(open_zoom PRIVATE ${OPENZOOM_CUDA_SOURCES})
     set_target_properties(open_zoom PROPERTIES
         CUDA_SEPARABLE_COMPILATION ON
+        CUDA_RUNTIME_LIBRARY Static
         CUDA_ARCHITECTURES "75;86;89"
     )
 endif()
 
 target_sources(open_zoom PRIVATE
     ${PROJECT_SOURCE_DIR}/include/openzoom/app/app.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/assistive_feature_manager.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/color_schemes.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/app/constants.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/app/interaction_controller.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/pipeline_orchestrator.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/recording_manager.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/settings_controller.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/app/settings_store.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/suspend_guard.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/ui_state_manager.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/capture/media_capture.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/image_processing.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/frame_pipeline.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/media_writer.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/common/maxine_superres.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/common/view_transform.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/assistive_runtime.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/common/codex_app_server_client.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/d3d12/presenter.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/ui/main_window.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/ui/assistive_overlay.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/ui/joystick_overlay.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/ui/render_widget.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/ui/color_scheme_picker.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/ui/responsive_slider_row.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/ui/wheel_safe_combo_box.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/ui/ai_settings_dialog.hpp
+    ${PROJECT_SOURCE_DIR}/include/openzoom/app/setup_assistant.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/cuda/cuda_interop.hpp
     ${PROJECT_SOURCE_DIR}/include/openzoom/cuda/cuda_kernels.hpp
 )
 
-target_include_directories(open_zoom PRIVATE ${PROJECT_SOURCE_DIR}/include)
+target_include_directories(open_zoom PRIVATE
+    ${PROJECT_SOURCE_DIR}/include
+    ${PROJECT_SOURCE_DIR}/third_party/maxine/Maxine-VFX-SDK/nvvfx/include
+)
 set_target_properties(open_zoom PROPERTIES
     VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}"
 )
@@ -60,6 +80,7 @@ set_target_properties(open_zoom PROPERTIES
 target_compile_definitions(open_zoom PRIVATE
     OPENZOOM_ENABLE_CUDA=$<BOOL:${OPENZOOM_ENABLE_CUDA}>
     OPENZOOM_HAS_CUDA_EXT_MEMORY=$<IF:$<BOOL:${OPENZOOM_ENABLE_CUDA}>,1,0>
+    OPENZOOM_ENABLE_TEXT_SR=$<BOOL:${OPENZOOM_ENABLE_TEXT_SR}>
 )
 
 if (WIN32)
@@ -79,7 +100,7 @@ if (WIN32)
 
     if (OPENZOOM_ENABLE_CUDA)
         find_package(CUDAToolkit REQUIRED)
-        target_link_libraries(open_zoom PRIVATE CUDA::cudart CUDA::cuda_driver)
+        target_link_libraries(open_zoom PRIVATE CUDA::cudart_static CUDA::cuda_driver)
     endif()
 
     target_link_libraries(open_zoom PRIVATE
@@ -114,7 +135,6 @@ else()
 endif()
 
 if (OPENZOOM_ENABLE_TESTS)
-    enable_testing()
     if (EXISTS "${PROJECT_SOURCE_DIR}/tests/CMakeLists.txt")
         add_subdirectory(${PROJECT_SOURCE_DIR}/tests ${CMAKE_BINARY_DIR}/tests)
     else()

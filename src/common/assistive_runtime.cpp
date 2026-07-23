@@ -19,6 +19,7 @@
 #include <QNetworkRequest>
 #include <QProcess>
 #include <QProcessEnvironment>
+#include <QSaveFile>
 #include <QStandardPaths>
 #include <QStringList>
 #include <QTemporaryFile>
@@ -41,6 +42,7 @@ constexpr int kMinFrameEdge = 64;
 constexpr int kMaxVlmFrameEdge = 2048;
 constexpr int kOcrWatchdogMs = 10000;
 constexpr int kVlmTransferTimeoutMs = 30000;
+constexpr auto kNotesInsertionMarker = "<!-- OPENZOOM_NOTES_APPEND -->";
 
 QString SanitizeText(QString text)
 {
@@ -55,6 +57,19 @@ QString TruncateText(const QString& text, int maxChars)
         return text;
     }
     return text.left(maxChars).trimmed() + QStringLiteral("...");
+}
+
+QString NotesImageUrl(const QString& notesFilePath, const QString& imagePath)
+{
+    const QFileInfo imageInfo(imagePath);
+    const QDir notesDirectory(QFileInfo(notesFilePath).absolutePath());
+    QString relativePath = notesDirectory.relativeFilePath(imageInfo.absoluteFilePath());
+    relativePath = QDir::fromNativeSeparators(relativePath);
+
+    const QUrl url = QDir::isAbsolutePath(relativePath)
+                         ? QUrl::fromLocalFile(imageInfo.absoluteFilePath())
+                         : QUrl(relativePath);
+    return QString::fromUtf8(url.toEncoded(QUrl::FullyEncoded));
 }
 
 // Non-empty configured values take precedence over the environment variable.
@@ -139,6 +154,8 @@ AssistiveRuntime::AssistiveRuntime(QObject* parent)
             this, &AssistiveRuntime::CodexAccountChanged);
     connect(codexClient_.get(), &CodexAppServerClient::ModelsChanged,
             this, &AssistiveRuntime::CodexModelsChanged);
+    connect(codexClient_.get(), &CodexAppServerClient::ModelCatalogChanged,
+            this, &AssistiveRuntime::CodexModelCatalogChanged);
     connect(codexClient_.get(), &CodexAppServerClient::RateLimitChanged,
             this, &AssistiveRuntime::CodexRateLimitChanged);
     connect(codexClient_.get(), &CodexAppServerClient::LoginUrlReady,
@@ -450,8 +467,7 @@ void AssistiveRuntime::NoteCapturedPhoto(const QString& filePath)
     if (filePath.trimmed().isEmpty()) {
         return;
     }
-    AppendNoteSection(QStringLiteral("Photo captured"),
-                      QStringLiteral("![capture](%1)").arg(filePath));
+    AppendNoteSection(QStringLiteral("Photo captured"), {}, filePath);
 }
 
 void AssistiveRuntime::StartCodexLogin()
@@ -578,6 +594,8 @@ QString AssistiveRuntime::TesseractProgram() const
 
     const QString appDirectory = QCoreApplication::applicationDirPath();
     QStringList candidates{
+        QDir(QStandardPaths::writableLocation(QStandardPaths::GenericDataLocation))
+            .filePath(QStringLiteral("OpenZoom/tools/tesseract/tesseract.exe")),
         QDir(appDirectory).filePath(QStringLiteral("tools/tesseract/tesseract.exe")),
         QDir(appDirectory).filePath(QStringLiteral("tesseract/tesseract.exe")),
         QDir(appDirectory).filePath(QStringLiteral("tesseract.exe"))};
@@ -919,46 +937,119 @@ bool AssistiveRuntime::EnsureNotesFile()
     }
 
     const QDateTime now = QDateTime::currentDateTime();
-    const QString fileName = QStringLiteral("NOTES_%1.md")
+    const QString fileName = QStringLiteral("NOTES_%1.html")
                                  .arg(now.toString(QStringLiteral("yyyyMMdd_HHmmss")));
     const QString path = QDir(directory).filePath(fileName);
 
-    QFile file(path);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Append)) {
+    QSaveFile file(path);
+    if (!file.open(QIODevice::WriteOnly)) {
         qWarning("AssistiveRuntime: failed to create notes file %s", qPrintable(path));
         return false;
     }
-    // \u2014 is an em dash; escaped so MSVC builds without /utf-8 stay correct.
-    const QString header = QStringLiteral("# OpenZoom Lecture Notes \u2014 %1\n")
-                               .arg(now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
-    file.write(header.toUtf8());
-    file.close();
+    const QString displayTime = now.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+    const QString machineTime = now.toString(Qt::ISODate);
+    const QString document = QStringLiteral(
+        "<!doctype html>\n"
+        "<html lang=\"en\">\n"
+        "<head>\n"
+        "  <meta charset=\"utf-8\">\n"
+        "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n"
+        "  <title>OpenZoom Lecture Notes - %1</title>\n"
+        "  <style>\n"
+        "    :root { color-scheme: light dark; font: 18px/1.6 system-ui, sans-serif; }\n"
+        "    body { margin: 0; background: Canvas; color: CanvasText; }\n"
+        "    main { width: min(72rem, calc(100% - 2rem)); margin: 0 auto; padding: 2rem 0 4rem; }\n"
+        "    h1 { font-size: clamp(1.8rem, 5vw, 3rem); line-height: 1.15; margin: 0; }\n"
+        "    .created { color: GrayText; margin: .5rem 0 2rem; }\n"
+        "    section { border-top: 2px solid GrayText; padding: 1.5rem 0; }\n"
+        "    h2 { font-size: 1.25rem; line-height: 1.3; margin: 0 0 1rem; }\n"
+        "    time { font-variant-numeric: tabular-nums; }\n"
+        "    .note-text { white-space: pre-wrap; overflow-wrap: anywhere; }\n"
+        "    figure { margin: 0; }\n"
+        "    img { display: block; max-width: 100%; height: auto; border: 2px solid GrayText; }\n"
+        "    figcaption { margin-top: .5rem; color: GrayText; }\n"
+        "    a:focus-visible { outline: 4px solid Highlight; outline-offset: 4px; }\n"
+        "    @media print { main { width: 100%; } section { break-inside: avoid; } }\n"
+        "  </style>\n"
+        "</head>\n"
+        "<body>\n"
+        "<main>\n"
+        "  <h1>OpenZoom Lecture Notes</h1>\n"
+        "  <p class=\"created\">Started <time datetime=\"%2\">%1</time></p>\n"
+        "  %3\n"
+        "</main>\n"
+        "</body>\n"
+        "</html>\n")
+                                 .arg(displayTime.toHtmlEscaped(),
+                                      machineTime.toHtmlEscaped(),
+                                      QString::fromLatin1(kNotesInsertionMarker));
+    const QByteArray documentBytes = document.toUtf8();
+    if (file.write(documentBytes) != documentBytes.size() || !file.commit()) {
+        qWarning("AssistiveRuntime: failed to finalize notes file %s", qPrintable(path));
+        return false;
+    }
 
     notesFilePath_ = path;
     return true;
 }
 
-void AssistiveRuntime::AppendNoteSection(const QString& heading, const QString& bodyText)
+void AssistiveRuntime::AppendNoteSection(const QString& heading,
+                                         const QString& bodyText,
+                                         const QString& imagePath)
 {
     if (!config_.lectureNotesEnabled || config_.notesDirectory.trimmed().isEmpty()) {
         return;
     }
-    if (bodyText.trimmed().isEmpty()) {
+    if (bodyText.trimmed().isEmpty() && imagePath.trimmed().isEmpty()) {
         return;
     }
     if (!EnsureNotesFile()) {
         return;
     }
 
-    QFile file(notesFilePath_);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Append)) {
-        qWarning("AssistiveRuntime: failed to append to notes file %s", qPrintable(notesFilePath_));
+    QFile existingFile(notesFilePath_);
+    if (!existingFile.open(QIODevice::ReadOnly)) {
+        qWarning("AssistiveRuntime: failed to read notes file %s", qPrintable(notesFilePath_));
         return;
     }
+    QByteArray document = existingFile.readAll();
+    existingFile.close();
+
+    const QByteArray marker(kNotesInsertionMarker);
+    const qsizetype markerOffset = document.indexOf(marker);
+    if (markerOffset < 0) {
+        qWarning("AssistiveRuntime: notes insertion marker missing from %s", qPrintable(notesFilePath_));
+        return;
+    }
+
     const QString timestamp = QTime::currentTime().toString(QStringLiteral("HH:mm:ss"));
-    const QString section = QStringLiteral("\n## [%1] %2\n\n%3\n").arg(timestamp, heading, bodyText);
-    file.write(section.toUtf8());
-    file.close();
+    QString content;
+    if (!imagePath.trimmed().isEmpty()) {
+        const QString imageUrl = NotesImageUrl(notesFilePath_, imagePath).toHtmlEscaped();
+        content = QStringLiteral(
+                      "    <figure>\n"
+                      "      <a href=\"%1\"><img src=\"%1\" alt=\"Captured processed camera view\" loading=\"lazy\"></a>\n"
+                      "      <figcaption>Processed camera view</figcaption>\n"
+                      "    </figure>\n")
+                      .arg(imageUrl);
+    } else {
+        content = QStringLiteral("    <div class=\"note-text\">%1</div>\n")
+                      .arg(bodyText.toHtmlEscaped());
+    }
+    const QString section = QStringLiteral(
+                                "  <section>\n"
+                                "    <h2><time>[%1]</time> %2</h2>\n"
+                                "%3"
+                                "  </section>\n")
+                                .arg(timestamp.toHtmlEscaped(), heading.toHtmlEscaped(), content);
+    document.insert(markerOffset, section.toUtf8());
+
+    QSaveFile outputFile(notesFilePath_);
+    if (!outputFile.open(QIODevice::WriteOnly) ||
+        outputFile.write(document) != document.size() ||
+        !outputFile.commit()) {
+        qWarning("AssistiveRuntime: failed to update notes file %s", qPrintable(notesFilePath_));
+    }
 }
 
 void AssistiveRuntime::SpeakText(const QString& text)

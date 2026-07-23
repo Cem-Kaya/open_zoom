@@ -14,10 +14,13 @@ the fold or surrounding it with permanent tool panels.
 
 Simple mode is the normal operating view:
 
-- The live camera fills the complete client area. Three small control clusters
+- The live camera fills the complete client area. Three primary control clusters
   sit flush to its corners: mode switch at top-left, profile navigation at
   bottom-left, and immediate actions at bottom-right. Processing status is
   intentionally absent from Simple mode and lives in Advanced diagnostics.
+- Profiles that enable Straighten Screen add a fourth, contextual strip beside
+  the carousel with Previous, Stop/Continue, and Next correction controls. It
+  disappears for profiles that do not use keystone correction.
 - The clusters are frameless windows owned by the main window. This keeps them
   above the native D3D swap chain while retaining normal Qt buttons,
   accessibility metadata, focus, and tooltips.
@@ -30,7 +33,7 @@ Simple mode is the normal operating view:
 - The current profile is flanked by previous/next buttons. The grid button or
   current-profile button opens a temporary tile grid with plain-language names
   and number badges.
-- Number keys `1` through `7` apply the first seven quick modes from anywhere
+- Number keys `1` through `9` apply the first nine quick modes from anywhere
   in Simple mode. `Tab` and `Shift+Tab` move across the separate corner
   clusters in a predictable order, and `Esc` closes the mode grid.
 - View navigation (wheel, keyboard, joystick, and middle-drag pan/zoom) updates
@@ -43,25 +46,34 @@ Simple mode is the normal operating view:
   Steady", and "See in Low Light"; internal preset names remain unchanged for
   persistence and configuration lookup.
 - The immediate actions are Photo, Record, Explain, and Read.
+- A compact `Text Clarity` checkbox beside the profile carousel is the only
+  direct image-processing toggle in Simple mode. It automatically chooses
+  paper/board/mixed behavior; all component parameters remain in Advanced.
 - Device selection and detailed numeric controls are intentionally absent.
 
 Adding a new profile must not create persistent chrome. It joins the mode grid
-and remains reachable by scrolling; only the first seven entries receive
+and remains reachable by scrolling; only the first nine entries receive
 number shortcuts.
 
 ## Advanced Mode
 
 Advanced mode keeps the live image visible and opens a narrow inspector on its
 right. Its top-level tabs are `Image` and `Assistant`; previous/next arrows
-wrap across current and future sections, while a top-level pop-out button opens
-AI Settings without placing service configuration inside the Image form.
+wrap across current and future sections. A full-width AI Settings pop-out row
+sits directly below the tab strip on both pages instead of crowding navigation.
+The top-left Simple/Advanced switch remains pinned in Advanced and is restored
+after Alt-Tab or other application deactivation.
 
 The scrollable Image inspector has two ownership groups:
 
-1. **Global device** contains the camera, physical orientation, and discovered
-   camera formats.
+1. **Global device** contains the camera, physical orientation, discovered
+   camera formats, viewport motion/framing, and the Virtual Joystick toggle.
 2. **Current profile** contains all image-processing and assistive-mode values,
-   plus the command that saves the current configuration as a quick option.
+   plus commands that save the current configuration as a quick option or
+   reset profile-owned tuning to defaults.
+
+The compact question-mark button in the tab header opens help without taking
+permanent camera space. The guide lists Controls before Features.
 
 The inspector is constrained to 380-520 pixels. Detailed controls scroll
 inside it instead of increasing the height of the main control area.
@@ -87,7 +99,9 @@ view to the shared persistent Assistant conversation. Closing it (or pressing
 Escape while it has focus) keeps the current result hidden until the next
 user-requested analysis. OCR, scene explanations, and mode changes never start
 speech automatically; only Read Aloud or the AI Settings Preview action does
-so.
+so. First use positions the panel below the top Simple controls. Position and
+size are stored relative to the camera surface, restored on restart, and
+clamped when the available view changes.
 
 ## Settings Ownership
 
@@ -99,6 +113,7 @@ not change when a quick profile is selected:
 | Camera selection | A physical capture source is an application choice. |
 | Camera orientation | Describes how the physical camera is mounted. |
 | Simple/Advanced state | Restores the user's preferred working view. |
+| Assistive View position and size | Restores the user's chosen floating panel layout. |
 | Inspector collapsed state | UI preference, not image treatment. |
 | Virtual joystick visibility | Interaction preference. |
 | Selected quick profile | Restores the active workflow. |
@@ -114,6 +129,7 @@ when the user creates a quick option:
 | Jitter reduction | Stabilization enabled and strength. |
 | Display treatment | Color mode, contrast, and brightness. |
 | Sharpening | Backend, enabled state, and strength. |
+| Text clarity | Master/individual stages, Sauvola and softness, polarity, stroke weight, CLAHE, two-color output, hysteresis, focus threshold, glare suppression. |
 | Assistive behavior | OCR, scene explanation, and assistive overlay enabled states. |
 | Diagnostics | Debug view and focus marker. |
 
@@ -126,7 +142,7 @@ code persists and applies orientation at the top level of
 
 - Switching modes must not recreate or hide the render surface.
 - Simple mode leaves the render surface full-size and overlays only the three
-  corner clusters described above.
+  primary clusters plus the contextual keystone strip described above.
 - Advanced controls live beside the camera, never above it as a tall form.
 - Processing status belongs under Advanced Image diagnostics. Its visible
   value is deliberately short (`GPU Ready`, `Camera Offline`, `CPU Debug`, or

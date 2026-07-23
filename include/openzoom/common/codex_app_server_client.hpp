@@ -43,6 +43,7 @@ public:
     bool IsSignedIn() const;
     bool IsTurnActive() const;
     QString SelectedModel() const;
+    static QString BuiltInAssistantInstructions();
 
     void RefreshAccount();
     void StartChatGptLogin();
@@ -59,6 +60,7 @@ signals:
     void ServerStateChanged(bool ready, const QString& status);
     void AccountChanged(bool signedIn, const QString& label, const QString& planType);
     void ModelsChanged(const QStringList& modelIds, const QString& selectedModel);
+    void ModelCatalogChanged(const QJsonArray& models, const QString& selectedModel);
     void RateLimitChanged(const QString& summary);
     void LoginUrlReady(const QUrl& url);
 
@@ -135,7 +137,7 @@ private:
     QString configuredExecutable_;
     QString preferredModel_;
     QString selectedModel_;
-    QString reasoningEffort_{QStringLiteral("xhigh")};
+    QString reasoningEffort_{QStringLiteral("low")};
     QString assistantInstructions_;
     QString workspaceDirectory_;
     bool initialized_{false};

@@ -1,0 +1,33 @@
+#pragma once
+
+#include "openzoom/app/settings_store.hpp"
+
+#include <optional>
+
+namespace openzoom {
+
+class SettingsController {
+public:
+    SettingsController();
+
+    const settings::PersistentSettings& Settings() const noexcept;
+    settings::PersistentSettings& MutableSettings() noexcept;
+
+    settings::AdvancedConfig DecorateLiveConfig(
+        settings::AdvancedConfig config) const;
+    QString MatchPreset(const settings::AdvancedConfig& current,
+                        bool preserveCurrentSelection);
+    std::optional<settings::AdvancedConfig> ResolvePreset(
+        const QString& presetId) const;
+    QString DefaultPromotedPresetName() const;
+    settings::PresetDefinition PromoteCurrentConfig(
+        settings::AdvancedConfig config, const QString& name);
+
+    bool Save(const settings::AdvancedConfig& current);
+
+private:
+    QString settingsPath_;
+    settings::PersistentSettings settings_;
+};
+
+} // namespace openzoom

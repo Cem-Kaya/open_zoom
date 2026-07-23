@@ -15,6 +15,7 @@
         "CMAKE_BUILD_TYPE": "Debug",
         "CMAKE_PREFIX_PATH": "C:/Qt/6.9.3/msvc2022_64",
         "OPENZOOM_ENABLE_CUDA": "ON",
+        "OPENZOOM_ENABLE_TEXT_SR": "ON",
         "OPENZOOM_ENABLE_TESTS": "OFF",
         "CMAKE_CUDA_ARCHITECTURES": "75;86;89"
       }
@@ -28,6 +29,7 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_PREFIX_PATH": "C:/Qt/6.9.3/msvc2022_64",
         "OPENZOOM_ENABLE_CUDA": "ON",
+        "OPENZOOM_ENABLE_TEXT_SR": "ON",
         "OPENZOOM_ENABLE_TESTS": "OFF",
         "CMAKE_CUDA_ARCHITECTURES": "75;86;89"
       }
@@ -41,7 +43,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_PREFIX_PATH": "C:/Qt/6.9.3/msvc2022_64",
         "OPENZOOM_ENABLE_CUDA": "OFF",
-        "OPENZOOM_ENABLE_TESTS": "OFF"
+        "OPENZOOM_ENABLE_TEXT_SR": "OFF",
+        "OPENZOOM_ENABLE_TESTS": "ON"
       }
     }
   ],
@@ -67,6 +70,13 @@
     {
       "name": "msvc-release-tests",
       "configurePreset": "msvc-release"
+    },
+    {
+      "name": "msvc-cpu-tests",
+      "configurePreset": "msvc-cpu",
+      "output": {
+        "outputOnFailure": true
+      }
     }
   ]
 }

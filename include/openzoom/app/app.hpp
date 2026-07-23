@@ -9,16 +9,23 @@
 #include <QSize>
 #include <QString>
 #include <QElapsedTimer>
+#include <QJsonArray>
 
+#include "openzoom/app/assistive_feature_manager.hpp"
 #include "openzoom/app/settings_store.hpp"
+#include "openzoom/app/recording_manager.hpp"
+#include "openzoom/app/pipeline_orchestrator.hpp"
+#include "openzoom/app/settings_controller.hpp"
+#include "openzoom/app/suspend_guard.hpp"
+#include "openzoom/app/ui_state_manager.hpp"
 #include "openzoom/capture/media_capture.hpp"
 #include "openzoom/common/frame_pipeline.hpp"
-#include "openzoom/common/media_writer.hpp"
-#include "openzoom/common/assistive_runtime.hpp"
 #include "openzoom/cuda/cuda_interop.hpp"
 
 #include <wrl/client.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -53,10 +60,14 @@ struct ID3D12Resource;
 namespace openzoom {
 
 class RenderWidget;
-class AssistiveOverlay;
 class JoystickOverlay;
 class MainWindow;
 class InteractionController;
+class UIStateManager;
+class AssistiveFeatureManager;
+class PipelineOrchestrator;
+class SetupAssistantDialog;
+class ColorSchemePicker;
 
 class D3D12Presenter;
 class CudaInteropSurface;
@@ -65,14 +76,15 @@ class OpenZoomApp : public QObject {
     Q_OBJECT
     friend class MainWindow;
     friend class InteractionController;
+    friend class UIStateManager;
 public:
     OpenZoomApp(int& argc, char** argv);
     ~OpenZoomApp() override;
 
+    bool Initialize();
     int Run();
 
 private slots:
-    void OnFrameTick();
     void OnPresetSelectionChanged(QListWidgetItem* current, QListWidgetItem* previous);
     void OnCameraSelectionChanged(int index);
     void OnBlackWhiteToggled(bool checked);
@@ -97,15 +109,19 @@ private slots:
     void OnOcrAssistToggled(bool checked);
     void OnVlmAssistToggled(bool checked);
     void OnAssistiveOverlayToggled(bool checked);
-    void OnAssistiveOverlayUpdated(const QString& title, const QString& body, bool visible);
     void OnStabilizationToggled(bool checked);
     void OnStabilizationStrengthChanged(int value);
     void OnKeystoneToggled(bool checked);
+    void OnKeystoneStepBack();
+    void OnKeystonePauseResume();
+    void OnKeystoneStepForward();
     void OnAutoContrastToggled(bool checked);
     void OnAutoContrastStrengthChanged(int value);
-    void OnDisplayColorModeChanged(int index);
+    void OnDisplayColorSchemeChanged();
     void OnContrastChanged(int value);
     void OnBrightnessChanged(int value);
+    void OnTextClarityControlsChanged();
+    void SetSuperResPerformanceOverride(bool enabled);
 
 private:
     settings::AdvancedConfig CaptureCurrentAdvancedConfig() const;
@@ -114,12 +130,10 @@ private:
     void RefreshPresetSelection(bool preserveCurrentSelection = false);
     void UpdatePresetDescription();
     void SyncCurrentConfigToPersistence(bool preservePresetSelection = false);
+    void ResetCurrentConfigToDefaults();
     void PromoteCurrentConfigToPreset();
-    void UpdateAssistiveRuntimeState();
-    void MaybeRequestAssistiveAnalysis(const uint8_t* data, UINT width, UINT height);
-    AssistiveRuntimeConfig BuildAssistiveRuntimeConfig() const;
-    void ApplyAssistiveSettingsToRuntime();
     void OpenAiSettingsDialog();
+    void OpenSetupAssistant();
     void OpenNotesFile();
     void SubmitOnDemandAnalysis(bool runOcr, bool runVlm);
     void SubmitAssistantPrompt();
@@ -139,22 +153,27 @@ private:
     void StopCameraCapture();
     void BeginCameraReconnect();
     void DriveCameraReconnect();
-    void BuildCompositeAndPresent(UINT width, UINT height);
+    void BuildCompositeAndPresent(UINT width,
+                                  UINT height,
+                                  CapturedFrame* originalFrame);
     void PresentFitted(const uint8_t* data,
                        UINT srcWidth,
                        UINT srcHeight,
                        bool cropToFill,
                        float centerXNorm,
-                       float centerYNorm);
+                       float centerYNorm,
+                       const CapturedFrame* originalFrame);
     void SetZoomCenter(float normX, float normY, bool syncUi,
-                       bool preservePresetSelection = false);
-    void ApplyInputForces();
+                       bool preservePresetSelection = false,
+                       bool persist = true);
+    bool ApplyInputForces(double elapsedSeconds);
     void UpdateJoystickVisibility();
     bool HandlePanKey(int key, bool pressed);
     bool HandlePanScroll(const QWheelEvent* wheelEvent);
     void HandleZoomWheel(int delta, const QPointF& localPos);
     void UpdateBlurUiLabels();
     void UpdateProcessingStatusLabel();
+    void UpdateKeystoneTrackingUi();
     void UpdateSpatialSharpenUi();
     void UpdateTemporalSmoothUi();
     void BeginMousePan(const QPointF& pos, const QSize& widgetSize);
@@ -164,16 +183,27 @@ private:
     bool MapViewToSource(const QPointF& pos, float& outX, float& outY) const;
     bool EnsureCudaSurface(UINT width, UINT height);
     bool ProcessFrameWithCuda(UINT width, UINT height);
-    bool TryProcessRawFrameWithCuda(const MediaFrame& frame);
+    bool TryProcessRawFrameWithCuda(const MediaFrame& frame,
+                                    CapturedFrame* originalFrame);
     bool RunCudaPipeline(const ProcessingInput& input, UINT presentWidth, UINT presentHeight);
-    void HandleGpuFramePresented(UINT width, UINT height);
-    bool AssistiveAnalysisDue() const;
-    void CaptureSnapshot(const uint8_t* data, UINT width, UINT height);
-    void MaybeRecordFrame(const uint8_t* data, UINT width, UINT height);
-    void StopRecordingUi();
+    void DrainCompletedGpuReadbacks();
+    bool PrepareOriginalFrame(const MediaFrame& source, CapturedFrame& destination);
+    void CapturePendingPhoto(const CapturedFrame& originalFrame);
+    bool SaveSnapshot(const uint8_t* data,
+                      UINT width,
+                      UINT height,
+                      const QString& fullPath);
+    void SaveCapturedPhotoPair(const uint8_t* processedData,
+                               UINT processedWidth,
+                               UINT processedHeight,
+                               const CapturedFrame& originalFrame);
     void ShowStatusMessage(const QString& message, int durationMs = 10000);
     QString EnsureOutputSubdir(const QString& subdir);
+    bool RunFrameTick(double elapsedSeconds);
+    void PresentLatestCudaScene(bool newCameraFrame,
+                                CapturedFrame* originalFrame);
     void ResetCudaFenceState();
+    void HandleCudaProcessingFailure();
     void ResolveCudaBufferFormatFromOptions();
     void HandleCameraStartFailure(const QString& message);
     void HandleCameraRuntimeFailure(uint64_t captureSession, const QString& message);
@@ -183,75 +213,18 @@ private:
     void SavePersistentSettings();
 
     QApplication* qtApp_{};
+    bool initialized_{false};
     std::unique_ptr<MainWindow> mainWindow_;
-    QTimer* frameTimer_{};
-    RenderWidget* renderWidget_{};
-    QComboBox* cameraCombo_{};
-    QListWidget* presetList_{};
-    QLabel* presetDescriptionLabel_{};
-    QPushButton* promotePresetButton_{};
-    QCheckBox* bwCheckbox_{};
-    QSlider* bwSlider_{};
-    QCheckBox* zoomCheckbox_{};
-    QSlider* zoomSlider_{};
-    QPushButton* debugButton_{};
-    QPushButton* capturePhotoButton_{};
-    QPushButton* recordButton_{};
-    QCheckBox* focusMarkerCheckbox_{};
-    QSlider* zoomCenterXSlider_{};
-    QSlider* zoomCenterYSlider_{};
-    QComboBox* rotationCombo_{};
-    QListWidget* cameraModesList_{};
-    QCheckBox* joystickCheckbox_{};
-    QToolButton* collapseButton_{};
-    QWidget* controlsContainer_{};
-    QCheckBox* blurCheckbox_{};
-    QSlider* blurSigmaSlider_{};
-    QSlider* blurRadiusSlider_{};
-    QLabel* blurSigmaValueLabel_{};
-    QLabel* blurRadiusValueLabel_{};
-    QCheckBox* temporalSmoothCheckbox_{};
-    QSlider* temporalSmoothSlider_{};
-    QLabel* temporalSmoothValueLabel_{};
-    QCheckBox* ocrAssistCheckbox_{};
-    QCheckBox* vlmAssistCheckbox_{};
-    QCheckBox* assistiveOverlayCheckbox_{};
-    QCheckBox* spatialSharpenCheckbox_{};
-    QComboBox* spatialBackendCombo_{};
-    QSlider* spatialSharpnessSlider_{};
-    QLabel* spatialSharpnessValueLabel_{};
-    QLabel* processingStatusLabel_{};
-    QCheckBox* stabilizationCheckbox_{};
-    QSlider* stabilizationStrengthSlider_{};
-    QCheckBox* keystoneCheckbox_{};
-    QCheckBox* autoContrastCheckbox_{};
-    QSlider* autoContrastStrengthSlider_{};
-    QComboBox* displayColorCombo_{};
-    QSlider* contrastSlider_{};
-    QSlider* brightnessSlider_{};
-    QPushButton* explainNowButton_{};
-    QPushButton* readTextButton_{};
-    QPushButton* aiSettingsButton_{};
-    QPushButton* openNotesButton_{};
-    QLabel* assistantConnectionLabel_{};
-    QLabel* assistantUsageLabel_{};
-    QPushButton* assistantConnectButton_{};
-    QTextBrowser* assistantTranscript_{};
-    QPlainTextEdit* assistantPromptEdit_{};
-    QCheckBox* assistantAttachFrameCheckbox_{};
-    QPushButton* assistantSendButton_{};
-    QPushButton* assistantStopButton_{};
-    QPushButton* assistantNewButton_{};
-    QListWidget* assistantHistoryList_{};
-    QPushButton* assistantRenameButton_{};
-    QPushButton* assistantExportButton_{};
-    QPushButton* assistantDeleteButton_{};
+    std::unique_ptr<UIStateManager> uiState_;
+    std::unique_ptr<PipelineOrchestrator> pipelineOrchestrator_;
     QString currentAssistantThreadId_;
     QString pendingAssistantPrompt_;
     bool assistantResponseOpen_{false};
     bool assistantResponseReceivedText_{false};
     bool codexReady_{false};
     bool codexSignedIn_{false};
+    QJsonArray codexModelCatalog_;
+    QString selectedCodexModel_;
 
     std::unique_ptr<D3D12Presenter> presenter_;
 
@@ -294,56 +267,83 @@ private:
     bool stabilizationEnabled_{};
     float stabilizationStrength_{0.85f};
     int displayColorMode_{0};
+    color_schemes::ColorScheme displayColorScheme_{};
+    color_schemes::ColorLut displayColorLut_{};
+    std::uint64_t displayColorLutGeneration_{1};
     float contrast_{1.0f};
     float brightness_{0.0f};
     bool keystoneEnabled_{};
     bool autoContrastEnabled_{};
     float autoContrastStrength_{0.7f};
+    bool autoTextClarityEnabled_{};
+    bool backgroundFlattenEnabled_{};
+    float backgroundFlattenStrength_{0.8f};
+    bool adaptiveBinarizationEnabled_{};
+    float sauvolaStrength_{0.28f};
+    float binarizationSoftness_{0.06f};
+    int textPolarityMode_{};
+    int strokeWeight_{};
+    bool smartSharpenEnabled_{};
+    float smartSharpenStrength_{0.45f};
+    bool claheEnabled_{};
+    float claheClipLimit_{2.0f};
+    bool twoColorTextEnabled_{};
+    bool textHysteresisEnabled_{};
+    float textHysteresisStrength_{0.08f};
+    bool selectiveSharpenEnabled_{};
+    bool focusDetectionEnabled_{};
+    float focusThreshold_{0.012f};
+    bool glareSuppressionEnabled_{};
+    float glareSuppressionStrength_{0.5f};
+    bool mlTextSuperResolutionEnabled_{};
+    float mlTextSuperResolutionStrength_{0.65f};
+    bool mlTextSuperResolutionPrefer2x_{};
+    bool mlTextSuperResolutionUltra1440p_{};
+    bool superResPerformanceOverride_{};
     bool simpleUiMode_{true};
     std::vector<uint8_t> presentationBuffer_;
-    std::vector<uint8_t> recordingBuffer_;
+    std::vector<uint8_t> cpuSceneBuffer_;
+    UINT cpuSceneWidth_{};
+    UINT cpuSceneHeight_{};
+    bool cpuSceneReady_{false};
     std::vector<uint8_t> assistiveBuffer_;
     std::vector<uint8_t> asyncReadbackBuffer_;
     processing::CpuFramePipeline cpuPipeline_;
-    VideoRecorder videoRecorder_;
-    bool recording_{false};
-    QElapsedTimer recordingTimer_;
-    uint64_t recordingFrameCount_{0};
-    UINT recordingWidth_{0};
-    UINT recordingHeight_{0};
+    processing::CpuFramePipeline capturePipeline_;
+    std::unique_ptr<RecordingManager> recordingManager_;
+    bool photoCapturePending_{};
+    UINT64 pendingPhotoReadbackId_{};
+    CapturedFrame pendingPhotoOriginal_;
+    QElapsedTimer pendingPhotoReadbackTimer_;
 
-    AssistiveOverlay* assistiveOverlay_{};
+    std::unique_ptr<AssistiveFeatureManager> assistiveManager_;
     JoystickOverlay* joystickOverlay_{};
-    std::unique_ptr<AssistiveRuntime> assistiveRuntime_;
+    SetupAssistantDialog* setupAssistantDialog_{};
     std::unique_ptr<InteractionController> interactionController_;
-    QElapsedTimer assistiveAnalysisTimer_;
 
     Microsoft::WRL::ComPtr<ID3D12Resource> cudaSharedTexture_;
+    Microsoft::WRL::ComPtr<ID3D12Resource> cudaSuperResTexture_;
     std::unique_ptr<CudaInteropSurface> cudaSurface_;
     UINT cudaSurfaceWidth_{};
     UINT cudaSurfaceHeight_{};
+    UINT cudaSuperResWidth_{};
+    UINT cudaSuperResHeight_{};
     bool cudaPipelineAvailable_{};
     bool usingCudaLastFrame_{};
-    uint64_t sharedFenceCounter_{1};
-    uint64_t lastCudaSignalValue_{};
-    uint64_t lastGraphicsSignalValue_{};
-    uint64_t lastReadbackSignalValue_{};
-    bool cudaFenceInteropEnabled_{};
+    bool superResPresentedLastFrame_{};
     CudaBufferFormat cudaBufferFormat_{CudaBufferFormat::kRgba8};
     bool rawCudaPathWarned_{false};
-    bool cameraReconnectPending_{false};
-    int cameraReconnectAttempt_{0};
-    qint64 cameraReconnectStartedMs_{0};
-    qint64 cameraReconnectNextAttemptMs_{0};
     QString transientStatusMessage_;
     qint64 transientStatusUntilMs_{0};
+    QString lastSuperResStatus_;
     QString lastCameraError_;
-    QString settingsPath_;
-    settings::PersistentSettings persistentSettings_{};
+    std::unique_ptr<SettingsController> settingsController_;
     bool presetSelectionSyncSuspended_{false};
     bool configTrackingSuspended_{false};
     UINT presentationWidth_{0};
     UINT presentationHeight_{0};
+
+    bool cudaSceneReady_{false};
 };
 
 } // namespace openzoom
